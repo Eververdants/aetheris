@@ -77,6 +77,44 @@ boosted:
   chrome.exe (pid 1234)
 ```
 
+## Configuration UI
+
+`aetheris-ui` is a small on-demand Win32 dialog (no `.rc`, no GUI framework — the
+window, controls, and lists are all built programmatically) that reads and edits
+the running service's config over the same named pipe as the CLI. It is
+**non-resident**: launch it when you want to look at or change something, and it
+exits as soon as the window is closed — it never stays running in the background.
+
+```sh
+aetheris-ui                # against the default pipe \\.\pipe\aetheris
+aetheris-ui --pipe <NAME>  # against a specific pipe (match the service's --pipe)
+```
+
+The dialog is three parts:
+
+- **Status panel** (top): the current mode (`Normal` / `GameBoost`), the boosted
+  process list, and the last-reload result. **Refresh** re-pulls live status via
+  `GetState`; status is also pulled once at startup.
+- **Rule editor** (middle): three lists — game processes (`[game] processes`),
+  `[[background]]` rules, and `[[rule]]` always-rules. Selecting a background or
+  rule row loads its fields into a shared editor row (name, priority combo,
+  affinity as `0,1`, `qos_cpu_quota`, suspend / trim checkboxes). **Add /
+  Delete / Apply** mutate a *local* copy of the config; **Reload cfg** re-fetches
+  the service's config back into the editor.
+- **Save / Reload / Exit** (bottom): **Save** commits the editor and pushes the
+  config to the service; **Reload** asks the service to re-read its config file
+  from disk; **Exit** closes the window, which quits the process.
+
+Save runs the same validate-then-persist path the service uses internally: the
+UI validates its working copy before anything leaves the process, then
+`SaveConfig` has the service validate again, write the config to a temp file in
+the same directory, atomically rename it over the real file, and reload the new
+config into the live engine — an invalid config can never reach the file, and
+the service keeps running its current config until a save succeeds. (If the
+service was unreachable at startup so the config never loaded, Save is refused
+until a successful "Reload cfg" — so an empty editor can't overwrite the real
+config on disk.)
+
 ## Config reference
 
 See the committed `aetheris.toml` at the repo root. Sections:
@@ -199,4 +237,6 @@ Previously documented as v1 gaps, **closed in v1.1**:
   `query`), non-elevated CLI via pipe DACL, best-effort CPU-sets affinity.
 - **v2-A (engine features, shipped):** real Job Object CPU QoS (`qos_cpu_quota`),
   opt-in reversible network QoS (Nagle / NetBIOS), opt-in standby memory purge.
-- **v2 (remaining):** kernel driver (monitor-only), DXGI overlay, Win32 config UI.
+- **v2-B (configuration UI, shipped):** `GetConfig` / `SaveConfig` IPC with
+  validation + atomic persist, and the `aetheris-ui` config dialog.
+- **v2 (remaining):** kernel driver (monitor-only), DXGI overlay.
