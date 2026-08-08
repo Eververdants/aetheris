@@ -52,6 +52,7 @@ fn cfg() -> Config {
         }],
         rule: vec![],
         protected_extra: vec![],
+        network: aetheris_core::config::NetworkConfig::default(),
     }
 }
 

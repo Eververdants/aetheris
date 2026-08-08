@@ -9,6 +9,7 @@ pub mod events;
 pub mod foreground;
 pub mod ipc;
 pub mod log;
+pub mod network;
 pub mod policy;
 pub mod proc_table;
 pub mod rules;

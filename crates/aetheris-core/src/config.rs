@@ -66,6 +66,22 @@ pub struct AlwaysRule {
     pub affinity: Option<AffinitySpec>,
 }
 
+/// Opt-in network QoS tweaks, applied on game-mode entry and reverted on exit.
+///
+/// All flags default to `false` — nothing is touched unless explicitly enabled:
+/// `enabled` gates the whole feature, `nagle` toggles the per-interface
+/// `TcpAckFrequency`/`TCPNoDelay` disable, and `netbios` toggles
+/// `DisableNetbiosOverTcpip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub nagle: bool,
+    #[serde(default)]
+    pub netbios: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -76,6 +92,8 @@ pub struct Config {
     pub rule: Vec<AlwaysRule>,
     #[serde(default)]
     pub protected_extra: Vec<String>,
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 #[derive(Debug)]
@@ -369,6 +387,40 @@ name = "y.exe"
 affinity = { cores = [63] }
 "#;
         Config::from_str(s2).expect("always-rule high core index warns but still validates");
+    }
+
+    #[test]
+    fn network_defaults_off() {
+        // `network` is opt-in: an absent `[network]` section must keep every
+        // flag off (never touch the registry unless the user asked for it).
+        let s = "[game]\nprocesses = []\n";
+        let cfg = Config::from_str(s).expect("parse without [network]");
+        assert!(!cfg.network.enabled, "enabled must default off");
+        assert!(!cfg.network.nagle, "nagle must default off");
+        assert!(!cfg.network.netbios, "netbios must default off");
+
+        // `Config::default()` behaves identically.
+        let d = Config::default();
+        assert!(!d.network.enabled);
+        assert!(!d.network.nagle);
+        assert!(!d.network.netbios);
+    }
+
+    #[test]
+    fn network_section_parses() {
+        let s = r#"
+[network]
+enabled = true
+nagle = true
+netbios = true
+
+[game]
+processes = []
+"#;
+        let cfg = Config::from_str(s).expect("parse with [network]");
+        assert!(cfg.network.enabled);
+        assert!(cfg.network.nagle);
+        assert!(cfg.network.netbios);
     }
 
     #[test]

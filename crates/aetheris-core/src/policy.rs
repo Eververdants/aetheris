@@ -38,6 +38,9 @@ pub struct PolicyEngine<B: ProcessBackend + QosLifecycle> {
     background_names: Vec<String>, // parallel to cfg.background
     always_names: Vec<String>,     // parallel to cfg.rule
     protected_hashes: HashSet<u64>,
+    // Backup of network QoS registry tweaks applied on GameBoost entry, reverted
+    // on exit. `Some` only while `Mode::GameBoost` and `cfg.network.enabled`.
+    network_backup: Option<Vec<crate::network::BackupEntry>>,
 }
 
 impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
@@ -58,6 +61,7 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
             background_names: Vec::new(),
             always_names: Vec::new(),
             protected_hashes: HashSet::new(),
+            network_backup: None,
         };
         engine.rebuild_matchers();
         engine
@@ -252,6 +256,18 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         self.mode = Mode::GameBoost;
         self.game_pids.clear();
         self.game_pids.push(game_pid);
+        // Network QoS tweaks are opt-in (`cfg.network.enabled`) and applied only
+        // on the Normal -> GameBoost transition. Failures are logged, never fatal
+        // to the game flow. Stored so `exit_game_mode` can revert them.
+        if self.cfg.network.enabled {
+            match crate::network::apply(self.cfg.network.nagle, self.cfg.network.netbios) {
+                Ok(backup) => self.network_backup = Some(backup),
+                Err(e) => {
+                    crate::log::warn(format!("network QoS apply failed: {e}"));
+                    self.network_backup = None;
+                }
+            }
+        }
         let mut table: Vec<(u32, String)> = self
             .table
             .iter()
@@ -274,6 +290,11 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         }
         self.mode = Mode::Normal;
         self.game_pids.clear();
+        // Revert any network QoS registry tweaks applied on entry. `revert`
+        // logs and swallows per-entry failures — never fail the game flow.
+        if let Some(backup) = self.network_backup.take() {
+            crate::network::revert(&backup);
+        }
         for (pid, state) in std::mem::take(&mut self.boosted) {
             let _ = self.backend.restore(pid, &state);
         }
@@ -389,6 +410,7 @@ mod tests {
             }],
             rule: vec![],
             protected_extra: vec![],
+            network: crate::config::NetworkConfig::default(),
         }
     }
 
