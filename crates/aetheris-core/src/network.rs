@@ -19,7 +19,9 @@
 //! ever touching real network settings.
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD, REG_SAM_FLAGS, RRF_RT_REG_DWORD,
@@ -76,6 +78,15 @@ fn read_dword_from_key(hkey: HKEY, value: &str) -> Result<Option<u32>, String> {
     };
     if err == ERROR_FILE_NOT_FOUND {
         return Ok(None);
+    }
+    if err == ERROR_UNSUPPORTED_TYPE {
+        // A pre-existing value of another type (e.g. REG_SZ where a DWORD is
+        // expected) surfaces as 1630. Callers treat this as a per-entry skip
+        // rather than a whole-apply abort, so give it a distinct message.
+        return Err(format!(
+            "RegGetValueW({value}): existing value is not REG_DWORD (code {})",
+            err.0
+        ));
     }
     if err != ERROR_SUCCESS {
         return Err(format!("RegGetValueW({value}): code {}", err.0));
@@ -179,28 +190,60 @@ fn enum_subkeys(root: HKEY, path: &str) -> Result<Vec<String>, String> {
 
 /// Apply the Nagle tweaks (backup + set `TcpAckFrequency=1`/`TCPNoDelay=1`) on
 /// every interface adapter, and the optional NetBIOS disable. Returns the backup
-/// so [`revert`] can reverse every change. Errors if Nagle is requested but no
+/// so [`revert`] can reverse every change. Per-value registry failures are
+/// logged and skipped (best-effort), so the returned backup always covers every
+/// value that was actually modified. Errors if Nagle is requested but no
 /// interface adapters are enumerated.
 pub fn apply(nagle: bool, netbios: bool) -> Result<Vec<BackupEntry>, String> {
+    apply_at(
+        HKEY_LOCAL_MACHINE,
+        TCPIP_INTERFACES_KEY,
+        NETBT_PARAMETERS_KEY,
+        nagle,
+        netbios,
+    )
+}
+
+/// [`apply`] parameterized over the hive root and registry paths so the unit
+/// tests can drive the exact mid-enumeration failure path against a scoped
+/// `HKCU` test key. Production always uses `HKEY_LOCAL_MACHINE`.
+fn apply_at(
+    root: HKEY,
+    interfaces_path: &str,
+    netbt_path: &str,
+    nagle: bool,
+    netbios: bool,
+) -> Result<Vec<BackupEntry>, String> {
     let mut backup = Vec::new();
     if nagle {
-        let adapters = enum_subkeys(HKEY_LOCAL_MACHINE, TCPIP_INTERFACES_KEY)?;
+        let adapters = enum_subkeys(root, interfaces_path)?;
         if adapters.is_empty() {
             return Err("no TCP/IP interface adapters found under Tcpip\\Parameters\\Interfaces".into());
         }
+        // Best-effort per value. A single unreadable/unwritable key must not
+        // abort the whole apply: the old `?` dropped the partially populated
+        // backup on a later adapter failure, stranding earlier modified values
+        // with no revert path. Log-and-continue so the returned backup still
+        // covers every entry actually modified.
         for adapter in adapters {
-            let path = format!("{TCPIP_INTERFACES_KEY}\\{adapter}");
-            backup.push(backup_and_set(HKEY_LOCAL_MACHINE, &path, "TcpAckFrequency", 1)?);
-            backup.push(backup_and_set(HKEY_LOCAL_MACHINE, &path, "TCPNoDelay", 1)?);
+            let path = format!("{interfaces_path}\\{adapter}");
+            for value in ["TcpAckFrequency", "TCPNoDelay"] {
+                match backup_and_set(root, &path, value, 1) {
+                    Ok(entry) => backup.push(entry),
+                    Err(err) => crate::log::warn(format!(
+                        "network apply {path}\\{value}: {err}; skipping this value"
+                    )),
+                }
+            }
         }
     }
     if netbios {
-        backup.push(backup_and_set(
-            HKEY_LOCAL_MACHINE,
-            NETBT_PARAMETERS_KEY,
-            "DisableNetbiosOverTcpip",
-            2,
-        )?);
+        match backup_and_set(root, netbt_path, "DisableNetbiosOverTcpip", 2) {
+            Ok(entry) => backup.push(entry),
+            Err(err) => crate::log::warn(format!(
+                "network apply {netbt_path}\\DisableNetbiosOverTcpip: {err}; skipping"
+            )),
+        }
     }
     Ok(backup)
 }
@@ -220,7 +263,7 @@ mod tests {
     use super::*;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, HKEY_CURRENT_USER, KEY_ALL_ACCESS,
-        REG_OPTION_NON_VOLATILE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
     const TEST_VALUE: &str = "TestValue";
@@ -255,6 +298,29 @@ mod tests {
         unsafe {
             let _ = RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(wide.as_ptr()));
         }
+    }
+
+    /// Write a `REG_SZ` value. Used to plant a non-DWORD under a test key so the
+    /// DWORD read path hits the `ERROR_UNSUPPORTED_TYPE` branch.
+    fn write_string_value(root: HKEY, path: &str, value: &str, text: &str) -> Result<(), String> {
+        let hkey = open_key(root, path, KEY_WRITE)?;
+        let result = (|| {
+            let wide = to_wide(value);
+            let data = text
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>();
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), data.len() * 2) };
+            let err =
+                unsafe { RegSetValueExW(hkey, PCWSTR(wide.as_ptr()), None, REG_SZ, Some(bytes)) };
+            if err != ERROR_SUCCESS {
+                return Err(format!("RegSetValueExW({value}): code {}", err.0));
+            }
+            Ok(())
+        })();
+        let _ = unsafe { RegCloseKey(hkey) };
+        result
     }
 
     /// Backup/apply/revert roundtrip against a scoped test key under HKCU, so
@@ -328,5 +394,82 @@ mod tests {
     fn apply_noop_when_flags_off() {
         let backup = apply(false, false).expect("no-op apply");
         assert!(backup.is_empty(), "nothing applied when all flags off");
+    }
+
+    /// A mid-enumeration failure must not strand earlier entries: `apply` logs
+    /// and continues, and the returned backup still covers every value it
+    /// actually modified, so reverting it restores each one. Also exercises the
+    /// non-DWORD (`ERROR_UNSUPPORTED_TYPE`) read path.
+    #[test]
+    fn apply_continues_past_per_adapter_failure_and_reverts_what_applied() {
+        let base = "Software\\AetherisTests\\ApplyContinue";
+        let path_a = format!("{base}\\A");
+        let path_b = format!("{base}\\B");
+        // Leaf subkeys first, then the parent key.
+        remove_test_key(&path_a);
+        remove_test_key(&path_b);
+        remove_test_key(base);
+        ensure_test_key(&path_a).expect("create adapter subkey A");
+        ensure_test_key(&path_b).expect("create adapter subkey B");
+
+        // Pre-write B's TcpAckFrequency as a string: reading it back as a
+        // REG_DWORD fails with a distinct type-mismatch error. The old code
+        // aborted the whole apply here, stranding A's already-applied values;
+        // the fixed apply logs, skips this value, and keeps going.
+        write_string_value(HKEY_CURRENT_USER, &path_b, "TcpAckFrequency", "not-a-dword")
+            .expect("write string under B");
+
+        let backup =
+            apply_at(HKEY_CURRENT_USER, base, base, true, false).expect("apply continues");
+
+        // A's two values applied; B's TcpAckFrequency skipped (type mismatch)
+        // but B's TCPNoDelay (absent before) applied and backed up.
+        assert_eq!(backup.len(), 3, "backup covers every value actually modified");
+        assert_eq!(
+            read_dword(HKEY_CURRENT_USER, &path_a, "TcpAckFrequency")
+                .expect("read")
+                .unwrap(),
+            1,
+            "A TcpAckFrequency applied"
+        );
+        assert_eq!(
+            read_dword(HKEY_CURRENT_USER, &path_a, "TCPNoDelay")
+                .expect("read")
+                .unwrap(),
+            1,
+            "A TCPNoDelay applied"
+        );
+        assert_eq!(
+            read_dword(HKEY_CURRENT_USER, &path_b, "TCPNoDelay")
+                .expect("read")
+                .unwrap(),
+            1,
+            "B TCPNoDelay applied despite sibling failure"
+        );
+
+        // Reverting the returned backup restores every modified value (each was
+        // absent before apply, so every revert deletes the value).
+        for entry in &backup {
+            revert_entry(HKEY_CURRENT_USER, entry).expect("revert entry");
+        }
+        assert_eq!(
+            read_dword(HKEY_CURRENT_USER, &path_a, "TcpAckFrequency").expect("read"),
+            None,
+            "A TcpAckFrequency reverted"
+        );
+        assert_eq!(
+            read_dword(HKEY_CURRENT_USER, &path_a, "TCPNoDelay").expect("read"),
+            None,
+            "A TCPNoDelay reverted"
+        );
+        assert_eq!(
+            read_dword(HKEY_CURRENT_USER, &path_b, "TCPNoDelay").expect("read"),
+            None,
+            "B TCPNoDelay reverted"
+        );
+
+        remove_test_key(&path_a);
+        remove_test_key(&path_b);
+        remove_test_key(base);
     }
 }
