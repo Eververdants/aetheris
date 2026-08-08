@@ -5,6 +5,7 @@
 pub mod actions;
 pub mod config;
 pub mod etw;
+pub mod events;
 pub mod foreground;
 pub mod ipc;
 pub mod log;
