@@ -49,7 +49,6 @@ pub struct ProcState {
 pub enum ActionError {
     Open(u32),
     Api(String),
-    Job(String),
 }
 
 impl fmt::Display for ActionError {
@@ -57,7 +56,6 @@ impl fmt::Display for ActionError {
         match self {
             ActionError::Open(code) => write!(f, "open process failed: code {code}"),
             ActionError::Api(m) => write!(f, "api: {m}"),
-            ActionError::Job(m) => write!(f, "job: {m}"),
         }
     }
 }
@@ -76,8 +74,8 @@ pub const PROCESS_QUERY: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(
 
 /// Full access rights needed to apply every action (query, set, suspend, terminate).
 ///
-/// `PROCESS_SET_QUOTA` is required by `AssignProcessToJobObject` (QoS), and
-/// `PROCESS_SUSPEND_RESUME` by `NtSuspendProcess`/`NtResumeProcess`.
+/// `PROCESS_SET_QUOTA` is required by `SetProcessWorkingSetSize` (memory trim),
+/// and `PROCESS_SUSPEND_RESUME` by `NtSuspendProcess`/`NtResumeProcess`.
 const PROCESS_RIGHTS: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(
     PROCESS_QUERY.0
         | PROCESS_SET_INFORMATION.0
@@ -115,32 +113,19 @@ pub(crate) fn open_process(pid: u32) -> Result<HANDLE, ActionError> {
     Ok(h)
 }
 
-/// Per-process QoS state tracked by [`OsBackend`].
-///
-/// `job` is the Job Object used for CPU rate control (QoS); it is `Some` only
-/// when the process was successfully assigned to it. When assignment failed we
-/// fall back to Background Processing Mode (`background_mode == true`, no job
-/// handle) so a later clear can reverse the mode.
-struct JobEntry {
-    job: Option<HANDLE>,
-    background_mode: bool,
-}
-
 /// Production backend backed by the Windows process APIs.
 ///
-/// Holds a per-pid map of QoS state. A job object is created lazily on first
-/// QoS assignment and kept so the quota can be changed or cleared later without
-/// re-creating it. Because the map also records whether the Background
-/// Processing Mode fallback was used, a clear can reverse both paths. Job
-/// handles are closed on drop (or evicted when their entry is cleared).
+/// Tracks which pids are currently in Background Processing Mode so a later
+/// clear can reverse exactly what was applied. v1 creates no Job Objects:
+/// QoS is Background Processing Mode (see [`OsBackend::apply_qos`] for why).
 pub struct OsBackend {
-    jobs: std::sync::Mutex<std::collections::HashMap<u32, JobEntry>>,
+    background_mode: std::sync::Mutex<std::collections::HashSet<u32>>,
 }
 
 impl OsBackend {
     pub fn new() -> Self {
         Self {
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            background_mode: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -190,116 +175,58 @@ impl OsBackend {
         }
     }
 
-    /// Apply a CPU rate-control quota to `pid` via a Job Object, or clear it.
+    /// Apply or clear CPU throttling for `pid` via Background Processing Mode.
     ///
-    /// `percent == 0` clears any existing rate control (unlimited CPU) and
-    /// reverses the Background Processing Mode fallback if it was applied.
-    /// A non-zero quota is enforced as a per-job hard cap in 0.01% units. If
-    /// the target cannot be assigned to a new job (it already lives in another
-    /// job, common for browsers), fall back to Background Processing Mode, which
-    /// lowers the process's I/O and CPU priority (spec §5.4).
+    /// `percent > 0` enters Background Processing Mode (`SetPriorityClass(...,
+    /// PROCESS_MODE_BACKGROUND_BEGIN)`), which lowers the process's resource
+    /// scheduling priorities (spec §5.4); `percent == 0` leaves it again.
+    ///
+    /// Why Background Processing Mode and not a Job Object (v1 decision):
+    /// a Job Object is destroyed when the last open handle to it is closed, and
+    /// destroying a job terminates every process still assigned to it. The
+    /// service is currently a console process stopped with Ctrl-C: with the
+    /// shipped `aetheris.toml` (`qos_cpu_quota = 50` on `chrome.exe`) the old
+    /// code held a live Job Object per capped process across a game session, so
+    /// Ctrl-C'ing the service after a session closed the last handle and KILLED
+    /// the still-capped browsers. Background Processing Mode has no such
+    /// lifetime hazard. Job Object QoS may return in v2 once the service runs
+    /// as a long-lived SCM service whose lifetime is independent of the console
+    /// host — and if it does, never close the last job handle while processes
+    /// are assigned; leak instead.
+    ///
+    /// Documented OS limitation: MSDN states `PROCESS_MODE_BACKGROUND_BEGIN` /
+    /// `END` "can be specified only if hProcess is a handle to the current
+    /// process". aetheris manages *other* processes, so on most hosts this call
+    /// fails with ERROR_INVALID_PARAMETER and the engine logs the apply as a
+    /// warning (priority/affinity/suspend still apply). That is acceptable for
+    /// v1: the mechanism is safe and reversible by construction, and a real
+    /// cross-process CPU cap (via `NtSetInformationProcess` or Job Objects in a
+    /// long-lived service) is future work.
     fn apply_qos(&self, pid: u32, percent: u32) -> Result<(), ActionError> {
-        use windows::Win32::System::JobObjects::*;
-
         if percent == 0 {
-            // Clear: reverse any background-mode fallback, disable CPU rate
-            // control on the existing job (unlimited), then evict the entry so
-            // Drop does not double-handle it. The job handle is intentionally
-            // not closed here: closing the last handle to a job object destroys
-            // it and terminates the assigned processes.
-            let mut jobs = self.jobs.lock().unwrap();
-            if let Some(entry) = jobs.remove(&pid) {
-                if entry.background_mode {
-                    // The process was never assigned to our job (assign failed),
-                    // so only SetPriorityClass can take it out of Background
-                    // Processing Mode.
-                    let h = open_process(pid)?;
-                    let r = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_END) };
-                    let _ = unsafe { CloseHandle(h) };
-                    r.map_err(|e| ActionError::Job(format!("clear background mode: {e}")))?;
-                }
-                if let Some(job) = entry.job {
-                    let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
-                        ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL(0),
-                        ..Default::default()
-                    };
-                    unsafe {
-                        SetInformationJobObject(
-                            job,
-                            JobObjectCpuRateControlInformation,
-                            (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
-                            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-                        )
-                    }
-                    .map_err(|e| ActionError::Job(format!("clear rate control: {e}")))?;
-                }
+            // Clear: reverse Background Processing Mode only if we applied it.
+            // Calling it when the pid was never put into background mode is a
+            // no-op (the engine only issues a clear after a successful apply).
+            let mut bg = self.background_mode.lock().unwrap();
+            if bg.remove(&pid) {
+                let h = open_process(pid)?;
+                let r = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_END) };
+                let _ = unsafe { CloseHandle(h) };
+                r.map_err(|e| ActionError::Api(format!("PROCESS_MODE_BACKGROUND_END: {e}")))?;
             }
             return Ok(());
         }
 
-        // Find-or-create a job for this pid.
-        let mut jobs = self.jobs.lock().unwrap();
-        let (job, fresh) = match jobs.get(&pid) {
-            Some(JobEntry { job: Some(j), .. }) => (*j, false),
-            _ => {
-                let j = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-                    .map_err(|e| ActionError::Job(format!("CreateJobObjectW: {e}")))?;
-                (j, true)
-            }
-        };
-
-        let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
-            ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-            Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 {
-                CpuRate: percent * 100, // per-job hard cap, in units of 0.01%
-            },
-        };
-        unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectCpuRateControlInformation,
-                (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-            )
+        let mut bg = self.background_mode.lock().unwrap();
+        if bg.contains(&pid) {
+            // Already in background mode (idempotent re-apply); nothing to do.
+            return Ok(());
         }
-        .map_err(|e| ActionError::Job(format!("set rate control: {e}")))?;
-
         let h = open_process(pid)?;
-        let assigned = unsafe { AssignProcessToJobObject(job, h) };
-        if assigned.is_err() {
-            // Fallback (spec §5.4): target already in a job (common for browsers).
-            // Background Processing Mode lowers the process's I/O and CPU priority.
-            // Record the mode so a later clear can reverse it; do not track a job
-            // handle since the assign failed. If we just created an (empty) job,
-            // close it rather than leak it.
-            let fb = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_BEGIN) };
-            let _ = unsafe { CloseHandle(h) };
-            if fresh {
-                let _ = unsafe { CloseHandle(job) };
-            }
-            jobs.insert(
-                pid,
-                JobEntry {
-                    job: None,
-                    background_mode: true,
-                },
-            );
-            return match fb {
-                Ok(()) => Ok(()),
-                Err(e) => Err(ActionError::Job(format!(
-                    "assign-to-job and background-mode fallback both failed: {e}"
-                ))),
-            };
-        }
+        let r = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_BEGIN) };
         let _ = unsafe { CloseHandle(h) };
-        // Primary path: track the job so the quota can be changed or cleared later.
-        jobs.insert(
-            pid,
-            JobEntry {
-                job: Some(job),
-                background_mode: false,
-            },
-        );
+        r.map_err(|e| ActionError::Api(format!("PROCESS_MODE_BACKGROUND_BEGIN: {e}")))?;
+        bg.insert(pid);
         Ok(())
     }
 }
@@ -312,18 +239,14 @@ impl Default for OsBackend {
 
 impl Drop for OsBackend {
     fn drop(&mut self) {
-        // Close every job handle still tracked (entries cleared via QoS clear
-        // have already been evicted). Guard against a null HANDLE. Closing the
-        // last handle to a job object destroys it (terminating any processes
-        // still assigned to it), which is the intended teardown semantics.
-        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in jobs.values() {
-            if let Some(job) = entry.job {
-                if !job.0.is_null() {
-                    let _ = unsafe { CloseHandle(job) };
-                }
-            }
-        }
+        // Intentionally do NOT close any Job Object handle here. Closing the
+        // last handle to a job object destroys the job and TERMINATES every
+        // process still assigned to it — the exact Ctrl-C hazard Critical 2
+        // removes. v1 creates no Job Objects (QoS is Background Processing
+        // Mode, tracked in `background_mode`), so there is nothing to close;
+        // the Background Processing Mode flag is left as-is on the (about to
+        // exit) service, which is safe. If a job handle is ever reintroduced,
+        // leak it rather than close it while processes are assigned.
     }
 }
 
@@ -337,6 +260,11 @@ impl ProcessBackend for OsBackend {
             .map_err(|e| ActionError::Api(format!("GetProcessAffinityMask: {e}")));
         let _ = unsafe { CloseHandle(h) };
         r?;
+        // `suspended`/`qos_percent` are intentionally left at their defaults:
+        // this is a PRE-action snapshot and aetheris never restores a
+        // suspension or QoS cap it did not apply. The policy engine records
+        // what IT applied into the stored `ProcState` (`apply_background_to`),
+        // which is what drives `restore()` to Resume / clear a cap.
         Ok(ProcState {
             priority,
             affinity: mask as u64,

@@ -2,8 +2,8 @@
 
 A zero-overhead Windows game-optimization service written in Rust. When a game
 is in the foreground, aetheris throttles background processes (priority,
-affinity, CPU-quota via Job Objects, suspend, memory trim) so the game gets the
-machine to itself — then restores everything when the game exits.
+affinity, CPU-quota, suspend, memory trim) so the game gets the machine to
+itself — then restores everything when the game exits.
 
 ## What it is
 
@@ -77,6 +77,9 @@ boosted:
   chrome.exe (pid 1234)
 ```
 
+(illustrative — v1 `get-state` returns an empty snapshot, so the real output is
+an empty `mode:` and a `(none)` boosted list; see Known v1 gaps)
+
 ## Config reference
 
 See the committed `aetheris.toml` at the repo root. Sections:
@@ -86,9 +89,10 @@ See the committed `aetheris.toml` at the repo root. Sections:
   names).
 - `[[background]]` — processes throttled while a game runs. `name` is a
   case-insensitive substring; optional `suspend`, `priority` (`idle`,
-  `below_normal`, ...), `qos_cpu_quota` (Job-Object CPU %), `trim_memory`
-  (working-set flush). Suspend and trim are explicit opt-in and default to
-  false — they are only applied to non-critical apps.
+  `below_normal`, ...), `qos_cpu_quota` (Background-Processing-Mode CPU throttle;
+  see Known v1 gaps), `trim_memory` (working-set flush). Suspend and trim are
+  explicit opt-in and default to false — they are only applied to non-critical
+  apps.
 - `[[rule]]` — always-on rules applied in any mode.
 - `protected_extra` — additional names added to the hardcoded protected list.
 
@@ -104,6 +108,20 @@ Documented so they are not mistaken for bugs:
   `StateSnapshot::default()`, so `aetheris-cli get-state` may print an empty
   `mode:` and `(none)` for the boosted list even while a game is running. Live
   state is deferred (spec acceptance item 8).
+- **`aetheris-cli query` always returns "not found".** IPC `QueryProcess` is a
+  v1 stub — the service always answers `Process(None)`.
+- **`aetheris-cli` must ALSO run elevated.** The named pipe is created with the
+  default pipe DACL, so a non-elevated CLI is denied access to the elevated
+  service's pipe. Run the CLI from an elevated terminal too.
+- **`qos_cpu_quota` is a safe v1 no-op for cross-process targets.** v1 throttles
+  via Background Processing Mode (`SetPriorityClass`), not Job Objects — a
+  console service holding a Job Object handle across a game session would
+  terminate still-capped processes on Ctrl-C. MSDN documents
+  `PROCESS_MODE_BACKGROUND_BEGIN/END` as current-process-only, so applying it to
+  another process (the only case aetheris has) fails with
+  `ERROR_INVALID_PARAMETER` and is logged as a warning. This is safe and
+  reversible; priority / affinity / suspend still apply. A real cross-process
+  CPU cap is deferred (v2).
 - **Affinity skips >64-logical-CPU hosts.** Classic `SetProcessAffinityMask`
   is a single `ULONG_PTR` and silently no-ops above one processor group.
   Group-aware affinity (`SetProcessDefaultCpuSetMasks` / `NtSetInformationProcess`)

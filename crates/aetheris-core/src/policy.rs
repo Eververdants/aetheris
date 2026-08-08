@@ -224,13 +224,25 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         if self.boosted.contains_key(&pid) {
             return;
         }
-        let state = match self.backend.snapshot(pid) {
+        let mut state = match self.backend.snapshot(pid) {
             Ok(s) => s,
             Err(_) => return,
         };
         for a in Self::actions_for(rule) {
-            if let Err(e) = self.backend.apply(pid, &a) {
-                crate::log::warn(format!("apply {pid} {:?}: {e}", a));
+            match self.backend.apply(pid, &a) {
+                Ok(()) => {
+                    // Record what was actually applied so `restore` can reverse
+                    // it (Critical 1): the pre-action snapshot always reports
+                    // `suspended: false` / `qos_percent: None`, so without this
+                    // a suspended or QoS-capped process was never resumed or
+                    // un-capped on game exit.
+                    match a {
+                        TargetAction::Suspend => state.suspended = true,
+                        TargetAction::QosCpuQuota { percent } => state.qos_percent = Some(percent),
+                        _ => {}
+                    }
+                }
+                Err(e) => crate::log::warn(format!("apply {pid} {:?}: {e}", a)),
             }
         }
         self.boosted.insert(pid, state);

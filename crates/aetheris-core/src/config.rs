@@ -140,11 +140,28 @@ impl Config {
                         b.name
                     )));
                 }
+                if let Some(c) = a.cores.iter().copied().find(|c| *c >= 64) {
+                    // `mask_from_cores` builds the mask as a u64 (`1u64 << c`);
+                    // any core index >= 64 would panic (and the release profile
+                    // aborts on panic, crashing the service).
+                    return Err(ConfigError::Validation(format!(
+                        "affinity for '{}' has core index {c} >= 64 (max 63)",
+                        b.name
+                    )));
+                }
             }
         }
         for r in &self.rule {
             if r.name.trim().is_empty() {
                 return Err(ConfigError::Validation("rule missing name".into()));
+            }
+            if let Some(a) = &r.affinity {
+                if let Some(c) = a.cores.iter().copied().find(|c| *c >= 64) {
+                    return Err(ConfigError::Validation(format!(
+                        "affinity for '{}' has core index {c} >= 64 (max 63)",
+                        r.name
+                    )));
+                }
             }
         }
         Ok(())
@@ -232,6 +249,43 @@ name = "x.exe"
 affinity = { cores = [] }
 "#;
         assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn reject_affinity_core_index_ge_64() {
+        // core index 64 would make mask_from_cores shift `1u64 << 64`, which
+        // panics in release (abort). It must be rejected at config load.
+        let s = r#"
+[game]
+processes = []
+
+[[background]]
+name = "x.exe"
+affinity = { cores = [0, 64] }
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // An always-rule affinity is validated too.
+        let s2 = r#"
+[game]
+processes = []
+
+[[rule]]
+name = "y.exe"
+affinity = { cores = [64] }
+"#;
+        assert!(Config::from_str(s2).is_err());
+
+        // Boundary core 63 is fine.
+        let s3 = r#"
+[game]
+processes = []
+
+[[background]]
+name = "z.exe"
+affinity = { cores = [63] }
+"#;
+        Config::from_str(s3).expect("core 63 is the maximum valid index");
     }
 
     #[test]

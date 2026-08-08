@@ -165,7 +165,12 @@ impl Service {
             match msg {
                 ServiceMsg::Stop => break,
                 ServiceMsg::Reload => {
-                    let _ = self.handle_message(&ServiceMsg::Reload);
+                    // A malformed config keeps the previous config active; log
+                    // it so the failure is at least visible (the IPC handler
+                    // still answers "queued" — the warning is the feedback).
+                    if let Err(e) = self.handle_message(&ServiceMsg::Reload) {
+                        log::warn(format!("reload failed (keeping previous config): {e}"));
+                    }
                 }
                 ServiceMsg::Proc(ev) => {
                     if system_load_percent() > 85 {
