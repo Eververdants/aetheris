@@ -34,7 +34,7 @@
 //! zero-cost transmute of the same COM pointer).
 
 use windows::core::{w, Interface, PCWSTR, Result};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, S_FALSE, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -61,6 +61,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     IDXGIDevice, IDXGIFactory2, IDXGISurface2, IDXGISwapChain1,
 };
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -131,6 +132,7 @@ unsafe fn render_telemetry(
     rt: &ID2D1RenderTarget,
     swapchain: &IDXGISwapChain1,
     text_format: &IDWriteTextFormat,
+    text_brush: &ID2D1SolidColorBrush,
     text: &str,
 ) -> Result<()> {
     // Re-acquire the flip-model back buffer on every call (flip-model buffers
@@ -146,16 +148,6 @@ unsafe fn render_telemetry(
     // premultiplied composition swapchain needs for per-pixel transparency.
     let target: ID2D1Bitmap1 = dctx.CreateBitmapFromDxgiSurface(&surface, None)?;
     dctx.SetTarget(&target);
-
-    let text_brush: ID2D1SolidColorBrush = rt.CreateSolidColorBrush(
-        &D2D1_COLOR_F {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 1.0,
-        },
-        None,
-    )?;
 
     rt.BeginDraw();
     // Fully transparent background: per-pixel alpha from the premultiplied
@@ -177,7 +169,7 @@ unsafe fn render_telemetry(
         &wide,
         text_format,
         &layout,
-        &text_brush,
+        text_brush,
         D2D1_DRAW_TEXT_OPTIONS_NONE,
         DWRITE_MEASURING_MODE_NATURAL,
     );
@@ -203,6 +195,20 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // COM must be initialized before creating a shared DWrite factory
+    // (DWRITE_FACTORY_TYPE_SHARED), D2D or DComp — all assume COM and would
+    // fail with CO_E_NOTINITIALIZED otherwise. This is a single-threaded UI
+    // thread, so apartment-threaded is the correct model (NOT multi-threaded,
+    // which is incompatible with a shared DWrite factory). S_FALSE means COM
+    // was already initialized on this thread with the same model — benign,
+    // keep going; anything else that failed is fatal.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if com == S_FALSE {
+        eprintln!("aetheris-overlay: COM already initialized on this thread (S_FALSE)");
+    } else if com.is_err() {
+        return Err(com.into());
+    }
+
     // Parse `--pipe <name>`; default to the service's well-known pipe. Task 2
     // uses it for `client_call`; Task 1 only displays it in the placeholder.
     let mut pipe = DEFAULT_PIPE.to_string();
@@ -335,7 +341,19 @@ fn run() -> Result<()> {
         text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
         text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
 
-        render_telemetry(&dctx, &rt, &swapchain, &text_format, &placeholder)?;
+        // White text brush, created once alongside the text format and reused
+        // across renders (Task 2 re-invokes render_telemetry per 1 Hz update).
+        let text_brush: ID2D1SolidColorBrush = rt.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+            None,
+        )?;
+
+        render_telemetry(&dctx, &rt, &swapchain, &text_format, &text_brush, &placeholder)?;
 
         // --- Message loop ----------------------------------------------------
         // Render-on-demand: Task 1 draws once at startup; the loop only pumps
