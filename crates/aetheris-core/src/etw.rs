@@ -6,14 +6,17 @@
 //! any setup failure returns `Err` so the service fails closed instead of
 //! falling back to polling.
 //!
-//! Decode strategy: event id 1 = Start, 2 = Stop; the affected pid comes from
-//! `EVENT_HEADER.ProcessId`. The image name and parent pid are decoded through
-//! TDH (`TdhGetPropertySize`/`TdhGetProperty`) keyed by property name, with a
-//! bounded fallback that parses the documented kernel-process MOF payload
-//! layout when TDH cannot resolve the schema.
+//! Decode strategy: event id 1 = Start, 2 = Stop. The affected pid is decoded
+//! from the payload — the TDH `ProcessId` property first, then a manual decode
+//! of the documented kernel-process layout, with `EVENT_HEADER.ProcessId` as a
+//! last resort (that header field for kernel-process Start events is the
+//! *creating* process, not the affected one). The image name and parent pid are
+//! decoded through TDH (`TdhGetPropertySize`/`TdhGetProperty`) keyed by property
+//! name, with a bounded fallback that parses the documented kernel-process MOF
+//! payload layout when TDH cannot resolve the schema.
 
 use std::os::raw::c_void;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -95,7 +98,12 @@ fn property_string(bytes: &[u8]) -> Option<String> {
     }
     if bytes.len() >= 4 {
         let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        if len > 0 && bytes.len() >= 4 + len * 2 {
+        if len == 0 {
+            // Zero-length prefix means the value is an empty string; do not
+            // fall through and decode the prefix bytes as content.
+            return None;
+        }
+        if bytes.len() >= 4 + len * 2 {
             let s = decode_utf16_units(&bytes[4..4 + len * 2]);
             if !s.is_empty() {
                 return Some(s);
@@ -139,6 +147,16 @@ fn get_property(record: *const EVENT_RECORD, name: &str) -> Option<Vec<u8>> {
         return None;
     }
     Some(buf)
+}
+
+/// Decode a little-endian `UInt32` from a TDH property value's raw bytes (the
+/// kernel-process `ProcessId`/`ParentId` properties are `UInt32`).
+fn decode_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() >= 4 {
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    } else {
+        None
+    }
 }
 
 /// Read a null-terminated UTF-16 string from raw payload bytes.
@@ -202,6 +220,25 @@ fn decode_name_from_payload(record: *const EVENT_RECORD) -> Option<String> {
     }
 }
 
+/// Last-resort affected-pid decode from the documented kernel-process payload
+/// layout. The pid sits at offset 0 for `Process_V0_TypeGroup1` (V0) and after
+/// the pointer-sized `UniqueProcessKey` for `Process_TypeGroup1` (V2+),
+/// mirroring the parent-pid decode offsets. Used for both Start (id 1) and
+/// Stop (id 2) events.
+fn decode_pid_from_payload(data: &[u8], version: u8, ptr: usize) -> Option<u32> {
+    let off = if version == 0 { 0 } else { ptr };
+    if data.len() >= off + 4 {
+        Some(u32::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+        ]))
+    } else {
+        None
+    }
+}
+
 /// Last-resort parent-pid decode from the documented payload layout.
 fn decode_parent_pid_from_payload(record: *const EVENT_RECORD) -> Option<u32> {
     let er = unsafe { &*record };
@@ -246,8 +283,8 @@ fn decode_name(record: *const EVENT_RECORD) -> String {
 fn decode_parent_pid(record: *const EVENT_RECORD) -> u32 {
     for prop in PARENT_PROPERTIES {
         if let Some(bytes) = get_property(record, prop) {
-            if bytes.len() >= 4 {
-                return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if let Some(pid) = decode_u32(&bytes) {
+                return pid;
             }
         }
     }
@@ -255,19 +292,36 @@ fn decode_parent_pid(record: *const EVENT_RECORD) -> u32 {
 }
 
 fn decode_event(record: *const EVENT_RECORD) -> Option<ProcessEvent> {
-    let header = unsafe { &(*record).EventHeader };
-    let id = header.EventDescriptor.Id;
-    let pid = header.ProcessId;
-    if pid == 0 {
-        return None;
-    }
+    let er = unsafe { &*record };
+    let id = er.EventHeader.EventDescriptor.Id;
     let kind = match id {
         1 => ProcessKind::Start,
         2 => ProcessKind::Stop,
         _ => return None,
     };
-    let name = decode_name(record);
-    let parent_pid = decode_parent_pid(record);
+    // `EVENT_HEADER.ProcessId` for kernel-process Start events is the
+    // *creating* process (or System), not the affected one; the authoritative
+    // pid lives in the payload. Prefer the TDH `ProcessId` property, then a
+    // manual decode of the documented layout, and only fall back to the header
+    // field if neither yields a value.
+    let data = unsafe {
+        std::slice::from_raw_parts(er.UserData as *const u8, er.UserDataLength as usize)
+    };
+    let ptr = std::mem::size_of::<usize>();
+    let pid = get_property(record, "ProcessId")
+        .and_then(|bytes| decode_u32(&bytes))
+        .or_else(|| decode_pid_from_payload(data, er.EventHeader.EventDescriptor.Version, ptr))
+        .unwrap_or(er.EventHeader.ProcessId);
+    // Last-resort sanity check: a zero pid is never a usable event.
+    if pid == 0 {
+        return None;
+    }
+    let (name, parent_pid) = match kind {
+        // Stop events carry no image name (and no parent); only the pid is
+        // meaningful, so skip the name/parent TDH probes entirely.
+        ProcessKind::Stop => (String::new(), 0),
+        ProcessKind::Start => (decode_name(record), decode_parent_pid(record)),
+    };
     Some(ProcessEvent {
         pid,
         name,
@@ -281,7 +335,9 @@ impl EtwMonitor {
     /// provider, and spawn the `ProcessTrace` consumer thread. Any failure
     /// returns `Err(String)` (fail-safe: the service exits, never polls).
     pub fn start() -> Result<Self, String> {
-        let (tx, rx) = channel::<ProcessEvent>();
+        // Bounded so a stalled consumer cannot grow memory without limit; when
+        // the buffer is full the ETW callback simply drops the next event.
+        let (tx, rx) = sync_channel::<ProcessEvent>(4096);
         let session_name = wstr(SESSION_NAME);
         let name_bytes = session_name.len() * 2;
 
@@ -340,7 +396,7 @@ impl EtwMonitor {
             )
         };
         if enable_status != ERROR_SUCCESS {
-            let _ = unsafe {
+            let status = unsafe {
                 ControlTraceW(
                     reg_handle,
                     PCWSTR(std::ptr::null()),
@@ -348,6 +404,12 @@ impl EtwMonitor {
                     EVENT_TRACE_CONTROL_STOP,
                 )
             };
+            if status != ERROR_SUCCESS {
+                crate::log::warn(format!(
+                    "ControlTraceW cleanup failed after EnableTraceEx2 error: status 0x{:08X}",
+                    status.0
+                ));
+            }
             return Err(format!(
                 "EnableTraceEx2 failed: status 0x{:08X}",
                 enable_status.0
@@ -361,13 +423,20 @@ impl EtwMonitor {
         logfile.LoggerName = PWSTR(session_name.as_ptr() as *mut u16);
         logfile.Anonymous1.ProcessTraceMode =
             PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-        let ctx = SendPtr(Box::into_raw(Box::new(tx.clone())) as *mut c_void);
+        // Keep the boxed sender owned as a local `Box` across the `OpenTraceW`
+        // call and `thread::spawn` so a panic on either path drops it instead
+        // of leaking the allocation (a raw `SendPtr` has no destructor). It is
+        // only intentionally leaked into `Self::ctx` once the consumer thread
+        // exists, and reclaimed in `shutdown()`.
+        let mut tx_box = Box::new(tx);
+        let ctx = SendPtr(tx_box.as_mut() as *mut SyncSender<ProcessEvent> as *mut c_void);
         logfile.Context = ctx.0;
         logfile.Anonymous2.EventRecordCallback = Some(event_callback);
 
         let trace_handle = unsafe { OpenTraceW(&mut logfile) };
         if trace_handle == INVALID_PROCESSTRACE_HANDLE {
-            let _ = unsafe {
+            // `tx_box` still owns the sender; it is dropped when we return.
+            let status = unsafe {
                 ControlTraceW(
                     reg_handle,
                     PCWSTR(std::ptr::null()),
@@ -375,7 +444,12 @@ impl EtwMonitor {
                     EVENT_TRACE_CONTROL_STOP,
                 )
             };
-            unsafe { drop(Box::from_raw(ctx.0 as *mut Sender<ProcessEvent>)) };
+            if status != ERROR_SUCCESS {
+                crate::log::warn(format!(
+                    "ControlTraceW cleanup failed after OpenTraceW error: status 0x{:08X}",
+                    status.0
+                ));
+            }
             return Err("OpenTraceW failed".into());
         }
 
@@ -389,6 +463,9 @@ impl EtwMonitor {
                 let _ = CloseTrace(trace_handle);
             }
         });
+
+        // Success: intentionally leak the Box into `ctx`.
+        std::mem::forget(tx_box);
 
         Ok(Self {
             rx,
@@ -442,7 +519,7 @@ impl EtwMonitor {
         }
         // Reclaim the callback sender now that the trace has stopped.
         if !self.ctx.0.is_null() {
-            unsafe { drop(Box::from_raw(self.ctx.0 as *mut Sender<ProcessEvent>)) };
+            unsafe { drop(Box::from_raw(self.ctx.0 as *mut SyncSender<ProcessEvent>)) };
             self.ctx.0 = std::ptr::null_mut();
         }
     }
@@ -459,7 +536,7 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     if record.is_null() {
         return;
     }
-    let tx_ptr = (*record).UserContext as *const Sender<ProcessEvent>;
+    let tx_ptr = (*record).UserContext as *const SyncSender<ProcessEvent>;
     if tx_ptr.is_null() {
         return;
     }
@@ -501,6 +578,17 @@ mod tests {
         push_utf16(&mut plain, "dummy_proc.exe");
         plain.extend_from_slice(&[0, 0]);
         assert_eq!(property_string(&plain).as_deref(), Some("dummy_proc.exe"));
+    }
+
+    #[test]
+    fn property_string_zero_length_prefix_is_none() {
+        // 4-byte zero length prefix means an empty string.
+        assert_eq!(property_string(&[0u8, 0, 0, 0]), None);
+        // Zero prefix followed by bytes that would otherwise decode as garbage
+        // must not be read as content.
+        let mut with_garbage = vec![0u8, 0, 0, 0];
+        push_utf16(&mut with_garbage, "junk");
+        assert_eq!(property_string(&with_garbage), None);
     }
 
     #[test]
@@ -556,21 +644,104 @@ mod tests {
         assert!(decode_parent_pid_from_payload(&rec).is_none());
     }
 
+    /// `Process_TypeGroup1` (V2+) layout: UniqueProcessKey(ptr), ProcessId,
+    /// ParentId, SessionId, ExitStatus, DirectoryTableBase(ptr), SID,
+    /// ImageFileName (NUL-terminated UTF-16).
+    fn build_v2_payload(pid: u32, parent: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 8]); // UniqueProcessKey
+        payload.extend_from_slice(&pid.to_le_bytes());
+        payload.extend_from_slice(&parent.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // SessionId
+        payload.extend_from_slice(&0u32.to_le_bytes()); // ExitStatus
+        payload.extend_from_slice(&[0u8; 8]); // DirectoryTableBase
+        // SID: rev=1, 1 sub-authority, authority 5, sub-authority 10.
+        payload.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 10, 0, 0, 0]);
+        push_utf16(&mut payload, "dummy_proc.exe\0");
+        payload
+    }
+
     #[test]
     fn decode_event_maps_ids_to_kinds() {
-        let mut payload = Vec::new();
-        push_utf16(&mut payload, "anything");
+        let mut payload = build_v2_payload(42, 7);
         let mut rec = event_record_with_payload(2, 1, &mut payload);
-        rec.EventHeader.ProcessId = 42;
+        // The header pid is the *creating* process for Start events; the
+        // payload pid must win.
+        rec.EventHeader.ProcessId = 999;
         let ev = decode_event(&rec).expect("start event decodes");
-        assert_eq!(ev.pid, 42);
+        assert_eq!(ev.pid, 42, "pid decoded from payload over the header");
+        assert_eq!(ev.name, "dummy_proc.exe");
+        assert_eq!(ev.parent_pid, 7);
         assert_eq!(ev.kind, ProcessKind::Start);
 
         rec.EventHeader.EventDescriptor.Id = 2;
         let ev = decode_event(&rec).expect("stop event decodes");
+        assert_eq!(ev.pid, 42);
         assert_eq!(ev.kind, ProcessKind::Stop);
+        assert_eq!(ev.name, "", "stop events carry no image name");
+        assert_eq!(ev.parent_pid, 0, "stop events carry no parent");
 
         rec.EventHeader.EventDescriptor.Id = 99;
         assert!(decode_event(&rec).is_none(), "unknown ids are dropped");
+    }
+
+    /// V0 Start: pid at payload offset 0, so `decode_event` must pick it up
+    /// there rather than from `EVENT_HEADER.ProcessId`.
+    #[test]
+    fn decode_event_v0_pid_from_payload_offset_zero() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&777u32.to_le_bytes()); // ProcessId
+        payload.extend_from_slice(&5u32.to_le_bytes()); // ParentId
+        payload.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 5]); // SID
+        push_utf16(&mut payload, "legacy.exe\0");
+        let mut rec = event_record_with_payload(0, 1, &mut payload);
+        rec.EventHeader.ProcessId = 999;
+        let ev = decode_event(&rec).expect("V0 start decodes");
+        assert_eq!(ev.pid, 777, "V0 pid comes from payload offset 0");
+        assert_eq!(ev.parent_pid, 5);
+    }
+
+    #[test]
+    fn decode_u32_reads_little_endian() {
+        assert_eq!(decode_u32(&[0x2A, 0x00, 0x00, 0x00]), Some(42));
+        assert_eq!(decode_u32(&[0x2A, 0x00]), None);
+    }
+
+    #[test]
+    fn decode_pid_from_payload_v0_offset_zero() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&123u32.to_le_bytes()); // ProcessId at offset 0
+        payload.extend_from_slice(&50u32.to_le_bytes()); // ParentId
+        assert_eq!(decode_pid_from_payload(&payload, 0, 8), Some(123));
+    }
+
+    #[test]
+    fn decode_pid_from_payload_v2_offset_ptr() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 8]); // UniqueProcessKey
+        payload.extend_from_slice(&456u32.to_le_bytes()); // ProcessId at offset ptr
+        assert_eq!(decode_pid_from_payload(&payload, 2, 8), Some(456));
+    }
+
+    #[test]
+    fn decode_pid_from_payload_short_payload_is_none() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0x04030201u32.to_le_bytes());
+        // V2 needs `ptr + 4` bytes; a 4-byte payload is too short.
+        assert_eq!(decode_pid_from_payload(&payload, 2, 8), None);
+        // V0 needs only offset 0..4, so it still decodes.
+        assert_eq!(decode_pid_from_payload(&payload, 0, 8), Some(0x04030201));
+    }
+
+    /// A zero pid anywhere in the chain must drop the event (the last-resort
+    /// sanity guard), regardless of the header value.
+    #[test]
+    fn decode_event_drops_zero_pid() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // ProcessId == 0
+        payload.extend_from_slice(&50u32.to_le_bytes()); // ParentId
+        let mut rec = event_record_with_payload(0, 1, &mut payload);
+        rec.EventHeader.ProcessId = 5;
+        assert!(decode_event(&rec).is_none(), "pid 0 events are dropped");
     }
 }
