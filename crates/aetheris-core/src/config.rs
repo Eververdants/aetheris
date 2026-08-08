@@ -111,13 +111,14 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let protected = self.protected_set();
         for b in &self.background {
             if b.name.trim().is_empty() {
                 return Err(ConfigError::Validation("background rule missing name".into()));
             }
             if b.suspend || b.trim_memory {
                 let p = b.name.to_ascii_lowercase();
-                if DEFAULT_PROTECTED.contains(&p.as_str()) {
+                if protected.contains(&p) {
                     return Err(ConfigError::Validation(format!(
                         "rule '{}' targets a protected process with suspend/trim",
                         b.name
@@ -203,6 +204,34 @@ name = "csrss.exe"
 suspend = true
 "#;
         assert!(Config::from_str(s).is_err(), "must reject protected+action");
+    }
+
+    #[test]
+    fn reject_suspend_on_protected_extra() {
+        let s = r#"
+protected_extra = ["MyCritical.exe"]
+
+[game]
+processes = ["game.exe"]
+
+[[background]]
+name = "MyCritical.exe"
+suspend = true
+"#;
+        assert!(Config::from_str(s).is_err(), "must reject suspend on protected_extra");
+    }
+
+    #[test]
+    fn reject_empty_affinity_cores() {
+        let s = r#"
+[game]
+processes = []
+
+[[background]]
+name = "x.exe"
+affinity = { cores = [] }
+"#;
+        assert!(Config::from_str(s).is_err());
     }
 
     #[test]
