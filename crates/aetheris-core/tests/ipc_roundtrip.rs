@@ -15,6 +15,7 @@ fn roundtrip_get_state_and_query() {
                 Request::GetState => Response::State(StateSnapshot {
                     mode: "Normal".into(),
                     boosted: vec![],
+                    ..StateSnapshot::default()
                 }),
                 Request::QueryProcess(name) => Response::Process(Some(ProcessInfo {
                     pid: 42,

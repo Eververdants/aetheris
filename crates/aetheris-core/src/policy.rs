@@ -65,6 +65,13 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         self.table.name(pid).map(|s| s.to_string())
     }
 
+    /// Iterate every tracked process as `(pid, name, is_game)`. Exposed so
+    /// `Service::current_state` can render the live process list into the shared
+    /// IPC snapshot (`QueryProcess` matches against it).
+    pub fn iter_processes(&self) -> impl Iterator<Item = (u32, &str, bool)> {
+        self.table.iter()
+    }
+
     fn is_protected(&self, name: &str) -> bool {
         self.protected.contains(&name.to_ascii_lowercase())
     }

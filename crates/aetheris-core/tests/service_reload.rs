@@ -50,7 +50,7 @@ fn service_processes_messages_and_reload() {
     let mut child = spawn_dummy();
     let bg_pid = child.id();
 
-    let mut svc = Service::new(&tmp, Config::load(&tmp).expect("cfg"));
+    let (mut svc, _state) = Service::new(&tmp, Config::load(&tmp).expect("cfg"));
 
     // Background helper starts first.
     svc.handle_message(&ServiceMsg::Proc(ProcessEvent {

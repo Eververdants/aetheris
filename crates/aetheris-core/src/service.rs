@@ -14,6 +14,7 @@
 //! lands in v1.1.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::actions::OsBackend;
@@ -37,21 +38,33 @@ pub struct Service {
     engine: PolicyEngine<OsBackend>,
     stop_tx: Sender<ServiceMsg>,
     stop_rx: Option<Receiver<ServiceMsg>>,
+    /// Shared IPC snapshot: refreshed by the main loop after every message and
+    /// read by the IPC thread to answer `GetState` / `QueryProcess` without
+    /// touching the engine.
+    state: Arc<RwLock<StateSnapshot>>,
 }
 
 impl Service {
-    pub fn new(cfg_path: &Path, cfg: Config) -> Self {
+    /// Build the service and the shared state snapshot `Arc`. The caller hands
+    /// the `Arc` to whichever thread must answer live-state queries (in v1 the
+    /// IPC thread spawned by [`Service::run`]).
+    pub fn new(cfg_path: &Path, cfg: Config) -> (Self, Arc<RwLock<StateSnapshot>>) {
         let backend = OsBackend::new();
         if let Err(e) = backend.enable_privileges() {
             log::warn(format!("privilege bootstrap failed: {e}"));
         }
         let (stop_tx, stop_rx) = channel::<ServiceMsg>();
-        Self {
-            cfg_path: cfg_path.to_path_buf(),
-            engine: PolicyEngine::new(cfg, backend),
-            stop_tx,
-            stop_rx: Some(stop_rx),
-        }
+        let state = Arc::new(RwLock::new(StateSnapshot::default()));
+        (
+            Self {
+                cfg_path: cfg_path.to_path_buf(),
+                engine: PolicyEngine::new(cfg, backend),
+                stop_tx,
+                stop_rx: Some(stop_rx),
+                state: state.clone(),
+            },
+            state,
+        )
     }
 
     pub fn cfg_path(&self) -> &Path {
@@ -66,9 +79,11 @@ impl Service {
     /// Dispatch a message to the engine. The testable core of the loop: `Reload`
     /// re-reads the config file and swaps it in (which exits GameBoost cleanly);
     /// `Stop` exits GameBoost so every boosted process is restored (a suspended
-    /// or down-prioritized process must not survive the service).
+    /// or down-prioritized process must not survive the service). The shared
+    /// snapshot is refreshed once after every message, so `GetState` /
+    /// `QueryProcess` readers always see the latest engine state.
     pub fn handle_message(&mut self, msg: &ServiceMsg) -> Result<(), String> {
-        match msg {
+        let res = match msg {
             ServiceMsg::Proc(ev) => {
                 self.engine.on_process_event(ev);
                 Ok(())
@@ -77,12 +92,7 @@ impl Service {
                 self.engine.on_foreground(ev);
                 Ok(())
             }
-            ServiceMsg::Reload => {
-                let cfg = Config::load(&self.cfg_path).map_err(|e| e.to_string())?;
-                // set_config exits GameBoost cleanly (restores boosted) before swapping.
-                self.engine.set_config(cfg);
-                Ok(())
-            }
+            ServiceMsg::Reload => self.reload(),
             ServiceMsg::Stop => {
                 // Restore every boosted process before the loop breaks, so a
                 // Ctrl-C mid-game never leaves processes suspended or
@@ -90,6 +100,42 @@ impl Service {
                 self.engine.exit_game_mode();
                 Ok(())
             }
+        };
+        self.refresh_state();
+        res
+    }
+
+    /// Re-read the config file and swap it in (`set_config` exits GameBoost
+    /// cleanly). `last_reload` is recorded in the shared snapshot so IPC readers
+    /// can see the most recent reload outcome.
+    fn reload(&mut self) -> Result<(), String> {
+        match Config::load(&self.cfg_path) {
+            Ok(cfg) => {
+                self.engine.set_config(cfg);
+                self.set_last_reload(None);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.set_last_reload(Some(msg.clone()));
+                Err(msg)
+            }
+        }
+    }
+
+    fn set_last_reload(&self, val: Option<String>) {
+        if let Ok(mut s) = self.state.write() {
+            s.last_reload = val;
+        }
+    }
+
+    /// Rebuild the shared snapshot from the engine's current state. Reads
+    /// `last_reload` back out of the snapshot so `current_state` callers (and a
+    /// subsequent refresh) do not clobber the recorded reload outcome.
+    fn refresh_state(&self) {
+        let snap = self.current_state();
+        if let Ok(mut s) = self.state.write() {
+            *s = snap;
         }
     }
 
@@ -108,7 +154,17 @@ impl Service {
                 is_game: false,
             })
             .collect();
-        StateSnapshot { mode, boosted }
+        let processes = self
+            .engine
+            .iter_processes()
+            .map(|(pid, name, is_game)| ProcessInfo {
+                pid,
+                name: name.to_string(),
+                is_game,
+            })
+            .collect();
+        let last_reload = self.state.read().ok().and_then(|s| s.last_reload.clone());
+        StateSnapshot { mode, boosted, processes, last_reload }
     }
 
     /// Spawn the ETW / foreground / IPC threads, each feeding the shared event
@@ -148,19 +204,36 @@ impl Service {
             }
         });
 
-        // IPC server: serves a stub state snapshot and forwards reloads to the
-        // main loop.
+        // IPC server: answers GetState/QueryProcess from the shared snapshot
+        // (refreshed by the main loop after every message) and forwards reloads
+        // to the main loop.
+        let state = self.state.clone();
         let ipc_tx = tx.clone();
         let ipc_server = IpcServer::new(DEFAULT_PIPE);
         std::thread::spawn(move || {
             let mut handle_req = |req: &Request| -> Response {
                 match req {
-                    Request::GetState => Response::State(StateSnapshot::default()),
+                    Request::GetState => {
+                        let s = state.read().unwrap();
+                        Response::State(s.clone())
+                    }
+                    Request::QueryProcess(name) => {
+                        let s = state.read().unwrap();
+                        let found = s
+                            .processes
+                            .iter()
+                            .find(|p| {
+                                p.name
+                                    .to_ascii_lowercase()
+                                    .contains(&name.to_ascii_lowercase())
+                            })
+                            .cloned();
+                        Response::Process(found)
+                    }
                     Request::ReloadConfig => {
                         let _ = ipc_tx.send(ServiceMsg::Reload);
                         Response::Reload("queued".into())
                     }
-                    Request::QueryProcess(_name) => Response::Process(None),
                 }
             };
             let _ = ipc_server.run(&mut handle_req);

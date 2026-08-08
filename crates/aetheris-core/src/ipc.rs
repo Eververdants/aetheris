@@ -47,6 +47,8 @@ pub enum Response {
 pub struct StateSnapshot {
     pub mode: String,
     pub boosted: Vec<ProcessInfo>,
+    pub processes: Vec<ProcessInfo>,
+    pub last_reload: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

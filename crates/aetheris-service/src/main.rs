@@ -32,7 +32,7 @@ fn main() {
         }
     };
 
-    let service = Service::new(&cfg_path, cfg);
+    let (service, _state) = Service::new(&cfg_path, cfg);
     let stop_tx: Sender<ServiceMsg> = service.stop_sender();
 
     if let Err(e) = ctrlc::set_handler(move || {
