@@ -7,19 +7,21 @@
 use std::fmt;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
+use windows::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetPriorityClass, GetProcessAffinityMask, OpenProcess, OpenProcessToken,
-    SetPriorityClass, SetProcessAffinityMask, SetProcessWorkingSetSize, ABOVE_NORMAL_PRIORITY_CLASS,
-    BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-    PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_MODE_BACKGROUND_BEGIN,
-    PROCESS_MODE_BACKGROUND_END, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE,
-    REALTIME_PRIORITY_CLASS,
+    ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetCurrentProcess, GetPriorityClass,
+    GetProcessAffinityMask, OpenProcess, OpenProcessToken, SetPriorityClass,
+    SetProcessAffinityMask, SetProcessDefaultCpuSetMasks, SetProcessWorkingSetSize,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS,
+    PROCESS_MODE_BACKGROUND_BEGIN, PROCESS_MODE_BACKGROUND_END, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
 };
 
 use crate::config::PriorityClass;
@@ -87,6 +89,47 @@ const PROCESS_RIGHTS: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(
 /// Build a core bitmask from a list of zero-based core indices.
 pub fn mask_from_cores(cores: &[u8]) -> u64 {
     cores.iter().fold(0u64, |m, &c| m | (1u64 << c))
+}
+
+/// Total number of logical processors across every processor group.
+///
+/// `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)` returns the grand total,
+/// which exceeds 64 only on dual-group (or larger) hosts — the signal that
+/// [`OsBackend::apply`] must take the group-aware CPU-Sets affinity path.
+pub fn logical_cpu_count() -> u32 {
+    unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) }
+}
+
+/// Builds the [`GROUP_AFFINITY`] entries for `SetProcessDefaultCpuSetMasks` from
+/// a flat list of zero-based core indices. Each index `c` in `0..64` maps to bit
+/// `c` of processor group 0 — the same group the flat u64 `core_mask` already
+/// spans on a single-group host.
+///
+/// Returns `None` when the list is empty, contains an index `>= 64` (not
+/// expressible as a group-0 mask), or holds more than 64 entries; the caller
+/// should skip the pin rather than pin nothing.
+///
+/// DEV-from-brief: the brief specified a raw
+/// `PROCESS_DEFAULT_CPU_SET_INFORMATION` byte buffer, but that struct does not
+/// exist in windows 0.62.2 (verified in the crate source), and 0.62.2's
+/// `SetProcessDefaultCpuSetMasks` takes a slice of typed [`GROUP_AFFINITY`]
+/// structs. We return the typed slice instead of a raw `Vec<u8>`; alignment is
+/// therefore guaranteed by the type system (the brief's alignment check existed
+/// only because it fed a raw-pointer API).
+pub fn build_cpu_set_mask(cores: &[u8]) -> Option<Vec<GROUP_AFFINITY>> {
+    if cores.is_empty() || cores.len() > 64 || cores.iter().any(|&c| c >= 64) {
+        return None;
+    }
+    Some(
+        cores
+            .iter()
+            .map(|&c| GROUP_AFFINITY {
+                Mask: 1usize << c,
+                Group: 0,
+                Reserved: [0; 3],
+            })
+            .collect(),
+    )
 }
 
 fn to_windows_priority(p: PriorityClass) -> PROCESS_CREATION_FLAGS {
@@ -284,10 +327,46 @@ impl ProcessBackend for OsBackend {
                     if *core_mask == 0 {
                         return Err(ActionError::Api("affinity mask is zero".into()));
                     }
-                    unsafe {
-                        SetProcessAffinityMask(h, *core_mask as usize).map_err(|e| {
-                            ActionError::Api(format!("SetProcessAffinityMask: {e}"))
-                        })
+                    if logical_cpu_count() > 64 {
+                        // Group-aware path: the flat u64 mask only spans processor
+                        // group 0 (cores 0..63); rebuild the requested core indices
+                        // and express each as a GROUP_AFFINITY entry so
+                        // SetProcessDefaultCpuSetMasks can pin them. Reuses `h`
+                        // (PROCESS_RIGHTS includes PROCESS_SET_INFORMATION).
+                        let cores: Vec<u8> =
+                            (0..64u8).filter(|i| (*core_mask >> *i) & 1 == 1).collect();
+                        match build_cpu_set_mask(&cores) {
+                            Some(entries) => unsafe {
+                                let r = SetProcessDefaultCpuSetMasks(h, Some(&entries));
+                                if !r.as_bool() {
+                                    // DEV-from-brief: the brief propagated the API
+                                    // error, but the task demands "log::warn + skip
+                                    // (never crash, never mis-pin)" — warn and skip,
+                                    // mirroring apply_qos's warn-and-continue pattern,
+                                    // so one failed pin does not fail the whole rule.
+                                    let code = GetLastError();
+                                    let e = windows::core::Error::from_hresult(
+                                        windows::core::HRESULT::from_win32(code.0),
+                                    );
+                                    crate::log::warn(format!(
+                                        "affinity: SetProcessDefaultCpuSetMasks failed ({e}); skipping"
+                                    ));
+                                }
+                                Ok(())
+                            },
+                            None => {
+                                crate::log::warn(
+                                    "affinity: >64 CPUs but CPU-set buffer build failed; skipping",
+                                );
+                                Ok(())
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            SetProcessAffinityMask(h, *core_mask as usize).map_err(|e| {
+                                ActionError::Api(format!("SetProcessAffinityMask: {e}"))
+                            })
+                        }
                     }
                 }
                 TargetAction::TrimMemory => unsafe {
@@ -353,5 +432,66 @@ fn state_priority_to_class(state: &ProcState) -> PriorityClass {
         p if p == HIGH_PRIORITY_CLASS.0 => PriorityClass::High,
         p if p == REALTIME_PRIORITY_CLASS.0 => PriorityClass::Realtime,
         _ => PriorityClass::Normal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_cpu_count_sane() {
+        let n = logical_cpu_count();
+        // DEV-from-brief: brief wrote `n >= 1 && n <= 1024`, which clippy's
+        // manual_range_contains flags; use the range form instead.
+        assert!(
+            (1..=1024).contains(&n),
+            "implausible logical CPU count {n}"
+        );
+    }
+
+    #[test]
+    fn build_cpu_set_mask_for_cores() {
+        use windows::Win32::System::SystemInformation::GROUP_AFFINITY;
+
+        // Two cores -> one GROUP_AFFINITY entry per core, all in group 0.
+        let entries = build_cpu_set_mask(&[0u8, 1u8]).expect("cores map to entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            GROUP_AFFINITY {
+                Mask: 1,
+                Group: 0,
+                Reserved: [0; 3],
+            }
+        );
+        assert_eq!(
+            entries[1],
+            GROUP_AFFINITY {
+                Mask: 2,
+                Group: 0,
+                Reserved: [0; 3],
+            }
+        );
+
+        // Highest valid index 63 maps to the top bit of the group-0 mask.
+        let top = build_cpu_set_mask(&[63]).expect("core 63 valid");
+        assert_eq!(top[0].Mask, 1usize << 63);
+        assert_eq!(top[0].Group, 0);
+
+        // Empty core list -> None (caller skips / falls back).
+        assert!(build_cpu_set_mask(&[]).is_none());
+
+        // Core index >= 64 cannot be expressed in a group-0 mask -> None.
+        assert!(build_cpu_set_mask(&[64]).is_none());
+
+        // More than 64 entries -> None (guard against pathological configs).
+        let too_many: Vec<u8> = (0..65).collect();
+        assert!(build_cpu_set_mask(&too_many).is_none());
+
+        // Entries are aligned structs; byte size is a multiple of alignment.
+        let sz = std::mem::size_of::<GROUP_AFFINITY>();
+        let al = std::mem::align_of::<GROUP_AFFINITY>();
+        assert_eq!(sz % al, 0, "GROUP_AFFINITY byte size must be alignment-multiple");
     }
 }

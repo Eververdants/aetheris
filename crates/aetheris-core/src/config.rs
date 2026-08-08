@@ -149,6 +149,15 @@ impl Config {
                         b.name
                     )));
                 }
+                // DEV (warn, non-fatal): cores beyond the host's logical CPU
+                // count can't be pinned; flag it but do NOT reject the config.
+                let n = crate::actions::logical_cpu_count();
+                if a.cores.iter().any(|&c| c as u32 >= n) {
+                    crate::log::warn(format!(
+                        "rule '{}' affinity cores exceed logical CPU count ({}) on this host",
+                        b.name, n
+                    ));
+                }
             }
         }
         for r in &self.rule {
@@ -161,6 +170,14 @@ impl Config {
                         "affinity for '{}' has core index {c} >= 64 (max 63)",
                         r.name
                     )));
+                }
+                // DEV (warn, non-fatal): same host-count check as background rules.
+                let n = crate::actions::logical_cpu_count();
+                if a.cores.iter().any(|&c| c as u32 >= n) {
+                    crate::log::warn(format!(
+                        "rule '{}' affinity cores exceed logical CPU count ({}) on this host",
+                        r.name, n
+                    ));
                 }
             }
         }
@@ -312,6 +329,46 @@ name = "x.exe"
 qos_cpu_quota = 150
 "#;
         assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn affinity_cores_within_logical_cpu_count_validate() {
+        // Cores [0, 1] are within any plausible host logical CPU count; must
+        // parse and validate cleanly (the host-count check is warn-only).
+        let s = r#"
+[game]
+processes = []
+
+[[background]]
+name = "x.exe"
+affinity = { cores = [0, 1] }
+"#;
+        Config::from_str(s).expect("cores 0..2 within host logical CPU count");
+    }
+
+    #[test]
+    fn affinity_core_beyond_logical_cpu_count_warns_not_panics() {
+        // Core 63 is a valid index (< 64) but exceeds any plausible host count;
+        // validation must warn (non-fatal), not panic or reject.
+        let s = r#"
+[game]
+processes = []
+
+[[background]]
+name = "x.exe"
+affinity = { cores = [63] }
+"#;
+        Config::from_str(s).expect("high core index warns but still validates");
+
+        let s2 = r#"
+[game]
+processes = []
+
+[[rule]]
+name = "y.exe"
+affinity = { cores = [63] }
+"#;
+        Config::from_str(s2).expect("always-rule high core index warns but still validates");
     }
 
     #[test]
