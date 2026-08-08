@@ -2,6 +2,14 @@
 # Run elevated:  powershell -ExecutionPolicy Bypass -File scripts/measure-footprint.ps1
 param([int]$Seconds = 60, [string]$Config = "aetheris.toml")
 
+# Elevation guard: the measurement is only meaningful when the service runs
+# elevated (the acceptance record is explicitly an elevated UAC run). Abort
+# rather than record a non-elevated measurement as if it were the real one.
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Warning "not elevated - measurement would be invalid; re-run elevated (e.g. Start-Process -Verb RunAs or a right-click Run as administrator)"
+    exit 1
+}
+
 $release = Join-Path (Get-Location) "target\release\aetheris-service.exe"
 if (-not (Test-Path $release)) { Write-Error "build release first: cargo build --release"; exit 1 }
 

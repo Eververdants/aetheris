@@ -17,7 +17,10 @@ Targets: mem<=5MB avg, CPU<0.1% avg
 Measured elevated (UAC), service ETW-active and alive for the full 60 s window
 (30/30 samples); numbers are real and stable. Independent cross-check of the
 running service: WorkingSet64 18.11 MB, PrivateBytes ~10.93 MB,
-TotalProcessorTime 0.047 s over ~30 s (≈0.000% avg CPU). The footprint is
+TotalProcessorTime 0.047 s cumulative (startup-inclusive); idle-window deltas
+~0.000%. The authoritative CPU evidence is the 60 s idle-window deltas above
+(avg 0.000% < 0.1% target), not the cumulative TotalProcessorTime figure. The
+footprint is
 dominated by the process runtime and loaded DLLs (shared working-set pages
 ≈ 7 MB of the 18.5 MB) — the windows-rs feature set plus ETW pulls in
 user32/advapi32/etc. — not by the service's own data structures (process table,
