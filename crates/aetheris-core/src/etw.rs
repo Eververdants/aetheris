@@ -468,3 +468,109 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         let _ = tx.send(ev);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic `EVENT_RECORD` with `UserData` pointing at the given payload.
+    fn event_record_with_payload(version: u8, id: u16, payload: &mut Vec<u8>) -> EVENT_RECORD {
+        let mut rec = EVENT_RECORD::default();
+        rec.EventHeader.EventDescriptor.Version = version;
+        rec.EventHeader.EventDescriptor.Id = id;
+        rec.UserData = payload.as_mut_ptr() as *mut c_void;
+        rec.UserDataLength = payload.len() as u16;
+        rec
+    }
+
+    fn push_utf16(buf: &mut Vec<u8>, s: &str) {
+        for u in s.encode_utf16() {
+            buf.extend_from_slice(&u.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn property_string_handles_length_prefix_and_nul_terminated() {
+        // 4-byte little-endian length prefix + UTF-16 payload ("dummy" = 5 units).
+        let mut prefixed = vec![5u8, 0, 0, 0];
+        push_utf16(&mut prefixed, "dummy");
+        assert_eq!(property_string(&prefixed).as_deref(), Some("dummy"));
+
+        // Plain NUL-terminated UTF-16, no prefix.
+        let mut plain = Vec::new();
+        push_utf16(&mut plain, "dummy_proc.exe");
+        plain.extend_from_slice(&[0, 0]);
+        assert_eq!(property_string(&plain).as_deref(), Some("dummy_proc.exe"));
+    }
+
+    #[test]
+    fn basename_extracts_file_from_full_path() {
+        assert_eq!(basename("dummy_proc.exe"), "dummy_proc.exe");
+        assert_eq!(basename(r"C:\Program Files\dummy_proc.exe"), "dummy_proc.exe");
+        assert_eq!(basename("/x/y/z.exe"), "z.exe");
+    }
+
+    /// The `Process_TypeGroup1` (V2+) layout: UniqueProcessKey(ptr), ProcessId,
+    /// ParentId, SessionId, ExitStatus, DirectoryTableBase(ptr), SID,
+    /// ImageFileName (NUL-terminated UTF-16).
+    #[test]
+    fn payload_decode_v2_start() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 8]); // UniqueProcessKey
+        payload.extend_from_slice(&100u32.to_le_bytes()); // ProcessId
+        payload.extend_from_slice(&50u32.to_le_bytes()); // ParentId
+        payload.extend_from_slice(&7u32.to_le_bytes()); // SessionId
+        payload.extend_from_slice(&0u32.to_le_bytes()); // ExitStatus
+        payload.extend_from_slice(&[0u8; 8]); // DirectoryTableBase
+        // SID: rev=1, 1 sub-authority, authority 5, sub-authority 10.
+        payload.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 10, 0, 0, 0]);
+        push_utf16(&mut payload, "dummy_proc.exe\0");
+        let rec = event_record_with_payload(2, 1, &mut payload);
+        assert_eq!(decode_name(&rec).to_ascii_lowercase(), "dummy_proc.exe");
+        assert_eq!(decode_parent_pid(&rec), 50);
+    }
+
+    /// The `Process_V0_TypeGroup1` (V0) layout: ProcessId, ParentId, SID,
+    /// ImageFileName.
+    #[test]
+    fn payload_decode_v0_start() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&100u32.to_le_bytes()); // ProcessId
+        payload.extend_from_slice(&50u32.to_le_bytes()); // ParentId
+        payload.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 5]); // SID: rev=1, 0 sub-authorities
+        push_utf16(&mut payload, "legacy.exe\0");
+        let rec = event_record_with_payload(0, 1, &mut payload);
+        assert_eq!(decode_name(&rec).to_ascii_lowercase(), "legacy.exe");
+        assert_eq!(decode_parent_pid(&rec), 50);
+    }
+
+    /// Stop (id 2) events carry no image name in the payload; decode must not
+    /// fabricate one (the event itself is still emitted, keyed by pid).
+    #[test]
+    fn payload_decode_stop_has_no_name() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&100u32.to_le_bytes()); // ProcessId
+        payload.extend_from_slice(&0u32.to_le_bytes()); // ExitStatus
+        let rec = event_record_with_payload(1, 2, &mut payload);
+        assert!(decode_name_from_payload(&rec).is_none());
+        assert!(decode_parent_pid_from_payload(&rec).is_none());
+    }
+
+    #[test]
+    fn decode_event_maps_ids_to_kinds() {
+        let mut payload = Vec::new();
+        push_utf16(&mut payload, "anything");
+        let mut rec = event_record_with_payload(2, 1, &mut payload);
+        rec.EventHeader.ProcessId = 42;
+        let ev = decode_event(&rec).expect("start event decodes");
+        assert_eq!(ev.pid, 42);
+        assert_eq!(ev.kind, ProcessKind::Start);
+
+        rec.EventHeader.EventDescriptor.Id = 2;
+        let ev = decode_event(&rec).expect("stop event decodes");
+        assert_eq!(ev.kind, ProcessKind::Stop);
+
+        rec.EventHeader.EventDescriptor.Id = 99;
+        assert!(decode_event(&rec).is_none(), "unknown ids are dropped");
+    }
+}
