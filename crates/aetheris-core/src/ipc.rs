@@ -15,7 +15,7 @@ use std::os::windows::io::FromRawHandle;
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
-    ERROR_PIPE_BUSY,
+    ERROR_PIPE_BUSY, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -46,6 +46,12 @@ pub const DEFAULT_PIPE_DACL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;IU)";
 
 /// Largest message accepted in either direction.
 const MAX_MSG: usize = 1 << 20;
+
+/// Win32 error 123, `ERROR_NO_PROCESS` — the named constant is not generated
+/// in the pinned windows crate's `Win32::Foundation` module, so it is spelled
+/// out here. It is the documented race when `CreateFileW` lands inside the
+/// server's close-then-recreate window.
+const ERROR_NO_PROCESS: WIN32_ERROR = WIN32_ERROR(123);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
@@ -337,11 +343,19 @@ pub fn client_call(pipe_name: &str, req: &Request) -> Result<Response, String> {
                 h = Some(hh);
                 break;
             }
-            Err(e) if e.code() == ERROR_PIPE_BUSY.into() => continue,
+            // ERROR_PIPE_BUSY: another client won the last instance.
+            // ERROR_NO_PROCESS: the server's close-then-recreate window — a
+            // CreateFileW during it races the previous CloseHandle. Both are
+            // transient, so retry rather than fail.
+            Err(e)
+                if e.code() == ERROR_PIPE_BUSY.into() || e.code() == ERROR_NO_PROCESS.into() =>
+            {
+                continue;
+            }
             Err(e) => return Err(format!("CreateFileW: {e}")),
         }
     }
-    let h = h.ok_or_else(|| "CreateFileW: pipe busy after retries".to_string())?;
+    let h = h.ok_or_else(|| "CreateFileW: pipe unavailable after retries".to_string())?;
 
     let mut file = unsafe { FileHandle::new(h) };
     let res = (|| -> std::io::Result<Response> {

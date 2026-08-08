@@ -77,9 +77,6 @@ boosted:
   chrome.exe (pid 1234)
 ```
 
-(illustrative — v1 `get-state` returns an empty snapshot, so the real output is
-an empty `mode:` and a `(none)` boosted list; see Known v1 gaps)
-
 ## Config reference
 
 See the committed `aetheris.toml` at the repo root. Sections:
@@ -96,39 +93,43 @@ See the committed `aetheris.toml` at the repo root. Sections:
 - `[[rule]]` — always-on rules applied in any mode.
 - `protected_extra` — additional names added to the hardcoded protected list.
 
-## Known v1 gaps
+## Known gaps
 
-Documented so they are not mistaken for bugs:
+Genuine remaining debt, documented so it is not mistaken for a bug:
 
-- **`system_load_percent` is a v1 stub.** The graceful-degradation hook (defer
-  actions when load > 85 %) is wired but the sampler returns 0 until v1.1 adds
-  real `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`
-  sampling. Because the stub returns 0 the hook never self-throttles.
-- **IPC `GetState` returns an empty snapshot.** The service currently serves
-  `StateSnapshot::default()`, so `aetheris-cli get-state` may print an empty
-  `mode:` and `(none)` for the boosted list even while a game is running. Live
-  state is deferred (spec acceptance item 8).
-- **`aetheris-cli query` always returns "not found".** IPC `QueryProcess` is a
-  v1 stub — the service always answers `Process(None)`.
-- **`aetheris-cli` must ALSO run elevated.** The named pipe is created with the
-  default pipe DACL, so a non-elevated CLI is denied access to the elevated
-  service's pipe. Run the CLI from an elevated terminal too.
-- **`qos_cpu_quota` does not throttle external processes in v1.** v1 throttles
-  via Background Processing Mode (`SetPriorityClass`), which MSDN documents as
-  current-process-only — applying it to another process (the only case aetheris
-  has) fails with `ERROR_INVALID_PARAMETER` and is logged as a warning, so
-  `qos_cpu_quota` is a documented v1 no-op for external processes. This is *not*
-  because Job Object handle-close kills processes (that only happens when
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set, which it never was); a real
-  cross-process CPU cap needs Job Objects with clear-on-stop semantics, deferred
-  to v2. Priority / affinity / suspend still apply in v1.
-- **Affinity skips >64-logical-CPU hosts.** Classic `SetProcessAffinityMask`
-  is a single `ULONG_PTR` and silently no-ops above one processor group.
-  Group-aware affinity (`SetProcessDefaultCpuSetMasks` / `NtSetInformationProcess`)
-  is the documented v1 limitation.
-- **Config is loaded with `std::fs::read`.** `memmap2` is a listed dependency
-  and the parse-from-string path is identical, so switching to mmap is a pure
-  I/O swap.
+- **`qos_cpu_quota` does not throttle external processes.** Background Processing
+  Mode (`SetPriorityClass`) is documented current-process-only, so applying it to
+  another process (the only case aetheris has) fails with `ERROR_INVALID_PARAMETER`
+  and is logged as a warning; `qos_cpu_quota` is a documented no-op for external
+  processes. This is *not* because Job Object handle-close kills processes (that
+  only happens when `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set, which it never
+  was); a real cross-process CPU cap needs Job Objects with clear-on-stop
+  semantics, deferred to v2. Priority / affinity / suspend still apply.
+- **Config is loaded with `std::fs::read`.** `memmap2` is a listed dependency and
+  the parse-from-string path is identical, so switching to mmap is a pure I/O swap
+  (not yet used).
+- **CPU-sets affinity on already-running threads is unverified.** The
+  >64-logical-CPU path sets a default mask via `SetProcessDefaultCpuSetMasks`,
+  which governs threads that were never explicitly pinned; its effect on threads
+  already running when the mask is applied is unverified (needs a dual-group host).
+- **Snapshot refresh is throttled to 250 ms.** The integrated message path rebuilds
+  the IPC snapshot at most every 250 ms (immediately on `reload` / stop), so
+  `get-state` may lag live state by up to that window under event churn.
+
+Previously documented as v1 gaps, **closed in v1.1**:
+
+- **`system_load_percent`** — the stub now samples
+  `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` for real, so
+  the graceful-degradation hook (defer actions above 85 % load) self-throttles
+  correctly.
+- **`get-state` empty snapshot** — the shared IPC snapshot is now live, so
+  `aetheris-cli get-state` prints the current mode and boosted list.
+- **`query` always "not found"** — `QueryProcess` now searches live process
+  state.
+- **CLI must run elevated** — the service pipe now carries an Interactive Users
+  DACL, so a non-elevated `aetheris-cli` can reach the elevated service.
+- **Affinity skips >64-logical-CPU hosts** — best-effort CPU-sets path via
+  `SetProcessDefaultCpuSetMasks` / group-affinity.
 
 ## License & compliance
 
@@ -153,5 +154,7 @@ Documented so they are not mistaken for bugs:
 - **v1 (shipped):** ETW process monitor, foreground detection, policy engine,
   five action types, named-pipe IPC, CLI, TOML config, protected list,
   graceful-degradation hook.
+- **v1.1 (shipped):** real system-load sampling, live IPC state (`get-state` /
+  `query`), non-elevated CLI via pipe DACL, best-effort CPU-sets affinity.
 - **v2 (planned):** kernel driver (monitor-only), DXGI overlay, Win32 config
-  UI, network QoS, real system-load sampling, live IPC state.
+  UI, network QoS.

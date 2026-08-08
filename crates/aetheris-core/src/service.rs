@@ -35,15 +35,29 @@ pub enum ServiceMsg {
     Stop,
 }
 
+/// Minimum interval between snapshot rebuilds on the integrated message path.
+///
+/// [`Service::current_state`] clones every process name into a fresh `processes`
+/// / `boosted` Vec, so rebuilding per event is O(N) String allocations per
+/// message under churn (a game spawning many processes/threads). Throttling to
+/// this interval keeps the IPC snapshot fresh enough while bounding allocations.
+/// `Reload` / `Stop` always force a rebuild so a reload outcome and the
+/// post-stop restore are never stale in the snapshot.
+const SNAPSHOT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub struct Service {
     cfg_path: PathBuf,
     engine: PolicyEngine<OsBackend>,
     stop_tx: Sender<ServiceMsg>,
     stop_rx: Option<Receiver<ServiceMsg>>,
-    /// Shared IPC snapshot: refreshed by the main loop after every message and
-    /// read by the IPC thread to answer `GetState` / `QueryProcess` without
-    /// touching the engine.
+    /// Shared IPC snapshot: rebuilt by the main loop (throttled to
+    /// [`SNAPSHOT_REFRESH_INTERVAL`]) and read by the IPC thread to answer
+    /// `GetState` / `QueryProcess` without touching the engine.
     state: Arc<RwLock<StateSnapshot>>,
+    /// Last time the shared snapshot was rebuilt on the integrated message
+    /// path; `None` before the first message. Used to throttle the O(N)
+    /// rebuilds in [`Service::current_state`].
+    last_refresh: Option<std::time::Instant>,
 }
 
 impl Service {
@@ -64,6 +78,7 @@ impl Service {
                 stop_tx,
                 stop_rx: Some(stop_rx),
                 state: state.clone(),
+                last_refresh: None,
             },
             state,
         )
@@ -82,8 +97,9 @@ impl Service {
     /// re-reads the config file and swaps it in (which exits GameBoost cleanly);
     /// `Stop` exits GameBoost so every boosted process is restored (a suspended
     /// or down-prioritized process must not survive the service). The shared
-    /// snapshot is refreshed once after every message, so `GetState` /
-    /// `QueryProcess` readers always see the latest engine state.
+    /// snapshot is refreshed after the message, throttled to
+    /// [`SNAPSHOT_REFRESH_INTERVAL`] so churn does not rebuild the O(N) process
+    /// Vecs per event; `Reload` / `Stop` always force a fresh snapshot.
     pub fn handle_message(&mut self, msg: &ServiceMsg) -> Result<(), String> {
         let res = match msg {
             ServiceMsg::Proc(ev) => {
@@ -103,8 +119,33 @@ impl Service {
                 Ok(())
             }
         };
-        self.refresh_state();
+        self.maybe_refresh_state(msg);
         res
+    }
+
+    /// Rebuild the shared snapshot after a message, throttled to
+    /// [`SNAPSHOT_REFRESH_INTERVAL`] so the O(N) name-cloning rebuild in
+    /// [`Service::current_state`] does not run on every event under churn.
+    /// `Reload` / `Stop` always force a rebuild so a reload outcome and the
+    /// post-stop restore are never stale; the timer is also advanced on a
+    /// forced rebuild so a subsequent throttled message does not immediately
+    /// re-trigger.
+    fn maybe_refresh_state(&mut self, msg: &ServiceMsg) {
+        let force = matches!(msg, ServiceMsg::Reload | ServiceMsg::Stop);
+        if force {
+            self.refresh_state();
+            self.last_refresh = Some(std::time::Instant::now());
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .last_refresh
+            .map(|t| now.duration_since(t) >= SNAPSHOT_REFRESH_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            self.last_refresh = Some(now);
+            self.refresh_state();
+        }
     }
 
     /// Re-read the config file and swap it in (`set_config` exits GameBoost
@@ -207,8 +248,8 @@ impl Service {
         });
 
         // IPC server: answers GetState/QueryProcess from the shared snapshot
-        // (refreshed by the main loop after every message) and forwards reloads
-        // to the main loop.
+        // (refreshed by the main loop, throttled to SNAPSHOT_REFRESH_INTERVAL)
+        // and forwards reloads to the main loop.
         let state = self.state.clone();
         let ipc_tx = tx.clone();
         // Interactive Users DACL so a non-elevated aetheris-cli can reach the
@@ -312,9 +353,17 @@ static LOAD_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
 pub fn system_load_percent() -> u32 {
     let mut cur = LoadSample { idle: 0, total: 0 };
     let ok = unsafe {
-        let mut info: [ntapi::ntexapi::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION; 64] =
-            [std::mem::zeroed(); 64];
-        let size = std::mem::size_of_val(&info) as u32;
+        // Size the buffer to the active logical-CPU count so
+        // NtQuerySystemInformation does not fail with
+        // STATUS_INFO_LENGTH_MISMATCH on >64-logical-CPU hosts (a fixed
+        // 64-entry array returned 0 forever there). Clamp to a sane cap: at
+        // least 64 (so a failed `logical_cpu_count()` of 0 keeps the previous
+        // behavior) and at most 256 (a larger buffer than the real count is
+        // still accepted, but no host needs more).
+        let count = crate::actions::logical_cpu_count().clamp(64, 256) as usize;
+        type CpuPerf = ntapi::ntexapi::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
+        let mut info: Vec<CpuPerf> = vec![std::mem::zeroed(); count];
+        let size = (count * std::mem::size_of::<CpuPerf>()) as u32;
         let status = ntapi::ntexapi::NtQuerySystemInformation(
             ntapi::ntexapi::SystemProcessorPerformanceInformation,
             info.as_mut_ptr() as *mut _,

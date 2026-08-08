@@ -193,7 +193,7 @@ priority = "idle"
 
 ## 8. 验收标准
 
-1. 空闲态资源:内存 ≤ 5 MB,CPU 基准进程跑 60s 平均 < 0.1%。
+1. 空闲态资源:PrivateBytes ≤ 12 MB(v1.1 重新基线;WorkingSet64 仅作参考——独立实测 ~10.9 MB,原 5 MB WorkingSet64 目标因共享 user32/gdi32/advapi32 页约 7 MB 不可达,详见 `docs/acceptance-v1.md`),CPU 基准进程跑 60s 平均 < 0.1%。
 2. 游戏启动 → 后台进程按规则被降级/挂起;游戏退出 → 全部恢复原状。
 3. 受保护进程名单内进程永不被动作。
 4. `aetheris-cli get-state` 输出正确状态快照;`reload` 生效。

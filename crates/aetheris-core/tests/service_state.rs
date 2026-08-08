@@ -57,6 +57,10 @@ fn state_snapshot_is_live_and_queryable() {
     .unwrap();
 
     // Real background helper: boosted for real so the snapshot lists it.
+    // Back-to-back Proc messages within the 250 ms throttle window do NOT
+    // rebuild the shared snapshot, so wait out the window before the next
+    // message to force a rebuild and prove the snapshot goes live.
+    std::thread::sleep(std::time::Duration::from_millis(260));
     svc.handle_message(&ServiceMsg::Proc(ProcessEvent {
         pid: dummy_pid,
         name: "dummy_proc.exe".into(),
@@ -65,7 +69,7 @@ fn state_snapshot_is_live_and_queryable() {
     }))
     .unwrap();
 
-    // The shared snapshot reflects the live engine state after each message.
+    // The shared snapshot reflects the live engine state (throttled rebuild).
     let snap = state.read().unwrap();
     assert_eq!(snap.mode, "GameBoost");
     assert!(
