@@ -5,6 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-aetheris-core = { path = "../aetheris-core", version = "0.1.0" }
+aetheris-core = { path = "../aetheris-core", version = "1.0.0" }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console"] }
 ctrlc = "3"

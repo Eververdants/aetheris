@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-aetheris-core = { path = "../aetheris-core", version = "0.1.0" }
+aetheris-core = { path = "../aetheris-core", version = "1.0.0" }
