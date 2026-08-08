@@ -9,16 +9,23 @@
 //! * **Rule editor** (middle): three `SysListView32` lists — game processes,
 //!   `[[background]]` rules and `[[rule]]` always-rules. Selecting a background
 //!   or rule row loads its fields into the shared editor (name, priority combo,
-//!   affinity, qos_cpu_quota, suspend/trim checkboxes). Add/Edit/Delete/Apply
+//!   affinity, qos_cpu_quota, suspend/trim checkboxes). Add/Delete/Apply
 //!   mutate a local `Config` copy; Apply writes the editor controls back to the
-//!   selected row.
+//!   selected row; "Reload cfg" re-fetches `GetConfig` into the editor (and
+//!   clears the startup load error once a fetch succeeds).
 //! * **Save / Reload / Exit** (bottom): Save validates the local config and
-//!   pushes it to the service via `client_call(SaveConfig(local))`; Reload asks
-//!   the service to re-read its config file; Exit closes the window.
+//!   pushes it to the service via `client_call(SaveConfig(local))` — refused
+//!   while the startup `GetConfig` failed, so the empty stub config can't
+//!   overwrite the real config on disk; Reload asks the service to re-read its
+//!   config file; Exit closes the window.
 //!
 //! The dialog state (pipe name, working `Config`, list↔row index maps and
 //! control handles) lives in a `UiState` box stored on the window via
-//! `SetWindowLongPtrW(GWLP_USERDATA)` and freed on `WM_DESTROY`.
+//! `SetWindowLongPtrW(GWLP_USERDATA)` and freed on `WM_DESTROY`. Programmatic
+//! list mutations set a `busy` flag so the reentrant `LVN_ITEMCHANGED`
+//! notification (fired synchronously by `LVM_SETITEMSTATE`) is ignored — it
+//! would otherwise mint a second `&mut UiState` while the outer frame's `&mut`
+//! is live (two simultaneous `&mut` = UB).
 //!
 //! Config is loaded once with `GetConfig` on startup; Refresh re-pulls status
 //! only (it never overwrites the editor's working copy).
@@ -73,7 +80,7 @@ const IDC_CHK_SUSPEND: isize = 124;
 const IDC_CHK_TRIM: isize = 125;
 
 const IDC_BTN_ADD: isize = 130;
-const IDC_BTN_EDIT: isize = 131;
+const IDC_BTN_RELOAD_CFG: isize = 131;
 const IDC_BTN_DELETE: isize = 132;
 const IDC_BTN_APPLY: isize = 133;
 
@@ -106,6 +113,12 @@ struct UiState {
     pipe: String,
     cfg: Config,
     init_error: Option<String>,
+    /// True while a list is being mutated/rebuild from code. The `WM_NOTIFY`
+    /// (`LVN_ITEMCHANGED`) handler returns immediately while this is set, so a
+    /// selection change triggered by `list_set_sel`/`LVM_SETITEMSTATE` cannot
+    /// re-enter `wndproc` and mint a second `&mut UiState` while the outer
+    /// frame's `&mut` is live (which would be two simultaneous `&mut` = UB).
+    busy: bool,
     mode: String,
     boosted: Vec<ProcessInfo>,
     last_reload: Option<String>,
@@ -128,6 +141,34 @@ struct UiState {
     h_qos: HWND,
     h_suspend: HWND,
     h_trim: HWND,
+}
+
+/// RAII guard for `UiState::busy`. Setting it clears the flag on `drop`, so the
+/// reentrancy lock is released on *every* exit path of the guarded method,
+/// including early returns and panics. It stores a raw pointer rather than a
+/// borrow so the enclosing `&mut UiState` methods can keep running while the
+/// guard is alive.
+struct BusyGuard(*mut UiState);
+
+impl BusyGuard {
+    /// Mark `state` busy and return a guard that unmarks it when dropped.
+    ///
+    /// # Safety
+    /// `state` must be the `&mut UiState` a method is currently executing on;
+    /// the guard is dropped before that method returns, so the raw pointer the
+    /// guard holds stays valid for its whole lifetime.
+    unsafe fn acquire(state: &mut UiState) -> BusyGuard {
+        state.busy = true;
+        BusyGuard(state as *mut UiState)
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        // SAFETY: the pointee is the `UiState` the enclosing method holds
+        // exclusively and is still alive (the guard drops before it returns).
+        unsafe { (*self.0).busy = false }
+    }
 }
 
 /// Startup payload passed as `CreateWindowExW`'s `lpParam`; consumed by
@@ -433,6 +474,15 @@ impl UiState {
         let _ = hwnd;
     }
 
+    /// `set_result`, but a no-op while the startup config load is still failing:
+    /// the `init_error` line must stay visible until a `GetConfig` succeeds, so
+    /// background status refreshes can't mask the "stub config" warning.
+    unsafe fn set_result_if_loaded(&mut self, hwnd: HWND, msg: &str) {
+        if self.init_error.is_none() {
+            self.set_result(hwnd, msg);
+        }
+    }
+
     unsafe fn update_status(&self, hwnd: HWND) {
         let _ = hwnd;
         set_text(self.h_status_mode, &format!("Mode: {}", self.mode));
@@ -454,7 +504,8 @@ impl UiState {
     }
 
     /// Re-pull `GetState` and repaint the status panel. Never touches the
-    /// editor's local config copy.
+    /// editor's local config copy, and while `init_error` is set it leaves the
+    /// result line untouched so the "config failed to load" warning persists.
     unsafe fn refresh_from_service(&mut self, hwnd: HWND) {
         let pipe = self.pipe.clone();
         match client_call(&pipe, &Request::GetState) {
@@ -462,10 +513,10 @@ impl UiState {
                 self.mode = s.mode;
                 self.boosted = s.boosted;
                 self.last_reload = s.last_reload;
-                self.set_result(hwnd, "Status refreshed");
+                self.set_result_if_loaded(hwnd, "Status refreshed");
             }
-            Ok(_) => self.set_result(hwnd, "Refresh: unexpected response"),
-            Err(e) => self.set_result(hwnd, &format!("Refresh failed: {e}")),
+            Ok(_) => self.set_result_if_loaded(hwnd, "Refresh: unexpected response"),
+            Err(e) => self.set_result_if_loaded(hwnd, &format!("Refresh failed: {e}")),
         }
         self.update_status(hwnd);
     }
@@ -513,6 +564,7 @@ impl UiState {
     /// Rebuild all three lists, then restore the previous selection (or pick
     /// the first background row on first load).
     unsafe fn rebuild_all(&mut self, hwnd: HWND) {
+        let _busy = BusyGuard::acquire(&mut *self);
         let (prev_active, prev_row) = (self.active, self.cur_row);
         self.rebuild_list(hwnd, ListKind::Game);
         self.rebuild_list(hwnd, ListKind::Background);
@@ -568,6 +620,14 @@ impl UiState {
                 if let Some(p) = self.cfg.game.processes.get(row) {
                     set_text(self.h_name, p);
                 }
+                // Game rows have no rule fields: clear the disabled controls so
+                // stale values from a previously selected background/rule row
+                // don't linger in the greyed-out editor.
+                combo_set_sel(self.h_prio, 0);
+                set_text(self.h_aff, "");
+                set_text(self.h_qos, "");
+                btn_set(self.h_suspend, false);
+                btn_set(self.h_trim, false);
             }
             ListKind::Background => {
                 if let Some(&idx) = self.bg_row_to_idx.get(row) {
@@ -603,6 +663,7 @@ impl UiState {
     /// repaint that list. Returns `false` (with a message) if nothing is
     /// selected or a field fails to parse.
     unsafe fn apply_fields(&mut self, hwnd: HWND) -> bool {
+        let _busy = BusyGuard::acquire(&mut *self);
         let Some(row) = self.cur_row else {
             self.set_result(hwnd, "No row selected to apply");
             return false;
@@ -663,7 +724,8 @@ impl UiState {
             }
         }
         // Repaint the active list and restore the selection so the new values
-        // are visible (the follow-up LVN_ITEMCHANGED reloads the fields).
+        // are visible. The busy guard suppresses the reentrant LVN_ITEMCHANGED,
+        // so reload the fields explicitly below.
         self.rebuild_list(hwnd, self.active);
         let n = list_count(self.list_hwnd(self.active));
         if row < n as usize {
@@ -676,6 +738,7 @@ impl UiState {
 
     /// Add a blank row of the active list's type to the local config.
     unsafe fn add_row(&mut self, hwnd: HWND) {
+        let _busy = BusyGuard::acquire(&mut *self);
         let target = self.active;
         match target {
             ListKind::Game => self.cfg.game.processes.push(String::new()),
@@ -694,18 +757,26 @@ impl UiState {
         self.set_result(hwnd, "Added a new row");
     }
 
-    /// Re-load the editor fields from the currently selected row.
-    unsafe fn edit_row(&mut self, hwnd: HWND) {
-        if self.cur_row.is_none() {
-            self.set_result(hwnd, "No row selected to edit");
-            return;
+    /// Re-fetch the service's config into the editor. On success the working
+    /// copy is replaced, any startup `init_error` is cleared (re-enabling
+    /// Save), and the lists are rebuilt. Replaces the former no-op "Edit" row.
+    unsafe fn reload_config(&mut self, hwnd: HWND) {
+        let pipe = self.pipe.clone();
+        match client_call(&pipe, &Request::GetConfig) {
+            Ok(Response::Config(c)) => {
+                self.cfg = c;
+                self.init_error = None;
+                self.rebuild_all(hwnd);
+                self.set_result(hwnd, "Config reloaded from service");
+            }
+            Ok(_) => self.set_result(hwnd, "Reload config: unexpected response"),
+            Err(e) => self.set_result(hwnd, &format!("Reload config failed: {e}")),
         }
-        self.load_fields(hwnd);
-        self.set_result(hwnd, "Edit loaded");
     }
 
     /// Remove the selected row from the local config.
     unsafe fn delete_row(&mut self, hwnd: HWND) {
+        let _busy = BusyGuard::acquire(&mut *self);
         let Some(row) = self.cur_row else {
             self.set_result(hwnd, "No row selected to delete");
             return;
@@ -750,7 +821,18 @@ impl UiState {
     /// local config, then push it to the service. Invalid configs are rejected
     /// locally *before* any round-trip (the service validates again on its side,
     /// so an invalid config can never reach the file).
+    ///
+    /// If the startup `GetConfig` failed, the local config is a `Config::default()`
+    /// stub and `init_error` is set; saving that stub would overwrite the real
+    /// config on disk, so Save is refused until a successful `reload_config`.
     unsafe fn do_save(&mut self, hwnd: HWND) {
+        if self.init_error.is_some() {
+            self.set_result(
+                hwnd,
+                "Save blocked: config not loaded from service — click 'Reload cfg' first",
+            );
+            return;
+        }
         if !self.apply_fields(hwnd) {
             return;
         }
@@ -858,7 +940,7 @@ unsafe extern "system" fn wndproc(
                     let _ = DestroyWindow(hwnd);
                 }
                 IDC_BTN_ADD if code == 0 => s.add_row(hwnd),
-                IDC_BTN_EDIT if code == 0 => s.edit_row(hwnd),
+                IDC_BTN_RELOAD_CFG if code == 0 => s.reload_config(hwnd),
                 IDC_BTN_DELETE if code == 0 => s.delete_row(hwnd),
                 IDC_BTN_APPLY if code == 0 => {
                     s.apply_fields(hwnd);
@@ -879,6 +961,14 @@ unsafe extern "system" fn wndproc(
                 };
                 if let Some(kind) = kind {
                     let s = state_mut(hwnd);
+                    // A selection change driven by our own list mutation
+                    // (apply/add/delete/rebuild) arrives re-entrantly while the
+                    // outer frame already holds `&mut self`. Refuse to handle it
+                    // so we don't mint a second `&mut UiState` mid-mutation;
+                    // the mutating method loads the fields itself afterwards.
+                    if s.busy {
+                        return LRESULT(0);
+                    }
                     s.active = kind;
                     let list = s.list_hwnd(kind);
                     s.cur_row = list_selected(list).map(|r| r as usize);
@@ -1147,13 +1237,13 @@ unsafe fn create_state(hwnd: HWND, init: InitData) -> UiState {
         hwnd,
         WINDOW_EX_STYLE::default(),
         w!("Button"),
-        w!("Edit"),
+        w!("Reload cfg"),
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
         360,
         366,
         74,
         28,
-        IDC_BTN_EDIT,
+        IDC_BTN_RELOAD_CFG,
         hinst,
     );
     mk_child(
@@ -1240,6 +1330,7 @@ unsafe fn create_state(hwnd: HWND, init: InitData) -> UiState {
         pipe: init.pipe,
         cfg: init.cfg,
         init_error: init.error,
+        busy: false,
         mode: String::new(),
         boosted: Vec::new(),
         last_reload: None,
