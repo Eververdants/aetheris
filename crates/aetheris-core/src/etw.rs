@@ -8,11 +8,13 @@
 //!
 //! Decode strategy: event id 1 = Start, 2 = Stop. The affected pid is decoded
 //! from the payload — the TDH `ProcessId` property first, then a manual decode
-//! of the documented kernel-process layout, with `EVENT_HEADER.ProcessId` as a
-//! last resort (that header field for kernel-process Start events is the
-//! *creating* process, not the affected one). The image name and parent pid are
-//! decoded through TDH (`TdhGetPropertySize`/`TdhGetProperty`) keyed by property
-//! name, with a bounded fallback that parses the documented kernel-process MOF
+//! of the kernel-process payload layout (ProcessId-first on modern Windows;
+//! the documented UniqueProcessKey-first V1 layout is a fallback), with
+//! `EVENT_HEADER.ProcessId` as a last resort (that header field for
+//! kernel-process Start events is the *creating* process, not the affected
+//! one; for Stop events it *is* the dying process). The image name and parent
+//! pid are decoded through TDH (`TdhGetPropertySize`/`TdhGetProperty`) keyed by
+//! property name, with a bounded fallback that parses the kernel-process
 //! payload layout when TDH cannot resolve the schema.
 
 use std::os::raw::c_void;
@@ -180,15 +182,18 @@ fn read_null_terminated_utf16(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Last-resort image-name decode from the documented kernel-process MOF payload
-/// layout, guarded by event version. Only meaningful for Start (id 1) events.
+/// Last-resort image-name decode from the kernel-process payload layout,
+/// guarded by event version. Only meaningful for Start (id 1) events.
 ///
-/// Layouts (see MicrosoftDocs/win32 ETW `process-v0-typegroup1.md` and
-/// `process-typegroup1.md`):
+/// Layouts:
 ///   V0  (Process_V0_TypeGroup1): ProcessId u32, ParentId u32, SID, ImageFileName
-///   V2+ (Process_TypeGroup1):    UniqueProcessKey ptr, ProcessId u32, ParentId
-///        u32, SessionId u32, ExitStatus i32, DirectoryTableBase ptr, SID,
-///        ImageFileName (null-terminated UTF-16), CommandLine, ...
+///   V4  (modern Windows, measured): ProcessId u32, run-id u64, CreateTime
+///        FILETIME, ParentId u32, parent run-id u64, SessionId u32, three
+///        reserved u32, SID, ImageFileName (null-terminated UTF-16) — the SID
+///        starts at offset 48 (0x30).
+///   V1  (Process_TypeGroup1, documented): UniqueProcessKey ptr, ProcessId u32,
+///        ParentId u32, SessionId u32, ExitStatus i32, DirectoryTableBase ptr,
+///        SID, ImageFileName — the SID starts at 2*ptr+16.
 fn decode_name_from_payload(record: *const EVENT_RECORD) -> Option<String> {
     let er = unsafe { &*record };
     if er.EventHeader.EventDescriptor.Id != 1 {
@@ -197,10 +202,10 @@ fn decode_name_from_payload(record: *const EVENT_RECORD) -> Option<String> {
     let data =
         unsafe { std::slice::from_raw_parts(er.UserData as *const u8, er.UserDataLength as usize) };
     let ptr = std::mem::size_of::<usize>();
-    let fixed = if er.EventHeader.EventDescriptor.Version == 0 {
-        8
-    } else {
-        2 * ptr + 16
+    let fixed = match er.EventHeader.EventDescriptor.Version {
+        0 => 8,
+        4 => 48,
+        _ => 2 * ptr + 16,
     };
     if data.len() < fixed + 8 {
         return None;
@@ -220,13 +225,13 @@ fn decode_name_from_payload(record: *const EVENT_RECORD) -> Option<String> {
     }
 }
 
-/// Last-resort affected-pid decode from the documented kernel-process payload
-/// layout. The pid sits at offset 0 for `Process_V0_TypeGroup1` (V0) and after
-/// the pointer-sized `UniqueProcessKey` for `Process_TypeGroup1` (V2+),
-/// mirroring the parent-pid decode offsets. Used for both Start (id 1) and
-/// Stop (id 2) events.
+/// Last-resort affected-pid decode from the kernel-process payload layout.
+/// The pid sits at offset 0 for `Process_V0_TypeGroup1` (V0) and for the modern
+/// ProcessId-first layout (measured: Start ver 4 and Stop ver 2 on Windows 11),
+/// and after the pointer-sized `UniqueProcessKey` for the documented V1
+/// `Process_TypeGroup1` layout. Used for both Start (id 1) and Stop (id 2).
 fn decode_pid_from_payload(data: &[u8], version: u8, ptr: usize) -> Option<u32> {
-    let off = if version == 0 { 0 } else { ptr };
+    let off = if version == 1 { ptr } else { 0 };
     if data.len() >= off + 4 {
         Some(u32::from_le_bytes([
             data[off],
@@ -239,7 +244,7 @@ fn decode_pid_from_payload(data: &[u8], version: u8, ptr: usize) -> Option<u32> 
     }
 }
 
-/// Last-resort parent-pid decode from the documented payload layout.
+/// Last-resort parent-pid decode from the kernel-process payload layout.
 fn decode_parent_pid_from_payload(record: *const EVENT_RECORD) -> Option<u32> {
     let er = unsafe { &*record };
     if er.EventHeader.EventDescriptor.Id != 1 {
@@ -248,12 +253,13 @@ fn decode_parent_pid_from_payload(record: *const EVENT_RECORD) -> Option<u32> {
     let data =
         unsafe { std::slice::from_raw_parts(er.UserData as *const u8, er.UserDataLength as usize) };
     let ptr = std::mem::size_of::<usize>();
-    // ParentId sits right after ProcessId: V0 at offset 4; V2+ after the
-    // pointer-sized UniqueProcessKey + 4-byte ProcessId.
-    let off = if er.EventHeader.EventDescriptor.Version == 0 {
-        4
-    } else {
-        ptr + 4
+    // ParentId: V0 right after ProcessId (offset 4); modern V4 after ProcessId,
+    // run-id and CreateTime (offset ptr+12 = 0x14); documented V1 after the
+    // pointer-sized UniqueProcessKey + 4-byte ProcessId (offset ptr+4).
+    let off = match er.EventHeader.EventDescriptor.Version {
+        0 => 4,
+        4 => ptr + 12,
+        _ => ptr + 4,
     };
     if data.len() >= off + 4 {
         Some(u32::from_le_bytes([
@@ -601,11 +607,12 @@ mod tests {
         assert_eq!(basename("/x/y/z.exe"), "z.exe");
     }
 
-    /// The `Process_TypeGroup1` (V2+) layout: UniqueProcessKey(ptr), ProcessId,
-    /// ParentId, SessionId, ExitStatus, DirectoryTableBase(ptr), SID,
-    /// ImageFileName (NUL-terminated UTF-16).
+    /// The documented `Process_TypeGroup1` (V1) layout: UniqueProcessKey(ptr),
+    /// ProcessId, ParentId, SessionId, ExitStatus, DirectoryTableBase(ptr), SID,
+    /// ImageFileName (NUL-terminated UTF-16). Kept as the name/parent decode
+    /// fallback path for the pre-modern layout.
     #[test]
-    fn payload_decode_v2_start() {
+    fn payload_decode_v1_start() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&[0u8; 8]); // UniqueProcessKey
         payload.extend_from_slice(&100u32.to_le_bytes()); // ProcessId
@@ -616,7 +623,7 @@ mod tests {
         // SID: rev=1, 1 sub-authority, authority 5, sub-authority 10.
         payload.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 10, 0, 0, 0]);
         push_utf16(&mut payload, "dummy_proc.exe\0");
-        let rec = event_record_with_payload(2, 1, &mut payload);
+        let rec = event_record_with_payload(1, 1, &mut payload);
         assert_eq!(decode_name(&rec).to_ascii_lowercase(), "dummy_proc.exe");
         assert_eq!(decode_parent_pid(&rec), 50);
     }
@@ -647,17 +654,20 @@ mod tests {
         assert!(decode_parent_pid_from_payload(&rec).is_none());
     }
 
-    /// `Process_TypeGroup1` (V2+) layout: UniqueProcessKey(ptr), ProcessId,
-    /// ParentId, SessionId, ExitStatus, DirectoryTableBase(ptr), SID,
-    /// ImageFileName (NUL-terminated UTF-16).
-    fn build_v2_payload(pid: u32, parent: u32) -> Vec<u8> {
+    /// Modern `Process_TypeGroup1` (V4) Start layout as measured on Windows 11:
+    /// ProcessId(u32), run-id(u64), CreateTime(FILETIME), ParentId(u32), parent
+    /// run-id(u64), SessionId(u32), three reserved u32, SID, ImageFileName
+    /// (NUL-terminated UTF-16). The affected pid is the first field; the same
+    /// ProcessId-first shape is used by the modern Stop (ver 2) layout.
+    fn build_modern_payload(pid: u32, parent: u32) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(&[0u8; 8]); // UniqueProcessKey
-        payload.extend_from_slice(&pid.to_le_bytes());
-        payload.extend_from_slice(&parent.to_le_bytes());
-        payload.extend_from_slice(&0u32.to_le_bytes()); // SessionId
-        payload.extend_from_slice(&0u32.to_le_bytes()); // ExitStatus
-        payload.extend_from_slice(&[0u8; 8]); // DirectoryTableBase
+        payload.extend_from_slice(&pid.to_le_bytes()); // ProcessId @0
+        payload.extend_from_slice(&[0u8; 8]); // run-id @4
+        payload.extend_from_slice(&[0u8; 8]); // CreateTime @0x0C
+        payload.extend_from_slice(&parent.to_le_bytes()); // ParentId @0x14
+        payload.extend_from_slice(&[0u8; 8]); // parent run-id @0x18
+        payload.extend_from_slice(&1u32.to_le_bytes()); // SessionId @0x20
+        payload.extend_from_slice(&[0u8; 12]); // reserved @0x24..0x30
         // SID: rev=1, 1 sub-authority, authority 5, sub-authority 10.
         payload.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 10, 0, 0, 0]);
         push_utf16(&mut payload, "dummy_proc.exe\0");
@@ -666,8 +676,9 @@ mod tests {
 
     #[test]
     fn decode_event_maps_ids_to_kinds() {
-        let mut payload = build_v2_payload(42, 7);
-        let mut rec = event_record_with_payload(2, 1, &mut payload);
+        // Modern Start (ver 4) and Stop (ver 2) share the ProcessId-first layout.
+        let mut payload = build_modern_payload(42, 7);
+        let mut rec = event_record_with_payload(4, 1, &mut payload);
         // The header pid is the *creating* process for Start events; the
         // payload pid must win.
         rec.EventHeader.ProcessId = 999;
@@ -678,6 +689,7 @@ mod tests {
         assert_eq!(ev.kind, ProcessKind::Start);
 
         rec.EventHeader.EventDescriptor.Id = 2;
+        rec.EventHeader.EventDescriptor.Version = 2; // modern Stop layout
         let ev = decode_event(&rec).expect("stop event decodes");
         assert_eq!(ev.pid, 42);
         assert_eq!(ev.kind, ProcessKind::Stop);
@@ -719,19 +731,30 @@ mod tests {
     }
 
     #[test]
-    fn decode_pid_from_payload_v2_offset_ptr() {
+    fn decode_pid_from_payload_modern_is_offset_zero() {
+        // Modern ProcessId-first layout (Start ver 4 / Stop ver 2 measured on
+        // Windows 11): the affected pid is the first payload field.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&456u32.to_le_bytes()); // ProcessId at offset 0
+        assert_eq!(decode_pid_from_payload(&payload, 2, 8), Some(456));
+        assert_eq!(decode_pid_from_payload(&payload, 4, 8), Some(456));
+    }
+
+    #[test]
+    fn decode_pid_from_payload_v1_offset_ptr() {
+        // Documented V1 TypeGroup1 layout: UniqueProcessKey first, pid at `ptr`.
         let mut payload = Vec::new();
         payload.extend_from_slice(&[0u8; 8]); // UniqueProcessKey
         payload.extend_from_slice(&456u32.to_le_bytes()); // ProcessId at offset ptr
-        assert_eq!(decode_pid_from_payload(&payload, 2, 8), Some(456));
+        assert_eq!(decode_pid_from_payload(&payload, 1, 8), Some(456));
     }
 
     #[test]
     fn decode_pid_from_payload_short_payload_is_none() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&0x04030201u32.to_le_bytes());
-        // V2 needs `ptr + 4` bytes; a 4-byte payload is too short.
-        assert_eq!(decode_pid_from_payload(&payload, 2, 8), None);
+        // V1 needs `ptr + 4` bytes; a 4-byte payload is too short.
+        assert_eq!(decode_pid_from_payload(&payload, 1, 8), None);
         // V0 needs only offset 0..4, so it still decodes.
         assert_eq!(decode_pid_from_payload(&payload, 0, 8), Some(0x04030201));
     }
