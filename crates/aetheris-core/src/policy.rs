@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::actions::{ProcessBackend, ProcState, TargetAction};
+use crate::actions::{ProcessBackend, ProcState, QosLifecycle, TargetAction};
 use crate::config::{AffinitySpec, Config};
 use crate::events::{ForegroundEvent, ProcessEvent, ProcessKind};
 use crate::proc_table::{name_hash, ProcessTable};
@@ -22,7 +22,7 @@ pub enum Mode {
     GameBoost,
 }
 
-pub struct PolicyEngine<B: ProcessBackend> {
+pub struct PolicyEngine<B: ProcessBackend + QosLifecycle> {
     cfg: Config,
     matcher: PatternMatcher,
     protected: BTreeSet<String>,
@@ -40,7 +40,7 @@ pub struct PolicyEngine<B: ProcessBackend> {
     protected_hashes: HashSet<u64>,
 }
 
-impl<B: ProcessBackend> PolicyEngine<B> {
+impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
     pub fn new(cfg: Config, backend: B) -> Self {
         let protected = cfg.protected_set();
         let matcher = PatternMatcher::new(cfg.game.processes.clone());
@@ -65,6 +65,13 @@ impl<B: ProcessBackend> PolicyEngine<B> {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Read access to the backend, used by tests to inspect OS-level QoS state
+    /// (e.g. whether a Job Object exists for a pid) and by the service for
+    /// backend-level operations.
+    pub fn backend(&self) -> &B {
+        &self.backend
     }
 
     pub fn boosted(&self) -> &HashMap<u32, ProcState> {
@@ -206,6 +213,9 @@ impl<B: ProcessBackend> PolicyEngine<B> {
                 } else if let Some(state) = self.boosted.remove(&ev.pid) {
                     let _ = self.backend.restore(ev.pid, &state);
                 }
+                // The process is gone: release any Job Object held for it. Safe
+                // because there is no longer a live process to strand.
+                self.backend.on_process_exit(ev.pid);
             }
         }
     }
@@ -267,6 +277,10 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         for (pid, state) in std::mem::take(&mut self.boosted) {
             let _ = self.backend.restore(pid, &state);
         }
+        // Un-cap and release every Job Object after restoring (restore clears
+        // each process's quota via QosCpuQuota{percent:0}; this is the global
+        // teardown). No KILL_ON_JOB_CLOSE, so nothing is terminated.
+        self.backend.clear_all_qos();
     }
 
     fn apply_background_to(&mut self, pid: u32, name: &str) {
@@ -345,6 +359,8 @@ mod tests {
             self.calls.lock().unwrap().clone()
         }
     }
+
+    impl QosLifecycle for RecordingBackend {}
 
     impl ProcessBackend for RecordingBackend {
         fn snapshot(&self, _pid: u32) -> Result<ProcState, ActionError> {

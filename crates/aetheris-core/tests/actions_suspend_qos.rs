@@ -1,13 +1,17 @@
 //! Suspend freezes a process (CPU time stops advancing); resume restarts it.
-//! QoS throttling is Background Processing Mode in v1 (safe and reversible; a
-//! Job Object is never created — see `OsBackend::apply_qos`).
+//! QoS throttling is a real cross-process CPU cap via a Job Object: the process
+//! is assigned to a job and the job's CPU rate control is read back / cleared.
 use std::process::Command;
 use std::time::Duration;
 
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{GetThreadTimes, OpenThread, THREAD_ALL_ACCESS};
+use windows::Win32::System::JobObjects::{
+    QueryInformationJobObject, JobObjectCpuRateControlInformation,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+};
+use windows::Win32::System::Threading::{GetThreadTimes, OpenProcess, OpenThread, THREAD_ALL_ACCESS};
 
-use aetheris_core::actions::{OsBackend, ProcessBackend, TargetAction};
+use aetheris_core::actions::{OsBackend, ProcessBackend, TargetAction, PROCESS_QUERY};
 
 fn spawn_dummy() -> std::process::Child {
     let exe = env!("CARGO_BIN_EXE_dummy_proc");
@@ -102,35 +106,57 @@ fn suspend_freezes_and_resume_restarts() {
 }
 
 #[test]
-fn qos_background_mode_is_safe_and_reversible() {
+fn qos_job_assigns_and_caps() {
+    // Spawn dummy; create job; assign; read back the CPU rate control.
     let mut child = spawn_dummy();
     let pid = child.id();
     let backend = OsBackend::new();
-
-    // Apply a cap. v1 QoS is Background Processing Mode; MSDN documents
-    // PROCESS_MODE_BACKGROUND_BEGIN/END as current-process-only, so applying to
-    // another process fails with ERROR_INVALID_PARAMETER and is a logged no-op.
-    // That is fine: the mechanism must be SAFE (never attach the process to a
-    // Job Object), not necessarily throttling in v1.
-    let _ = backend.apply(pid, &TargetAction::QosCpuQuota { percent: 10 });
-
-    // percent == 0 reverses a successful apply and is a no-op otherwise; either
-    // way it must succeed.
+    backend
+        .apply(pid, &TargetAction::QosCpuQuota { percent: 50 })
+        .expect("assign qos");
+    // Read back: rate control should be enabled with hard cap 5000 (0.01% units).
+    let jobs = backend.jobs.lock().unwrap();
+    let entry = jobs.get(&pid).expect("job entry exists");
+    let mut info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+    unsafe {
+        QueryInformationJobObject(
+            Some(entry.job),
+            JobObjectCpuRateControlInformation,
+            (&mut info as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            None,
+        )
+    }
+    .expect("query job");
+    assert!(
+        info.ControlFlags.0 & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE.0 != 0,
+        "rate control must be enabled"
+    );
+    let cpu_rate = unsafe { info.Anonymous.CpuRate };
+    assert_eq!(cpu_rate, 5000, "hard cap must be 50% in 0.01% units");
+    drop(jobs);
     backend
         .apply(pid, &TargetAction::QosCpuQuota { percent: 0 })
-        .expect("clear qos (percent=0) must be a no-op or a reversal, never an error");
+        .expect("clear qos");
+    backend.on_process_exit(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
-    // Dropping the backend must NOT terminate the process (Critical 2): v1
-    // holds no Job Object handles at all (QoS is Background Processing Mode,
-    // current-process-only), and closing a job handle only kills assigned
-    // processes when JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is set — which it never
-    // is.
-    drop(backend);
-    assert!(
-        child.try_wait().expect("try_wait").is_none(),
-        "QoS must never leave a Job Object handle open that would terminate the process on drop"
-    );
-
+#[test]
+fn qos_clear_then_drop_does_not_kill() {
+    let mut child = spawn_dummy();
+    let pid = child.id();
+    let backend = OsBackend::new();
+    backend
+        .apply(pid, &TargetAction::QosCpuQuota { percent: 30 })
+        .expect("assign");
+    backend
+        .apply(pid, &TargetAction::QosCpuQuota { percent: 0 })
+        .expect("clear");
+    drop(backend); // Drop must not terminate the still-running dummy
+    let alive = unsafe { OpenProcess(PROCESS_QUERY, false, pid) }.is_ok();
+    assert!(alive, "closing the backend must not kill the capped process");
     let _ = child.kill();
     let _ = child.wait();
 }

@@ -11,6 +11,10 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::JobObjects::{
+    QueryInformationJobObject, JobObjectCpuRateControlInformation,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+};
 use windows::Win32::System::Threading::{
     GetPriorityClass, GetThreadTimes, OpenProcess, OpenThread, NORMAL_PRIORITY_CLASS,
     PROCESS_QUERY_INFORMATION, THREAD_ALL_ACCESS,
@@ -174,11 +178,11 @@ fn boost_suspends_then_exit_resumes_and_restores() {
         "priority must be restored to NORMAL after game exit"
     );
 
-    // 5c. QoS: the engine's restore reverses whatever QoS it applied. On hosts
-    // where the cross-process PROCESS_MODE_BACKGROUND_BEGIN call is refused
-    // (documented as current-process-only), the apply was a logged no-op, so
-    // there is nothing left to clear. Prove the clear side is sound with a
-    // fresh backend: applying then clearing must not error, and clearing an
+    // 5c. QoS: the engine's restore reverses whatever QoS it applied via
+    // QosCpuQuota{percent:0} and exit_game_mode clears all jobs. The job entry
+    // for the dummy must exist during boost and be gone after exit (asserted in
+    // `qos_job_lifecycle_across_game_exit`). Prove the clear side is sound with
+    // a fresh backend: applying then clearing must not error, and clearing an
     // un-applied pid must be a no-op.
     let b = OsBackend::new();
     let _ = b.apply(bg_pid, &TargetAction::QosCpuQuota { percent: 50 });
@@ -186,6 +190,59 @@ fn boost_suspends_then_exit_resumes_and_restores() {
         .expect("qos clear must never error (no-op or reversal)");
 
     // 6. Child is killed by the ChildGuard on drop (also on panic).
+    drop(guard);
+}
+
+/// Engine-level Job Object QoS lifecycle: entering GameBoost must attach the
+/// background process to a real Job Object (a cross-process CPU cap, v2-A
+/// Task 1), and exiting GameBoost must clear the cap and release the job.
+#[test]
+fn qos_job_lifecycle_across_game_exit() {
+    let guard = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_dummy_proc")).spawn().expect("spawn dummy"),
+    );
+    let bg_pid = guard.0.id();
+
+    let mut engine = PolicyEngine::new(cfg(), OsBackend::new());
+
+    // 1. Background helper starts while in Normal mode; then the game starts ->
+    //    GameBoost: the engine applies QosCpuQuota{50}, creating a Job Object
+    //    and assigning the dummy to it.
+    engine.on_process_event(&start(bg_pid, "dummy_proc.exe"));
+    engine.on_process_event(&start(9000, "game.exe"));
+    assert_eq!(engine.mode(), Mode::GameBoost);
+    assert!(engine.boosted().contains_key(&bg_pid));
+
+    // A job entry must exist for the dummy. (If the host forbids the attach
+    // because the test harness already runs inside a job, the entry still
+    // exists with assigned=false — either way a job was created.)
+    let jobs = engine.backend().jobs.lock().unwrap();
+    let entry = jobs.get(&bg_pid).expect("job entry must exist while boosting");
+    let rate = unsafe {
+        let mut info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+        QueryInformationJobObject(
+            Some(entry.job),
+            JobObjectCpuRateControlInformation,
+            (&mut info as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            None,
+        )
+        .expect("query job while boosting");
+        info.Anonymous.CpuRate
+    };
+    assert_eq!(rate, 5000, "engine must apply the configured 50% hard cap");
+    drop(jobs);
+
+    // 2. Game exits -> Normal: the engine restores every boosted process and
+    //    clears all QoS (rate control disabled, job handles released).
+    engine.on_process_event(&stop(9000, "game.exe"));
+    assert_eq!(engine.mode(), Mode::Normal);
+    assert!(engine.boosted().is_empty(), "boosted map must be cleared on game exit");
+    assert!(
+        engine.backend().jobs.lock().unwrap().is_empty(),
+        "all QoS job entries must be released on game exit"
+    );
+
     drop(guard);
 }
 

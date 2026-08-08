@@ -1,16 +1,26 @@
-//! Action executor: privilege enablement, priority, affinity, and memory trim.
+//! Action executor: privilege enablement, priority, affinity, memory trim, and
+//! Job Object CPU QoS.
 //!
 //! This is the OS-facing layer that turns a [`TargetAction`] into a real Windows
 //! API call against a target process. [`OsBackend`] is the production backend;
 //! the [`ProcessBackend`] trait is what the policy engine will drive.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    JobObjectCpuRateControlInformation, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0, JOB_OBJECT_CPU_RATE_CONTROL,
+    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
 };
 use windows::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows::Win32::System::Threading::{
@@ -19,9 +29,8 @@ use windows::Win32::System::Threading::{
     SetProcessAffinityMask, SetProcessDefaultCpuSetMasks, SetProcessWorkingSetSize,
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
     IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS,
-    PROCESS_MODE_BACKGROUND_BEGIN, PROCESS_MODE_BACKGROUND_END, PROCESS_QUERY_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
 };
 
 use crate::config::PriorityClass;
@@ -51,6 +60,7 @@ pub struct ProcState {
 pub enum ActionError {
     Open(u32),
     Api(String),
+    Job(String),
 }
 
 impl fmt::Display for ActionError {
@@ -58,6 +68,7 @@ impl fmt::Display for ActionError {
         match self {
             ActionError::Open(code) => write!(f, "open process failed: code {code}"),
             ActionError::Api(m) => write!(f, "api: {m}"),
+            ActionError::Job(m) => write!(f, "job: {m}"),
         }
     }
 }
@@ -156,19 +167,47 @@ pub(crate) fn open_process(pid: u32) -> Result<HANDLE, ActionError> {
     Ok(h)
 }
 
+/// Per-pid QoS state tracked by [`OsBackend`].
+///
+/// `job` is the Job Object used to cap the process's CPU rate; `assigned` is
+/// true only once [`AssignProcessToJobObject`] succeeded. When assignment fails
+/// (target already lives in a job, common for browsers) `assigned` stays false
+/// and the job is kept open but empty so a later clear can close it safely.
+///
+/// Fields are `pub` for integration-test readback (`backend.jobs`); the struct
+/// is otherwise an internal bookkeeping detail.
+pub struct JobEntry {
+    pub job: HANDLE,
+    pub assigned: bool,
+}
+
 /// Production backend backed by the Windows process APIs.
 ///
-/// Tracks which pids are currently in Background Processing Mode so a later
-/// clear can reverse exactly what was applied. v1 creates no Job Objects:
-/// QoS is Background Processing Mode (see [`OsBackend::apply_qos`] for why).
+/// Holds a per-pid map of Job Object handles. A job is created lazily on the
+/// first QoS assignment and kept so the quota can be changed or cleared later
+/// without re-creating it. **A job is never configured with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`**, so closing a handle never terminates
+/// the assigned process — the job simply stops capping.
 pub struct OsBackend {
-    background_mode: std::sync::Mutex<std::collections::HashSet<u32>>,
+    pub jobs: Mutex<HashMap<u32, JobEntry>>,
+}
+
+/// Lifecycle hooks for QoS that the policy engine needs on top of
+/// [`ProcessBackend`]. Defaults are no-ops so non-QoS backends (e.g. the
+/// `RecordingBackend` in tests) implement the trait without doing anything.
+pub trait QosLifecycle {
+    /// The process has exited; release any Job Object held for it (safe: the
+    /// process is gone, so closing the handle cannot strand a live process).
+    fn on_process_exit(&self, _pid: u32) {}
+    /// Clear all CPU caps (un-capp all assigned jobs) and close every handle.
+    /// No `KILL_ON_JOB_CLOSE`, so this never terminates processes.
+    fn clear_all_qos(&self) {}
 }
 
 impl OsBackend {
     pub fn new() -> Self {
         Self {
-            background_mode: std::sync::Mutex::new(std::collections::HashSet::new()),
+            jobs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -218,57 +257,154 @@ impl OsBackend {
         }
     }
 
-    /// Apply or clear CPU throttling for `pid` via Background Processing Mode.
+    /// Apply or clear a real cross-process CPU cap for `pid` via a Job Object.
     ///
-    /// `percent > 0` enters Background Processing Mode (`SetPriorityClass(...,
-    /// PROCESS_MODE_BACKGROUND_BEGIN)`), which lowers the process's resource
-    /// scheduling priorities (spec §5.4); `percent == 0` leaves it again.
+    /// `percent > 0` finds-or-creates the pid's job, enables a hard CPU rate cap
+    /// (`JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`)
+    /// at `percent * 100` in 0.01% units, and assigns the process to it.
     ///
-    /// Why Background Processing Mode and not a Job Object (v1 decision):
-    /// Job Object QoS is deferred to v2, and NOT because closing the last job
-    /// handle kills processes — a job only terminates its assigned processes on
-    /// handle close when `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set, which was
-    /// never the case here. The real reason is that Background Processing Mode,
-    /// the v1 mechanism, is current-process-only (see the documented OS
-    /// limitation below), so `qos_cpu_quota` is a documented no-op for external
-    /// processes in v1. A real cross-process CPU cap needs Job Objects with
-    /// clear-on-stop semantics (the job and its caps are cleaned up when the
-    /// service stops), which is deferred to v2.
+    /// `percent == 0` disables rate control (ControlFlags = 0 → unlimited). If
+    /// the job was never assigned (attach failed), it is closed and dropped —
+    /// nothing lives in it. If it WAS assigned, the job is kept open but uncapped
+    /// while the process lives (a process cannot be removed from a job; closing
+    /// the last handle would destroy the job object, and although that is safe
+    /// without `KILL_ON_JOB_CLOSE`, the process may be in *other* jobs, so we
+    /// only release it via [`Self::on_process_exit`] once the process is gone).
     ///
-    /// Documented OS limitation: MSDN states `PROCESS_MODE_BACKGROUND_BEGIN` /
-    /// `END` "can be specified only if hProcess is a handle to the current
-    /// process". aetheris manages *other* processes, so on most hosts this call
-    /// fails with ERROR_INVALID_PARAMETER and the engine logs the apply as a
-    /// warning (priority/affinity/suspend still apply). That is acceptable for
-    /// v1: the mechanism is safe and reversible by construction, and a real
-    /// cross-process CPU cap (via `NtSetInformationProcess` or Job Objects with
-    /// clear-on-stop semantics) is deferred to v2.
+    /// Assignment can fail with ERROR_ACCESS_DENIED when the target already
+    /// lives in a job (common for browsers). That degrades gracefully: no CPU
+    /// cap for that process, but priority/affinity still apply. This is never a
+    /// hard error.
+    ///
+    /// **Safety:** this backend never sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    /// Closing a Job Object handle without that flag does NOT terminate assigned
+    /// processes — the job simply stops capping.
     fn apply_qos(&self, pid: u32, percent: u32) -> Result<(), ActionError> {
+        let mut jobs = self.jobs.lock().unwrap();
+
         if percent == 0 {
-            // Clear: reverse Background Processing Mode only if we applied it.
-            // Calling it when the pid was never put into background mode is a
-            // no-op (the engine only issues a clear after a successful apply).
-            let mut bg = self.background_mode.lock().unwrap();
-            if bg.remove(&pid) {
-                let h = open_process(pid)?;
-                let r = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_END) };
-                let _ = unsafe { CloseHandle(h) };
-                r.map_err(|e| ActionError::Api(format!("PROCESS_MODE_BACKGROUND_END: {e}")))?;
+            // Clear: disable rate control (→ unlimited) on the tracked job. If
+            // the process was never assigned (attach failed), close + drop the
+            // entry (safe: the job is empty).
+            match jobs.get(&pid) {
+                Some(entry) if entry.assigned => {
+                    let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                        ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL(0),
+                        ..Default::default()
+                    };
+                    unsafe {
+                        SetInformationJobObject(
+                            entry.job,
+                            JobObjectCpuRateControlInformation,
+                            (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                        )
+                    }
+                    .map_err(|e| ActionError::Job(format!("clear rate control: {e}")))?;
+                }
+                Some(_) => {
+                    if let Some(e) = jobs.remove(&pid) {
+                        let _ = unsafe { CloseHandle(e.job) };
+                    }
+                }
+                None => {}
             }
             return Ok(());
         }
 
-        let mut bg = self.background_mode.lock().unwrap();
-        if bg.contains(&pid) {
-            // Already in background mode (idempotent re-apply); nothing to do.
-            return Ok(());
+        // percent > 0: find-or-create the job for this pid.
+        let entry = match jobs.entry(pid) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                let j = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+                    .map_err(|e| ActionError::Job(format!("CreateJobObjectW: {e}")))?;
+                v.insert(JobEntry { job: j, assigned: false })
+            }
+        };
+
+        // Hard cap the job's CPU rate in 0.01% units. Construct the union via
+        // its safe struct-literal form (the vendored windows crate exposes
+        // `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 { CpuRate }`).
+        let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+            ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+            Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 {
+                CpuRate: percent * 100,
+            },
+        };
+        unsafe {
+            SetInformationJobObject(
+                entry.job,
+                JobObjectCpuRateControlInformation,
+                (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            )
         }
-        let h = open_process(pid)?;
-        let r = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_BEGIN) };
-        let _ = unsafe { CloseHandle(h) };
-        r.map_err(|e| ActionError::Api(format!("PROCESS_MODE_BACKGROUND_BEGIN: {e}")))?;
-        bg.insert(pid);
+        .map_err(|e| ActionError::Job(format!("set rate control: {e}")))?;
+
+        if !entry.assigned {
+            let h = open_process(pid)?;
+            let assigned = unsafe { AssignProcessToJobObject(entry.job, h) };
+            let _ = unsafe { CloseHandle(h) };
+            if assigned.is_err() {
+                // Target already in a job (browsers/common). Degrade: no cap for
+                // this process; priority/affinity still apply. Keep the empty
+                // job open but never KILL_ON_JOB_CLOSE, so nothing is terminated;
+                // a later percent==0 clear or on_process_exit closes it.
+                crate::log::warn(format!(
+                    "qos: pid {pid} already in a job; cpu cap skipped"
+                ));
+                return Ok(());
+            }
+            entry.assigned = true;
+        }
         Ok(())
+    }
+
+    /// Close + remove the Job Object for `pid`. Safe only after the process has
+    /// exited (that is the caller's contract — the policy engine calls this from
+    /// the `Stop` event path and service shutdown).
+    pub fn on_process_exit(&self, pid: u32) {
+        if let Some(e) = self.jobs.lock().unwrap().remove(&pid) {
+            let _ = unsafe { CloseHandle(e.job) };
+        }
+    }
+
+    /// Disable CPU rate control on every assigned job (→ unlimited) and close
+    /// all handles. Called on game exit and service Stop. No
+    /// `KILL_ON_JOB_CLOSE`, so no process is terminated — jobs simply stop
+    /// capping and their handles are released.
+    pub fn clear_all_qos(&self) {
+        let mut jobs = self.jobs.lock().unwrap();
+        for (_, entry) in jobs.iter() {
+            if entry.assigned {
+                let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                    ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL(0),
+                    ..Default::default()
+                };
+                let _ = unsafe {
+                    SetInformationJobObject(
+                        entry.job,
+                        JobObjectCpuRateControlInformation,
+                        (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                        std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                    )
+                };
+            }
+        }
+        for (_, e) in jobs.drain() {
+            let _ = unsafe { CloseHandle(e.job) };
+        }
+    }
+}
+
+impl QosLifecycle for OsBackend {
+    fn on_process_exit(&self, pid: u32) {
+        OsBackend::on_process_exit(self, pid);
+    }
+
+    fn clear_all_qos(&self) {
+        OsBackend::clear_all_qos(self);
     }
 }
 
@@ -280,15 +416,14 @@ impl Default for OsBackend {
 
 impl Drop for OsBackend {
     fn drop(&mut self) {
-        // Intentionally do NOT close any Job Object handle here. Note that
-        // closing the last job handle does NOT kill assigned processes — a job
-        // only terminates its processes when `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-        // is set (it never was). The real v1 story: QoS is Background Processing
-        // Mode, tracked in `background_mode`, which is current-process-only, so
-        // the flag on the (about to exit) service is left as-is and is safe —
-        // there are no Job Objects to clean up. When Job Object QoS lands in v2
-        // it must be cleaned up with clear-on-stop semantics, not by relying on
-        // handle-close behavior.
+        // Close remaining job handles. WITHOUT JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        // this does NOT terminate assigned processes — the job objects simply
+        // stop capping. Caps were already cleared by `clear_all_qos` on the
+        // Stop path; this is the final safety net for abnormal teardown.
+        let jobs = self.jobs.lock().unwrap();
+        for (_, e) in jobs.iter() {
+            let _ = unsafe { CloseHandle(e.job) };
+        }
     }
 }
 
