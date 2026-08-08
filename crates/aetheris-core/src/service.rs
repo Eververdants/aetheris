@@ -78,6 +78,11 @@ impl Service {
         }
         let (stop_tx, stop_rx) = channel::<ServiceMsg>();
         let state = Arc::new(RwLock::new(StateSnapshot::default()));
+        // Seed the shared snapshot's config up front: the snapshot is only
+        // rebuilt on the first message, so without this a client connecting
+        // before any event would read `Config::default()` from GetConfig (and
+        // an unedited save would clobber the real config).
+        state.write().unwrap().config = cfg.clone();
         (
             Self {
                 cfg_path: cfg_path.to_path_buf(),
@@ -104,9 +109,11 @@ impl Service {
     /// re-reads the config file and swaps it in (which exits GameBoost cleanly);
     /// `Stop` exits GameBoost so every boosted process is restored (a suspended
     /// or down-prioritized process must not survive the service). The shared
-    /// snapshot is refreshed after the message, throttled to
+    /// snapshot is refreshed on the way out, throttled to
     /// [`SNAPSHOT_REFRESH_INTERVAL`] so churn does not rebuild the O(N) process
-    /// Vecs per event; `Reload` / `Stop` always force a fresh snapshot.
+    /// Vecs per event; `Reload` / `Stop` always force a fresh snapshot, and
+    /// `SaveConfig` refreshes *before* its reply so a `GetConfig` arriving
+    /// immediately after cannot read a pre-save config.
     pub fn handle_message(&mut self, msg: &ServiceMsg) -> Result<(), String> {
         let res = match msg {
             ServiceMsg::Proc(ev) => {
@@ -120,8 +127,15 @@ impl Service {
             ServiceMsg::Reload => self.reload(),
             ServiceMsg::SaveConfig { cfg, reply } => {
                 let res = self.persist_config(cfg);
-                let _ = reply.send(res);
-                Ok(())
+                // Refresh BEFORE replying so a GetConfig arriving right after
+                // SaveConfig reads the just-saved config, not the pre-save one.
+                // A failed `reply.send` is surfaced as `Err` (the reply is the
+                // only delivery a SaveConfig has, so its failure must be
+                // observable, not swallowed).
+                self.maybe_refresh_state(msg);
+                reply
+                    .send(res)
+                    .map_err(|e| format!("save config reply failed: {e}"))
             }
             ServiceMsg::Stop => {
                 // Restore every boosted process before the loop breaks, so a
@@ -131,7 +145,11 @@ impl Service {
                 Ok(())
             }
         };
-        self.maybe_refresh_state(msg);
+        // SaveConfig already refreshed above (before its reply); every other
+        // message refreshes on the way out.
+        if !matches!(msg, ServiceMsg::SaveConfig { .. }) {
+            self.maybe_refresh_state(msg);
+        }
         res
     }
 
@@ -354,9 +372,9 @@ impl Service {
                     }
                 }
                 ServiceMsg::SaveConfig { cfg, reply } => {
-                    // The reply channel carries the persist outcome back to the
-                    // blocked IPC thread; handle_message only returns Err if the
-                    // reply itself could not be delivered.
+                    // The reply payload carries the persist outcome back to the
+                    // blocked IPC thread; handle_message returns Err here only
+                    // when the reply channel itself could not be delivered.
                     if let Err(e) =
                         self.handle_message(&ServiceMsg::SaveConfig { cfg, reply })
                     {
