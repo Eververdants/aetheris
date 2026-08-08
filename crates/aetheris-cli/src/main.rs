@@ -47,6 +47,16 @@ fn main() {
             }
         }
         Ok(Response::Reload(m)) => println!("reload: {m}"),
+        Ok(Response::Config(c)) => {
+            println!(
+                "processes: {}; background rules: {}; always rules: {}",
+                c.game.processes.len(),
+                c.background.len(),
+                c.rule.len()
+            );
+        }
+        Ok(Response::SaveConfig(Ok(m))) => println!("saved: {m}"),
+        Ok(Response::SaveConfig(Err(e))) => println!("save failed: {e}"),
         Ok(Response::Process(Some(p))) => {
             println!("{} (pid {}, game={})", p.name, p.pid, p.is_game)
         }

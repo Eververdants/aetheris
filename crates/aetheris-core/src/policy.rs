@@ -71,6 +71,12 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         self.mode
     }
 
+    /// Read access to the active config, exposed so `Service::current_state`
+    /// can clone it into the shared IPC snapshot for `GetConfig`.
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
     /// Read access to the backend, used by tests to inspect OS-level QoS state
     /// (e.g. whether a Job Object exists for a pid) and by the service for
     /// backend-level operations.

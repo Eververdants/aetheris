@@ -30,6 +30,8 @@ use windows::Win32::System::Pipes::{
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 
+use crate::config::Config;
+
 /// Default pipe used by the service.
 pub const DEFAULT_PIPE: &str = r"\\.\pipe\aetheris";
 
@@ -56,14 +58,18 @@ const ERROR_NO_PROCESS: WIN32_ERROR = WIN32_ERROR(123);
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
     GetState,
+    GetConfig,
     ReloadConfig,
+    SaveConfig(Config),
     QueryProcess(String),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Response {
     State(StateSnapshot),
+    Config(Config),
     Reload(String),
+    SaveConfig(Result<String, String>),
     Process(Option<ProcessInfo>),
 }
 
@@ -73,6 +79,9 @@ pub struct StateSnapshot {
     pub boosted: Vec<ProcessInfo>,
     pub processes: Vec<ProcessInfo>,
     pub last_reload: Option<String>,
+    /// Live config, cloned into the snapshot on each refresh so `GetConfig`
+    /// answers from shared state without a separate roundtrip to the engine.
+    pub config: Config,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

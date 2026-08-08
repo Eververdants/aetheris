@@ -32,6 +32,13 @@ pub enum ServiceMsg {
     Proc(ProcessEvent),
     Foreground(ForegroundEvent),
     Reload,
+    /// Persist `cfg` (validate, atomic temp+rename, reload into the engine) and
+    /// report the outcome on `reply`. The IPC thread sends this and blocks on
+    /// `reply` so a `SaveConfig` request gets a synchronous result.
+    SaveConfig {
+        cfg: Config,
+        reply: Sender<Result<String, String>>,
+    },
     Stop,
 }
 
@@ -111,6 +118,11 @@ impl Service {
                 Ok(())
             }
             ServiceMsg::Reload => self.reload(),
+            ServiceMsg::SaveConfig { cfg, reply } => {
+                let res = self.persist_config(cfg);
+                let _ = reply.send(res);
+                Ok(())
+            }
             ServiceMsg::Stop => {
                 // Restore every boosted process before the loop breaks, so a
                 // Ctrl-C mid-game never leaves processes suspended or
@@ -127,11 +139,15 @@ impl Service {
     /// [`SNAPSHOT_REFRESH_INTERVAL`] so the O(N) name-cloning rebuild in
     /// [`Service::current_state`] does not run on every event under churn.
     /// `Reload` / `Stop` always force a rebuild so a reload outcome and the
-    /// post-stop restore are never stale; the timer is also advanced on a
-    /// forced rebuild so a subsequent throttled message does not immediately
-    /// re-trigger.
+    /// post-stop restore are never stale; `SaveConfig` also forces one so a
+    /// just-saved config is immediately visible to `GetConfig` readers. The
+    /// timer is also advanced on a forced rebuild so a subsequent throttled
+    /// message does not immediately re-trigger.
     fn maybe_refresh_state(&mut self, msg: &ServiceMsg) {
-        let force = matches!(msg, ServiceMsg::Reload | ServiceMsg::Stop);
+        let force = matches!(
+            msg,
+            ServiceMsg::Reload | ServiceMsg::Stop | ServiceMsg::SaveConfig { .. }
+        );
         if force {
             self.refresh_state();
             self.last_refresh = Some(std::time::Instant::now());
@@ -172,6 +188,23 @@ impl Service {
         }
     }
 
+    /// Validate `cfg`, write it atomically over `cfg_path` (temp file in the
+    /// same directory + rename), and reload it into the engine.
+    ///
+    /// Invalid configs are rejected *before* any write, so a bad config never
+    /// touches the file. The temp name embeds the pid so concurrent saves (or a
+    /// leftover from a crashed process) never collide.
+    fn persist_config(&mut self, cfg: &Config) -> Result<String, String> {
+        cfg.validate().map_err(|e| e.to_string())?;
+        let dir = self.cfg_path.parent().unwrap_or(std::path::Path::new("."));
+        let tmp = dir.join(format!(".aetheris.toml.tmp{}", std::process::id()));
+        std::fs::write(&tmp, toml::to_string(cfg).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &self.cfg_path).map_err(|e| e.to_string())?;
+        self.engine.set_config(cfg.clone());
+        Ok("saved".into())
+    }
+
     /// Rebuild the shared snapshot from the engine's current state. Reads
     /// `last_reload` back out of the snapshot so `current_state` callers (and a
     /// subsequent refresh) do not clobber the recorded reload outcome.
@@ -207,7 +240,7 @@ impl Service {
             })
             .collect();
         let last_reload = self.state.read().ok().and_then(|s| s.last_reload.clone());
-        StateSnapshot { mode, boosted, processes, last_reload }
+        StateSnapshot { mode, boosted, processes, last_reload, config: self.engine.cfg().clone() }
     }
 
     /// Spawn the ETW / foreground / IPC threads, each feeding the shared event
@@ -247,9 +280,10 @@ impl Service {
             }
         });
 
-        // IPC server: answers GetState/QueryProcess from the shared snapshot
-        // (refreshed by the main loop, throttled to SNAPSHOT_REFRESH_INTERVAL)
-        // and forwards reloads to the main loop.
+        // IPC server: answers GetState/QueryProcess/GetConfig from the shared
+        // snapshot (refreshed by the main loop, throttled to
+        // SNAPSHOT_REFRESH_INTERVAL), forwards reloads to the main loop, and
+        // routes SaveConfig through the main loop, blocking for the outcome.
         let state = self.state.clone();
         let ipc_tx = tx.clone();
         // Interactive Users DACL so a non-elevated aetheris-cli can reach the
@@ -261,6 +295,10 @@ impl Service {
                     Request::GetState => {
                         let s = state.read().unwrap();
                         Response::State(s.clone())
+                    }
+                    Request::GetConfig => {
+                        let cfg = state.read().unwrap().config.clone();
+                        Response::Config(cfg)
                     }
                     Request::QueryProcess(name) => {
                         let s = state.read().unwrap();
@@ -278,6 +316,19 @@ impl Service {
                     Request::ReloadConfig => {
                         let _ = ipc_tx.send(ServiceMsg::Reload);
                         Response::Reload("queued".into())
+                    }
+                    Request::SaveConfig(cfg) => {
+                        let (tx, rx) = channel();
+                        let _ = ipc_tx.send(ServiceMsg::SaveConfig {
+                            cfg: cfg.clone(),
+                            reply: tx,
+                        });
+                        match rx.recv() {
+                            Ok(res) => Response::SaveConfig(res),
+                            Err(_) => {
+                                Response::SaveConfig(Err("service unavailable".into()))
+                            }
+                        }
                     }
                 }
             };
@@ -300,6 +351,16 @@ impl Service {
                     // still answers "queued" — the warning is the feedback).
                     if let Err(e) = self.handle_message(&ServiceMsg::Reload) {
                         log::warn(format!("reload failed (keeping previous config): {e}"));
+                    }
+                }
+                ServiceMsg::SaveConfig { cfg, reply } => {
+                    // The reply channel carries the persist outcome back to the
+                    // blocked IPC thread; handle_message only returns Err if the
+                    // reply itself could not be delivered.
+                    if let Err(e) =
+                        self.handle_message(&ServiceMsg::SaveConfig { cfg, reply })
+                    {
+                        log::warn(format!("save config reply failed: {e}"));
                     }
                 }
                 ServiceMsg::Proc(ev) => {

@@ -2,6 +2,7 @@
 use std::thread;
 use std::time::Duration;
 
+use aetheris_core::config::{Config, GameConfig};
 use aetheris_core::ipc::{client_call, IpcServer, ProcessInfo, Request, Response, StateSnapshot};
 
 const TEST_PIPE: &str = r"\\.\pipe\aetheris_test";
@@ -24,6 +25,14 @@ fn roundtrip_get_state_and_query() {
                     is_game: false,
                 })),
                 Request::ReloadConfig => Response::Reload("ok".into()),
+                Request::GetConfig => Response::Config(Config {
+                    game: GameConfig {
+                        processes: vec!["game.exe".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                Request::SaveConfig(_cfg) => Response::SaveConfig(Ok("saved".into())),
             }
         };
         let _ = server.run(&mut handler);
@@ -47,6 +56,15 @@ fn roundtrip_get_state_and_query() {
 
     let reload = client_call(TEST_PIPE, &Request::ReloadConfig).expect("call");
     assert!(matches!(reload, Response::Reload(_)));
+
+    let cfg = match client_call(TEST_PIPE, &Request::GetConfig).expect("call") {
+        Response::Config(c) => c,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(cfg.game.processes, vec!["game.exe".to_string()]);
+
+    let save = client_call(TEST_PIPE, &Request::SaveConfig(cfg)).expect("call");
+    assert!(matches!(save, Response::SaveConfig(Ok(_))));
 
     drop(t);
 }
