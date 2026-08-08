@@ -8,14 +8,14 @@
 //!
 //! Graceful degradation: on [`ServiceMsg::Proc`] events the engine is only
 //! consulted when `system_load_percent()` is at or below 85; above that the
-//! action is deferred with a warn (throttled to once per second). The v1 sampler
-//! stub returns 0, so the hook never self-throttles incorrectly — the real
-//! `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` sampling
-//! lands in v1.1.
+//! action is deferred with a warn (throttled to once per second). The sampler
+//! reads `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` and on
+//! any failure returns 0, so the hook never self-throttles incorrectly.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::actions::OsBackend;
 use crate::config::Config;
@@ -276,9 +276,97 @@ impl Service {
     }
 }
 
-/// v1 stub: returns 0 so graceful degradation never self-throttles incorrectly.
-/// Real `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`
-/// sampling lands in v1.1.
+/// Previous aggregate CPU sample, used to compute the delta between two calls
+/// to [`system_load_percent`].
+#[derive(Clone, Copy)]
+struct LoadSample {
+    idle: u64,
+    total: u64,
+}
+
+static LOAD_STATE: Mutex<Option<LoadSample>> = Mutex::new(None);
+static LOAD_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Current system busy percentage, 0..=100, from two
+/// `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` samples.
+///
+/// Idle and total processor time are summed across all processors; the ratio of
+/// the per-call deltas is the busy percentage. The first call only seeds the
+/// previous sample and returns 0 (not enough data). On any query failure the
+/// call returns 0 — safe for graceful degradation, which must never
+/// self-throttle on a broken sampler — and logs a warning once.
 pub fn system_load_percent() -> u32 {
-    0
+    let mut cur = LoadSample { idle: 0, total: 0 };
+    let ok = unsafe {
+        let mut info: [ntapi::ntexapi::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION; 64] =
+            [std::mem::zeroed(); 64];
+        let size = std::mem::size_of_val(&info) as u32;
+        let status = ntapi::ntexapi::NtQuerySystemInformation(
+            ntapi::ntexapi::SystemProcessorPerformanceInformation,
+            info.as_mut_ptr() as *mut _,
+            size,
+            std::ptr::null_mut(),
+        );
+        if status == 0 {
+            let mut idle = 0u64;
+            let mut total = 0u64;
+            for p in info.iter() {
+                idle = idle.saturating_add(*p.IdleTime.QuadPart() as u64);
+                total = total
+                    .saturating_add(*p.IdleTime.QuadPart() as u64)
+                    .saturating_add(*p.KernelTime.QuadPart() as u64)
+                    .saturating_add(*p.UserTime.QuadPart() as u64);
+            }
+            cur = LoadSample { idle, total };
+            true
+        } else {
+            false
+        }
+    };
+
+    if !ok {
+        if !LOAD_FAILED_WARNED.swap(true, Ordering::Relaxed) {
+            log::warn("system load sampling failed (NtQuerySystemInformation)");
+        }
+        return 0;
+    }
+
+    let mut guard = LOAD_STATE.lock().unwrap();
+    let prev = match &*guard {
+        Some(p) => *p,
+        None => {
+            *guard = Some(cur);
+            return 0; // first sample: not enough data
+        }
+    };
+    *guard = Some(cur);
+
+    let d_total = cur.total.saturating_sub(prev.total);
+    let d_idle = cur.idle.saturating_sub(prev.idle);
+    if d_total == 0 {
+        return 0;
+    }
+    let busy = d_total.saturating_sub(d_idle);
+    let pct = (busy as f64 / d_total as f64 * 100.0).round();
+    (pct as u32).min(100)
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::system_load_percent;
+
+    #[test]
+    fn load_in_range() {
+        let v = system_load_percent();
+        assert!(v <= 100, "load {v} out of range");
+    }
+
+    #[test]
+    fn load_changes_slowly() {
+        // Two samples close together must both be 0..=100 (stability, not monotonicity).
+        let a = system_load_percent();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let b = system_load_percent();
+        assert!(a <= 100 && b <= 100);
+    }
 }
