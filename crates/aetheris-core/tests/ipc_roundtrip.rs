@@ -8,6 +8,30 @@ use aetheris_core::ipc::{client_call, IpcServer, ProcessInfo, Request, Response,
 const TEST_PIPE: &str = r"\\.\pipe\aetheris_test";
 const TEST_PIPE_DACL: &str = r"\\.\pipe\aetheris_test_dacl";
 
+/// The one-shot server tears each connection down before recreating the next
+/// pipe instance, so a client call can fail transiently even though a previous
+/// call succeeded: a write landing inside the close-then-recreate window gets
+/// ERROR_PIPE_NOT_CONNECTED, and a call racing the very first `CreateNamedPipeW`
+/// finds no pipe instance at all ("pipe unavailable after retries"). Both are
+/// scheduling races, not protocol failures. Poll until the call succeeds or the
+/// deadline passes, retrying every error; a genuinely broken server still fails
+/// (slowly) after the deadline. Protocol mismatches surface as panics at the
+/// call sites' `match`, which this helper does not retry.
+fn call_with_retry(pipe: &str, req: &Request) -> Result<Response, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match client_call(pipe, req) {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 #[test]
 fn roundtrip_get_state_and_query() {
     let server = IpcServer::new(TEST_PIPE);
@@ -38,32 +62,30 @@ fn roundtrip_get_state_and_query() {
         let _ = server.run(&mut handler);
     });
 
-    // Wait for the server to be listening.
-    thread::sleep(Duration::from_millis(300));
-
-    let state = match client_call(TEST_PIPE, &Request::GetState).expect("call") {
+    let state = match call_with_retry(TEST_PIPE, &Request::GetState).expect("call") {
         Response::State(s) => s,
         other => panic!("unexpected response: {other:?}"),
     };
     assert_eq!(state.mode, "Normal");
 
-    let proc =
-        match client_call(TEST_PIPE, &Request::QueryProcess("browser.exe".into())).expect("call") {
-            Response::Process(p) => p,
-            other => panic!("unexpected response: {other:?}"),
-        };
+    let proc = match call_with_retry(TEST_PIPE, &Request::QueryProcess("browser.exe".into()))
+        .expect("call")
+    {
+        Response::Process(p) => p,
+        other => panic!("unexpected response: {other:?}"),
+    };
     assert_eq!(proc.unwrap().pid, 42);
 
-    let reload = client_call(TEST_PIPE, &Request::ReloadConfig).expect("call");
+    let reload = call_with_retry(TEST_PIPE, &Request::ReloadConfig).expect("call");
     assert!(matches!(reload, Response::Reload(_)));
 
-    let cfg = match client_call(TEST_PIPE, &Request::GetConfig).expect("call") {
+    let cfg = match call_with_retry(TEST_PIPE, &Request::GetConfig).expect("call") {
         Response::Config(c) => c,
         other => panic!("unexpected response: {other:?}"),
     };
     assert_eq!(cfg.game.processes, vec!["game.exe".to_string()]);
 
-    let save = client_call(TEST_PIPE, &Request::SaveConfig(cfg)).expect("call");
+    let save = call_with_retry(TEST_PIPE, &Request::SaveConfig(cfg)).expect("call");
     assert!(matches!(save, Response::SaveConfig(Ok(_))));
 
     drop(t);
@@ -77,12 +99,9 @@ fn pipe_with_interactive_dacl_connectable_from_same_token() {
         let _ = server.run(&mut h);
     });
 
-    // Wait for the server to be listening.
-    thread::sleep(Duration::from_millis(300));
-
     // Connect as the current (likely non-elevated) token; must succeed with the
     // IU DACL.
-    let resp = client_call(TEST_PIPE_DACL, &Request::GetState)
+    let resp = call_with_retry(TEST_PIPE_DACL, &Request::GetState)
         .expect("connect with interactive DACL");
     assert!(matches!(resp, Response::State(_)));
 
