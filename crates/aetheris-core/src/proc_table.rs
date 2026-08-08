@@ -32,18 +32,17 @@ impl ProcessTable {
 
     pub fn upsert(&mut self, pid: u32, name: &str, is_game: bool) {
         let h = name_hash(name);
-        match self.get(pid) {
-            Some(m) if m.name_hash == h => {
-                if let Some(i) = self.pids.iter().position(|p| *p == pid) {
-                    self.is_game[i] = is_game;
-                }
-            }
-            _ => {
-                self.pids.push(pid);
-                self.name_hashes.push(h);
-                self.is_game.push(is_game);
-                self.names.insert(pid, name.to_string());
-            }
+        if let Some(i) = self.pids.iter().position(|p| *p == pid) {
+            // Update in place: pid already known, refresh name hash, game flag,
+            // and the name map. Never push a duplicate row.
+            self.name_hashes[i] = h;
+            self.is_game[i] = is_game;
+            self.names.insert(pid, name.to_string());
+        } else {
+            self.pids.push(pid);
+            self.name_hashes.push(h);
+            self.is_game.push(is_game);
+            self.names.insert(pid, name.to_string());
         }
     }
 
@@ -123,5 +122,19 @@ mod tests {
     #[test]
     fn hash_is_stable_and_case_insensitive() {
         assert_eq!(name_hash("Chrome.EXE"), name_hash("chrome.exe"));
+    }
+
+    #[test]
+    fn upsert_same_pid_renamed_updates_in_place() {
+        let mut t = ProcessTable::new();
+        t.upsert(42, "old.exe", false);
+        t.upsert(42, "new.exe", true);
+        assert_eq!(t.len(), 1, "renamed pid must not add a row");
+        assert_eq!(t.name(42), Some("new.exe"));
+        let m = t.get(42).unwrap();
+        assert!(m.is_game);
+        assert_eq!(t.iter().count(), 1);
+        t.remove(42);
+        assert_eq!(t.len(), 0);
     }
 }
