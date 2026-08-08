@@ -152,7 +152,7 @@ impl Config {
                 // DEV (warn, non-fatal): cores beyond the host's logical CPU
                 // count can't be pinned; flag it but do NOT reject the config.
                 let n = crate::actions::logical_cpu_count();
-                if a.cores.iter().any(|&c| c as u32 >= n) {
+                if n > 0 && a.cores.iter().any(|&c| c as u32 >= n) {
                     crate::log::warn(format!(
                         "rule '{}' affinity cores exceed logical CPU count ({}) on this host",
                         b.name, n
@@ -173,7 +173,7 @@ impl Config {
                 }
                 // DEV (warn, non-fatal): same host-count check as background rules.
                 let n = crate::actions::logical_cpu_count();
-                if a.cores.iter().any(|&c| c as u32 >= n) {
+                if n > 0 && a.cores.iter().any(|&c| c as u32 >= n) {
                     crate::log::warn(format!(
                         "rule '{}' affinity cores exceed logical CPU count ({}) on this host",
                         r.name, n

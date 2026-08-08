@@ -333,6 +333,12 @@ impl ProcessBackend for OsBackend {
                         // and express each as a GROUP_AFFINITY entry so
                         // SetProcessDefaultCpuSetMasks can pin them. Reuses `h`
                         // (PROCESS_RIGHTS includes PROCESS_SET_INFORMATION).
+                        // NOTE: this API sets the process DEFAULT CPU-set mask.
+                        // Whether already-running threads are re-pinned by a
+                        // default-mask change is unverified (needs a >64-logical-CPU
+                        // host); if they are not, new threads are still pinned while
+                        // existing ones keep their prior scheduling — verify on a
+                        // dual-group host before relying on this path in production.
                         let cores: Vec<u8> =
                             (0..64u8).filter(|i| (*core_mask >> *i) & 1 == 1).collect();
                         match build_cpu_set_mask(&cores) {
