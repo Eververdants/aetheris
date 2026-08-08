@@ -6,9 +6,9 @@
 //!
 //! The WinEvent callback has no context parameter, so the sender lives in a
 //! process-global [`OnceLock`]. The watcher starts once at service init and
-//! lives for the process lifetime, so this is acceptable; `start()` must not
-//! be called twice in the same process (the second call's channel would never
-//! be fed, since the `OnceLock` keeps the first sender).
+//! lives for the process lifetime, so this is acceptable; calling `start()`
+//! twice in the same process returns an error (the `OnceLock` keeps the first
+//! sender).
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::OnceLock;
@@ -21,7 +21,7 @@ use windows::Win32::UI::Accessibility::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GetMessageW, GetWindowThreadProcessId,
-    PostThreadMessageW, MSG, WINEVENT_OUTOFCONTEXT, WM_QUIT,
+    PeekMessageW, PM_NOREMOVE, PostThreadMessageW, MSG, WINEVENT_OUTOFCONTEXT, WM_QUIT,
 };
 
 use crate::events::ForegroundEvent;
@@ -61,9 +61,9 @@ unsafe extern "system" fn win_event_proc(
 impl ForegroundWatcher {
     pub fn start() -> Result<Self, String> {
         let (tx, rx) = channel::<ForegroundEvent>();
-        let _ = FOREGROUND_TX.set(tx);
-        let tx = FOREGROUND_TX.get().cloned().ok_or("foreground tx lost")?;
-        drop(tx); // callback reads the static; local clone only confirms the set
+        if FOREGROUND_TX.set(tx).is_err() {
+            return Err("ForegroundWatcher::start called twice".to_string());
+        }
 
         // The pump thread registers its OS thread id first so `stop()` can
         // target it with PostThreadMessageW. (PostMessageW to a NULL window
@@ -71,6 +71,16 @@ impl ForegroundWatcher {
         let (tid_tx, tid_rx) = channel::<u32>();
 
         let handle = thread::spawn(move || {
+            // Windows creates a thread's message queue lazily on the first
+            // GetMessage/PeekMessage. `stop()` posts WM_QUIT to this thread id
+            // via PostThreadMessageW, which fails with ERROR_INVALID_THREAD_ID
+            // if the queue doesn't exist yet, leaving `join()` to hang. Force
+            // the queue into existence BEFORE publishing the id so that once
+            // `start()` returns, `stop()` always succeeds.
+            let mut force_queue = std::mem::MaybeUninit::<MSG>::uninit();
+            let _ = unsafe {
+                PeekMessageW(force_queue.as_mut_ptr(), None, 0, 0, PM_NOREMOVE)
+            };
             let _ = tid_tx.send(unsafe { GetCurrentThreadId() });
             let hook = unsafe {
                 SetWinEventHook(
