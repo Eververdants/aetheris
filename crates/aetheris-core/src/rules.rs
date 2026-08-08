@@ -20,6 +20,19 @@ impl PatternMatcher {
         self.ac.is_match(name.as_bytes())
     }
 
+    /// Iterate every (overlapping) match of the compiled patterns over
+    /// `haystack`, each yielding a `Match` whose `pattern()` is the index of the
+    /// matching pattern. `first_matching_*` takes the minimum pattern index over
+    /// this iterator to recover "earliest rule in config order wins" — a
+    /// plain `find_iter` reports matches in leftmost scan order, NOT pattern
+    /// order, so `find_iter(...).next()` would not yield the earliest pattern.
+    pub fn find_overlapping_iter<'h>(
+        &self,
+        haystack: &'h [u8],
+    ) -> aho_corasick::FindOverlappingIter<'_, 'h> {
+        self.ac.find_overlapping_iter(haystack)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ac.patterns_len() == 0
     }
@@ -50,5 +63,17 @@ mod tests {
         let m = PatternMatcher::new(vec!["browser.exe".into()]);
         assert!(m.matches("browser.exe"));
         assert!(m.matches("Browser.EXE"));
+    }
+
+    #[test]
+    fn earliest_pattern_index_wins() {
+        // A later pattern that matches earlier in the haystack must not win:
+        // `min` over overlapping matches yields the earliest pattern index.
+        let m = PatternMatcher::new(vec!["updater.exe".into(), "updater".into()]);
+        let earliest = m
+            .find_overlapping_iter(b"updater.exe")
+            .map(|x| x.pattern().as_usize())
+            .min();
+        assert_eq!(earliest, Some(0));
     }
 }

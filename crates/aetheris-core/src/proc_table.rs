@@ -20,8 +20,13 @@ pub struct ProcessTable {
 }
 
 pub fn name_hash(name: &str) -> u64 {
+    // Non-allocating case-insensitive fold: hash each byte lowercased in place.
+    // Hashes a protected (already-lowercase) name identically to an
+    // arbitrary-case runtime name, so `is_protected` never allocates.
     let mut h = DefaultHasher::new();
-    name.to_ascii_lowercase().hash(&mut h);
+    for &b in name.as_bytes() {
+        b.to_ascii_lowercase().hash(&mut h);
+    }
     h.finish()
 }
 
@@ -122,6 +127,13 @@ mod tests {
     #[test]
     fn hash_is_stable_and_case_insensitive() {
         assert_eq!(name_hash("Chrome.EXE"), name_hash("chrome.exe"));
+    }
+
+    #[test]
+    fn name_hash_is_identical_across_case() {
+        // The protected set (hashed already-lowercase) and arbitrary-case
+        // runtime names must hash identically so `is_protected` matches.
+        assert_eq!(name_hash("CSRSS.EXE"), name_hash("csrss.exe"));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //!   restores every snapshot.
 //! - Protected processes are never acted on.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::actions::{ProcessBackend, ProcState, TargetAction};
 use crate::config::{AffinitySpec, Config};
@@ -32,13 +32,20 @@ pub struct PolicyEngine<B: ProcessBackend> {
     boosted: HashMap<u32, ProcState>,
     game_pids: Vec<u32>,
     foreground_pid: Option<u32>,
+    // Precompiled matchers, rebuilt once at `new()` / `set_config()` instead of
+    // per lookup. Pattern indices align with `cfg.background` / `cfg.rule`.
+    background_matcher: PatternMatcher,
+    always_matcher: PatternMatcher,
+    background_names: Vec<String>, // parallel to cfg.background
+    always_names: Vec<String>,     // parallel to cfg.rule
+    protected_hashes: HashSet<u64>,
 }
 
 impl<B: ProcessBackend> PolicyEngine<B> {
     pub fn new(cfg: Config, backend: B) -> Self {
         let protected = cfg.protected_set();
         let matcher = PatternMatcher::new(cfg.game.processes.clone());
-        Self {
+        let mut engine = Self {
             cfg,
             matcher,
             protected,
@@ -48,7 +55,14 @@ impl<B: ProcessBackend> PolicyEngine<B> {
             boosted: HashMap::new(),
             game_pids: Vec::new(),
             foreground_pid: None,
-        }
+            background_matcher: PatternMatcher::new(Vec::new()),
+            always_matcher: PatternMatcher::new(Vec::new()),
+            background_names: Vec::new(),
+            always_names: Vec::new(),
+            protected_hashes: HashSet::new(),
+        };
+        engine.rebuild_matchers();
+        engine
     }
 
     pub fn mode(&self) -> Mode {
@@ -72,20 +86,59 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         self.table.iter()
     }
 
+    /// Rebuild the precompiled matchers and the protected-hash set. Called from
+    /// `new()` and `set_config()`; never from the per-event hot path.
+    fn rebuild_matchers(&mut self) {
+        self.background_names = self.cfg.background.iter().map(|r| r.name.to_ascii_lowercase()).collect();
+        self.always_names = self.cfg.rule.iter().map(|r| r.name.to_ascii_lowercase()).collect();
+        self.background_matcher = PatternMatcher::new(self.background_names.clone());
+        self.always_matcher = PatternMatcher::new(self.always_names.clone());
+        self.protected_hashes = self
+            .protected
+            .iter()
+            .map(|p| crate::proc_table::name_hash(p))
+            .collect();
+    }
+
     fn is_protected(&self, name: &str) -> bool {
-        self.protected.contains(&name.to_ascii_lowercase())
+        // Allocation-free lookup: hash the name with the same case-insensitive
+        // fold used to build `protected_hashes`, so arbitrary-case names match
+        // already-lowercase protected entries.
+        self.protected_hashes.contains(&crate::proc_table::name_hash(name))
+    }
+
+    /// Index of the earliest background rule matching `name`, in config order.
+    fn first_matching_background(&self, name: &str) -> Option<usize> {
+        // The matcher is `ascii_case_insensitive(true)`; scan the raw bytes with
+        // no lowercase alloc. Take the MINIMUM pattern index over all (overlapping)
+        // matches so the earliest rule in config order wins — aho-corasick reports
+        // matches in leftmost scan order, not pattern order, so `.next()` alone
+        // would not preserve config-order precedence for overlapping patterns.
+        self.background_matcher
+            .find_overlapping_iter(name.as_bytes())
+            .map(|m| m.pattern().as_usize())
+            .min()
+    }
+
+    /// Index of the earliest always-rule matching `name`, in config order.
+    fn first_matching_always(&self, name: &str) -> Option<usize> {
+        self.always_matcher
+            .find_overlapping_iter(name.as_bytes())
+            .map(|m| m.pattern().as_usize())
+            .min()
+    }
+
+    fn background_rule_at(&self, i: usize) -> Option<&crate::config::BackgroundRule> {
+        self.cfg.background.get(i)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_protected_for_test(&self, name: &str) -> bool {
+        self.is_protected(name)
     }
 
     fn is_game(&self, name: &str) -> bool {
         self.matcher.matches(name)
-    }
-
-    fn find_background_rule(&self, name: &str) -> Option<&crate::config::BackgroundRule> {
-        let name = name.to_ascii_lowercase();
-        self.cfg
-            .background
-            .iter()
-            .find(|r| PatternMatcher::new(vec![r.name.clone()]).matches(&name))
     }
 
     fn actions_for(rule: &crate::config::BackgroundRule) -> Vec<TargetAction> {
@@ -109,20 +162,20 @@ impl<B: ProcessBackend> PolicyEngine<B> {
     }
 
     fn always_actions_for(&self, name: &str) -> Vec<TargetAction> {
-        let name_l = name.to_ascii_lowercase();
-        if let Some(r) = self.cfg.rule.iter().find(|r| {
-            PatternMatcher::new(vec![r.name.clone()]).matches(&name_l)
-        }) {
-            let mut v = Vec::new();
-            if let Some(p) = r.priority {
-                v.push(TargetAction::Priority(p));
-            }
-            if let Some(a) = &r.affinity {
-                v.push(TargetAction::Affinity { core_mask: mask_from_affinity(a) });
-            }
-            return v;
+        let Some(idx) = self.first_matching_always(name) else {
+            return Vec::new();
+        };
+        let Some(r) = self.cfg.rule.get(idx) else {
+            return Vec::new();
+        };
+        let mut v = Vec::new();
+        if let Some(p) = r.priority {
+            v.push(TargetAction::Priority(p));
         }
-        Vec::new()
+        if let Some(a) = &r.affinity {
+            v.push(TargetAction::Affinity { core_mask: mask_from_affinity(a) });
+        }
+        v
     }
 
     pub fn on_process_event(&mut self, ev: &ProcessEvent) {
@@ -228,7 +281,11 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         if self.is_protected(name) {
             return;
         }
-        let rule = match self.find_background_rule(name) {
+        let rule_idx = match self.first_matching_background(name) {
+            Some(i) => i,
+            None => return,
+        };
+        let rule = match self.background_rule_at(rule_idx) {
             Some(r) => r,
             None => return,
         };
@@ -264,6 +321,7 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         self.cfg = cfg;
         self.matcher = PatternMatcher::new(self.cfg.game.processes.clone());
         self.protected = self.cfg.protected_set();
+        self.rebuild_matchers();
     }
 }
 
@@ -411,6 +469,56 @@ mod tests {
         assert!(eng.boosted().is_empty());
         let calls = backend.calls();
         assert!(calls.iter().any(|c| c.pid == 100 && c.restore.is_some()));
+    }
+
+    #[test]
+    fn combined_matcher_first_match_order() {
+        // background rule order matters: first matching rule wins. Overwrite the
+        // shared `cfg()` background (which already carries a suspend=true
+        // "browser.exe" rule) so the scenario is exactly: "browser" (idx 0,
+        // suspend=false) is the earliest match for "browser.exe".
+        let mut c = cfg();
+        c.background = vec![
+            BackgroundRule { name: "browser".into(), suspend: false, ..Default::default() },
+            BackgroundRule { name: "browser.exe".into(), suspend: true, ..Default::default() },
+        ];
+        let backend = RecordingBackend::default();
+        let mut eng = PolicyEngine::new(c, backend.clone());
+        eng.on_process_event(&start(200, "game.exe"));
+        eng.on_process_event(&start(100, "browser.exe"));
+        let calls = backend.calls();
+        // First rule ("browser") matches "browser.exe"; suspend is false there,
+        // so no Suspend applied.
+        assert!(!calls.iter().any(|c| c.pid == 100 && c.action == Some(TargetAction::Suspend)));
+    }
+
+    #[test]
+    fn overlapping_rules_preserve_config_order_precedence() {
+        // A later-index pattern that matches earlier in the name must not win:
+        // config order (earliest pattern index) decides, matching the pre-cache
+        // `find_background_rule` behavior. Here "updater" (idx 1) is a prefix of
+        // "updater.exe" but rule 0 ("updater.exe") is the earliest match.
+        let mut c = cfg();
+        c.background = vec![
+            BackgroundRule { name: "updater.exe".into(), suspend: true, ..Default::default() },
+            BackgroundRule { name: "updater".into(), suspend: false, ..Default::default() },
+        ];
+        let backend = RecordingBackend::default();
+        let mut eng = PolicyEngine::new(c, backend.clone());
+        eng.on_process_event(&start(200, "game.exe"));
+        eng.on_process_event(&start(100, "updater.exe"));
+        let calls = backend.calls();
+        // Rule 0 ("updater.exe", suspend) is the earliest match, so Suspend IS applied.
+        assert!(calls.iter().any(|c| c.pid == 100 && c.action == Some(TargetAction::Suspend)));
+    }
+
+    #[test]
+    fn is_protected_is_allocation_free_on_hit() {
+        // Sanity: protected membership works case-insensitively via hash, no panic.
+        let c = cfg();
+        let eng = PolicyEngine::new(c, RecordingBackend::default());
+        assert!(eng.is_protected_for_test("CSRSS.EXE"));
+        assert!(!eng.is_protected_for_test("browser.exe"));
     }
 
     #[test]
