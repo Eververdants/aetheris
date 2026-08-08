@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aetheris-core", "crates/aetheris-service", "crates/aetheris-cli"]
+members = ["crates/aetheris-core", "crates/aetheris-service", "crates/aetheris-cli", "crates/aetheris-ui"]
 
 [workspace.package]
 version = "1.0.0"
