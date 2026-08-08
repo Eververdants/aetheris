@@ -188,3 +188,62 @@ fn boost_suspends_then_exit_resumes_and_restores() {
     // 6. Child is killed by the ChildGuard on drop (also on panic).
     drop(guard);
 }
+
+/// Regression (Ctrl-C / `ServiceMsg::Stop`): the service must restore every
+/// boosted process when it shuts down, not only when the game exits. The stop
+/// path calls `PolicyEngine::exit_game_mode()` directly; without the fix the
+/// main loop broke on `ServiceMsg::Stop` without ever exiting game mode, so a
+/// suspended dummy_proc stayed frozen (and down-prioritized) after Ctrl-C.
+#[test]
+fn stop_path_restores_boosted_processes() {
+    let guard = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_dummy_proc")).spawn().expect("spawn dummy"),
+    );
+    let bg_pid = guard.0.id();
+
+    let mut engine = PolicyEngine::new(cfg(), OsBackend::new());
+
+    // 1. Background helper starts, then the game starts -> GameBoost: dummy is
+    //    suspended + down-prioritized.
+    engine.on_process_event(&start(bg_pid, "dummy_proc.exe"));
+    std::thread::sleep(Duration::from_millis(200)); // warm up busy-time
+    engine.on_process_event(&start(9000, "game.exe"));
+    assert_eq!(engine.mode(), Mode::GameBoost);
+    assert!(engine.boosted().contains_key(&bg_pid));
+
+    // 2. Suspended: CPU time must stop advancing.
+    let t1 = busy_time(bg_pid);
+    std::thread::sleep(Duration::from_millis(300));
+    let t2 = busy_time(bg_pid);
+    assert!(
+        t2 - t1 < 500_000,
+        "boosted background process must be frozen (t2-t1={})",
+        t2 - t1
+    );
+
+    // 3. Simulate the stop path: the service calls `exit_game_mode()` directly
+    //    (what `ServiceMsg::Stop` now routes to) before breaking the loop.
+    engine.exit_game_mode();
+    assert_eq!(engine.mode(), Mode::Normal);
+    assert!(engine.boosted().is_empty(), "boosted map must be cleared on stop");
+
+    // 4. Resumed: CPU time advances again.
+    std::thread::sleep(Duration::from_millis(300));
+    let t3 = busy_time(bg_pid);
+    assert!(
+        t3 - t2 > 50_000,
+        "restored process must accrue CPU time again (t3-t2={})",
+        t3 - t2
+    );
+
+    // 5. Priority restored to NORMAL (BelowNormal was applied during boost).
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        priority_class(bg_pid),
+        NORMAL_PRIORITY_CLASS.0,
+        "priority must be restored to NORMAL after stop"
+    );
+
+    // 6. Child is killed by the ChildGuard on drop (also on panic).
+    drop(guard);
+}

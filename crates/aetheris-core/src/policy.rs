@@ -202,7 +202,11 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         }
     }
 
-    fn exit_game_mode(&mut self) {
+    /// Exit GameBoost: restore every boosted process (resume suspended, restore
+    /// priority/affinity/QoS) and return to `Mode::Normal`. Public so the
+    /// service can restore state on shutdown (Ctrl-C / `ServiceMsg::Stop`) —
+    /// a suspended or down-prioritized process must never survive the service.
+    pub fn exit_game_mode(&mut self) {
         if self.mode != Mode::GameBoost {
             return;
         }

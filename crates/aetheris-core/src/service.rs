@@ -65,7 +65,8 @@ impl Service {
 
     /// Dispatch a message to the engine. The testable core of the loop: `Reload`
     /// re-reads the config file and swaps it in (which exits GameBoost cleanly);
-    /// `Stop` is a no-op here (the loop itself breaks on it).
+    /// `Stop` exits GameBoost so every boosted process is restored (a suspended
+    /// or down-prioritized process must not survive the service).
     pub fn handle_message(&mut self, msg: &ServiceMsg) -> Result<(), String> {
         match msg {
             ServiceMsg::Proc(ev) => {
@@ -82,7 +83,13 @@ impl Service {
                 self.engine.set_config(cfg);
                 Ok(())
             }
-            ServiceMsg::Stop => Ok(()),
+            ServiceMsg::Stop => {
+                // Restore every boosted process before the loop breaks, so a
+                // Ctrl-C mid-game never leaves processes suspended or
+                // down-prioritized.
+                self.engine.exit_game_mode();
+                Ok(())
+            }
         }
     }
 
@@ -163,7 +170,12 @@ impl Service {
         let mut last_degrade_warn = std::time::Instant::now();
         while let Ok(msg) = rx.recv() {
             match msg {
-                ServiceMsg::Stop => break,
+                ServiceMsg::Stop => {
+                    // Restore GameBoost state (resume suspended, restore
+                    // priority/affinity/QoS) before breaking out of the loop.
+                    let _ = self.handle_message(&ServiceMsg::Stop);
+                    break;
+                }
                 ServiceMsg::Reload => {
                     // A malformed config keeps the previous config active; log
                     // it so the failure is at least visible (the IPC handler

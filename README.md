@@ -113,15 +113,15 @@ Documented so they are not mistaken for bugs:
 - **`aetheris-cli` must ALSO run elevated.** The named pipe is created with the
   default pipe DACL, so a non-elevated CLI is denied access to the elevated
   service's pipe. Run the CLI from an elevated terminal too.
-- **`qos_cpu_quota` is a safe v1 no-op for cross-process targets.** v1 throttles
-  via Background Processing Mode (`SetPriorityClass`), not Job Objects — a
-  console service holding a Job Object handle across a game session would
-  terminate still-capped processes on Ctrl-C. MSDN documents
-  `PROCESS_MODE_BACKGROUND_BEGIN/END` as current-process-only, so applying it to
-  another process (the only case aetheris has) fails with
-  `ERROR_INVALID_PARAMETER` and is logged as a warning. This is safe and
-  reversible; priority / affinity / suspend still apply. A real cross-process
-  CPU cap is deferred (v2).
+- **`qos_cpu_quota` does not throttle external processes in v1.** v1 throttles
+  via Background Processing Mode (`SetPriorityClass`), which MSDN documents as
+  current-process-only — applying it to another process (the only case aetheris
+  has) fails with `ERROR_INVALID_PARAMETER` and is logged as a warning, so
+  `qos_cpu_quota` is a documented v1 no-op for external processes. This is *not*
+  because Job Object handle-close kills processes (that only happens when
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set, which it never was); a real
+  cross-process CPU cap needs Job Objects with clear-on-stop semantics, deferred
+  to v2. Priority / affinity / suspend still apply in v1.
 - **Affinity skips >64-logical-CPU hosts.** Classic `SetProcessAffinityMask`
   is a single `ULONG_PTR` and silently no-ops above one processor group.
   Group-aware affinity (`SetProcessDefaultCpuSetMasks` / `NtSetInformationProcess`)

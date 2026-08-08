@@ -121,8 +121,10 @@ fn qos_background_mode_is_safe_and_reversible() {
         .expect("clear qos (percent=0) must be a no-op or a reversal, never an error");
 
     // Dropping the backend must NOT terminate the process (Critical 2): v1
-    // holds no Job Object handles whose close would destroy the job and kill
-    // the assigned process.
+    // holds no Job Object handles at all (QoS is Background Processing Mode,
+    // current-process-only), and closing a job handle only kills assigned
+    // processes when JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is set — which it never
+    // is.
     drop(backend);
     assert!(
         child.try_wait().expect("try_wait").is_none(),

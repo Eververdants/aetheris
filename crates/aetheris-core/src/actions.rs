@@ -182,17 +182,15 @@ impl OsBackend {
     /// scheduling priorities (spec §5.4); `percent == 0` leaves it again.
     ///
     /// Why Background Processing Mode and not a Job Object (v1 decision):
-    /// a Job Object is destroyed when the last open handle to it is closed, and
-    /// destroying a job terminates every process still assigned to it. The
-    /// service is currently a console process stopped with Ctrl-C: with the
-    /// shipped `aetheris.toml` (`qos_cpu_quota = 50` on `chrome.exe`) the old
-    /// code held a live Job Object per capped process across a game session, so
-    /// Ctrl-C'ing the service after a session closed the last handle and KILLED
-    /// the still-capped browsers. Background Processing Mode has no such
-    /// lifetime hazard. Job Object QoS may return in v2 once the service runs
-    /// as a long-lived SCM service whose lifetime is independent of the console
-    /// host — and if it does, never close the last job handle while processes
-    /// are assigned; leak instead.
+    /// Job Object QoS is deferred to v2, and NOT because closing the last job
+    /// handle kills processes — a job only terminates its assigned processes on
+    /// handle close when `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set, which was
+    /// never the case here. The real reason is that Background Processing Mode,
+    /// the v1 mechanism, is current-process-only (see the documented OS
+    /// limitation below), so `qos_cpu_quota` is a documented no-op for external
+    /// processes in v1. A real cross-process CPU cap needs Job Objects with
+    /// clear-on-stop semantics (the job and its caps are cleaned up when the
+    /// service stops), which is deferred to v2.
     ///
     /// Documented OS limitation: MSDN states `PROCESS_MODE_BACKGROUND_BEGIN` /
     /// `END` "can be specified only if hProcess is a handle to the current
@@ -200,8 +198,8 @@ impl OsBackend {
     /// fails with ERROR_INVALID_PARAMETER and the engine logs the apply as a
     /// warning (priority/affinity/suspend still apply). That is acceptable for
     /// v1: the mechanism is safe and reversible by construction, and a real
-    /// cross-process CPU cap (via `NtSetInformationProcess` or Job Objects in a
-    /// long-lived service) is future work.
+    /// cross-process CPU cap (via `NtSetInformationProcess` or Job Objects with
+    /// clear-on-stop semantics) is deferred to v2.
     fn apply_qos(&self, pid: u32, percent: u32) -> Result<(), ActionError> {
         if percent == 0 {
             // Clear: reverse Background Processing Mode only if we applied it.
@@ -239,14 +237,15 @@ impl Default for OsBackend {
 
 impl Drop for OsBackend {
     fn drop(&mut self) {
-        // Intentionally do NOT close any Job Object handle here. Closing the
-        // last handle to a job object destroys the job and TERMINATES every
-        // process still assigned to it — the exact Ctrl-C hazard Critical 2
-        // removes. v1 creates no Job Objects (QoS is Background Processing
-        // Mode, tracked in `background_mode`), so there is nothing to close;
-        // the Background Processing Mode flag is left as-is on the (about to
-        // exit) service, which is safe. If a job handle is ever reintroduced,
-        // leak it rather than close it while processes are assigned.
+        // Intentionally do NOT close any Job Object handle here. Note that
+        // closing the last job handle does NOT kill assigned processes — a job
+        // only terminates its processes when `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+        // is set (it never was). The real v1 story: QoS is Background Processing
+        // Mode, tracked in `background_mode`, which is current-process-only, so
+        // the flag on the (about to exit) service is left as-is and is safe —
+        // there are no Job Objects to clean up. When Job Object QoS lands in v2
+        // it must be cleaned up with clear-on-stop semantics, not by relying on
+        // handle-close behavior.
     }
 }
 
