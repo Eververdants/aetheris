@@ -31,7 +31,6 @@ pub struct PolicyEngine<B: ProcessBackend> {
     mode: Mode,
     boosted: HashMap<u32, ProcState>,
     game_pids: Vec<u32>,
-    foreground_pid: Option<u32>,
     // Precompiled matchers, rebuilt once at `new()` / `set_config()` instead of
     // per lookup. Pattern indices align with `cfg.background` / `cfg.rule`.
     background_matcher: PatternMatcher,
@@ -54,7 +53,6 @@ impl<B: ProcessBackend> PolicyEngine<B> {
             mode: Mode::Normal,
             boosted: HashMap::new(),
             game_pids: Vec::new(),
-            foreground_pid: None,
             background_matcher: PatternMatcher::new(Vec::new()),
             always_matcher: PatternMatcher::new(Vec::new()),
             background_names: Vec::new(),
@@ -203,11 +201,6 @@ impl<B: ProcessBackend> PolicyEngine<B> {
             }
             ProcessKind::Stop => {
                 self.table.remove(ev.pid);
-                self.foreground_pid = if self.foreground_pid == Some(ev.pid) {
-                    None
-                } else {
-                    self.foreground_pid
-                };
                 if self.game_pids.contains(&ev.pid) {
                     self.exit_game_mode();
                 } else if let Some(state) = self.boosted.remove(&ev.pid) {
@@ -218,7 +211,6 @@ impl<B: ProcessBackend> PolicyEngine<B> {
     }
 
     pub fn on_foreground(&mut self, ev: &ForegroundEvent) {
-        self.foreground_pid = Some(ev.pid);
         let name = self
             .table
             .name(ev.pid)
@@ -446,6 +438,18 @@ mod tests {
         eng.on_foreground(&ForegroundEvent { pid: 200 });
         assert_eq!(eng.mode(), Mode::GameBoost);
         assert!(eng.boosted().contains_key(&300));
+    }
+
+    #[test]
+    fn boost_on_start_false_defers_to_foreground() {
+        let mut c = cfg();
+        c.game.boost_on_start = false;
+        let backend = RecordingBackend::default();
+        let mut eng = PolicyEngine::new(c, backend.clone());
+        eng.on_process_event(&start(200, "game.exe"));
+        assert_eq!(eng.mode(), Mode::Normal, "start event must NOT enter GameBoost when boost_on_start=false");
+        eng.on_foreground(&ForegroundEvent { pid: 200 });
+        assert_eq!(eng.mode(), Mode::GameBoost, "foreground event enters GameBoost");
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::os::windows::io::FromRawHandle;
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
+    ERROR_PIPE_BUSY,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -303,35 +304,45 @@ fn write_all_handle(h: HANDLE, buf: &[u8]) -> std::io::Result<()> {
 pub fn client_call(pipe_name: &str, req: &Request) -> Result<Response, String> {
     let name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
 
-    // Wait for an available pipe instance before opening, retrying with a
-    // bounded timeout so a missing server fails fast instead of hanging.
-    let mut waited = 0;
-    loop {
-        let ok = unsafe { WaitNamedPipeW(windows::core::PCWSTR(name.as_ptr()), 2000) };
-        if ok.as_bool() {
-            break;
-        }
-        waited += 1;
-        if waited > 5 {
-            return Err(format!("WaitNamedPipeW timeout for {pipe_name}"));
-        }
-    }
-
-    // Blocking client pipe: no FILE_FLAG_OVERLAPPED.
-    let h = unsafe {
-        CreateFileW(
-            windows::core::PCWSTR(name.as_ptr()),
-            (GENERIC_READ | GENERIC_WRITE).0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES::default(),
-            None,
-        )
-    }
-    .map_err(|e| format!("CreateFileW: {e}"))?;
-
+    // Serialize before opening the pipe so a serialization error can never
+    // leak an opened handle: the early `?` below returns before `CreateFileW`.
     let req_buf = bincode::serialize(req).map_err(|e| format!("serialize: {e}"))?;
+
+    // Wait for a connectable pipe instance, then open it, retrying up to 5
+    // times. Only attempt CreateFileW once WaitNamedPipeW reports an instance
+    // is ready: attempting it during the server's close-then-recreate window
+    // races the previous CloseHandle and fails with ERROR_NO_PROCESS. A
+    // successful wait can still race another client for the last instance, so
+    // an ERROR_PIPE_BUSY CreateFileW retries too.
+    let mut h = None;
+    for _ in 0..5 {
+        let ready =
+            unsafe { WaitNamedPipeW(windows::core::PCWSTR(name.as_ptr()), 2000) }.as_bool();
+        if !ready {
+            continue;
+        }
+        // Blocking client pipe: no FILE_FLAG_OVERLAPPED.
+        match unsafe {
+            CreateFileW(
+                windows::core::PCWSTR(name.as_ptr()),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES::default(),
+                None,
+            )
+        } {
+            Ok(hh) => {
+                h = Some(hh);
+                break;
+            }
+            Err(e) if e.code() == ERROR_PIPE_BUSY.into() => continue,
+            Err(e) => return Err(format!("CreateFileW: {e}")),
+        }
+    }
+    let h = h.ok_or_else(|| "CreateFileW: pipe busy after retries".to_string())?;
+
     let mut file = unsafe { FileHandle::new(h) };
     let res = (|| -> std::io::Result<Response> {
         file.write_all(&(req_buf.len() as u32).to_le_bytes())?;
