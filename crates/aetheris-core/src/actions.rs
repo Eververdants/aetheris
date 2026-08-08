@@ -17,8 +17,9 @@ use windows::Win32::System::Threading::{
     SetPriorityClass, SetProcessAffinityMask, SetProcessWorkingSetSize, ABOVE_NORMAL_PRIORITY_CLASS,
     BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
     PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_MODE_BACKGROUND_BEGIN,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
-    PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
+    PROCESS_MODE_BACKGROUND_END, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE,
+    REALTIME_PRIORITY_CLASS,
 };
 
 use crate::config::PriorityClass;
@@ -114,13 +115,26 @@ pub(crate) fn open_process(pid: u32) -> Result<HANDLE, ActionError> {
     Ok(h)
 }
 
+/// Per-process QoS state tracked by [`OsBackend`].
+///
+/// `job` is the Job Object used for CPU rate control (QoS); it is `Some` only
+/// when the process was successfully assigned to it. When assignment failed we
+/// fall back to Background Processing Mode (`background_mode == true`, no job
+/// handle) so a later clear can reverse the mode.
+struct JobEntry {
+    job: Option<HANDLE>,
+    background_mode: bool,
+}
+
 /// Production backend backed by the Windows process APIs.
 ///
-/// Holds a per-pid map of Job Object handles used for CPU rate control (QoS).
-/// A job is created lazily on first QoS assignment and kept so the quota can
-/// be changed or cleared later without re-creating it.
+/// Holds a per-pid map of QoS state. A job object is created lazily on first
+/// QoS assignment and kept so the quota can be changed or cleared later without
+/// re-creating it. Because the map also records whether the Background
+/// Processing Mode fallback was used, a clear can reverse both paths. Job
+/// handles are closed on drop (or evicted when their entry is cleared).
 pub struct OsBackend {
-    jobs: std::sync::Mutex<std::collections::HashMap<u32, HANDLE>>,
+    jobs: std::sync::Mutex<std::collections::HashMap<u32, JobEntry>>,
 }
 
 impl OsBackend {
@@ -178,7 +192,8 @@ impl OsBackend {
 
     /// Apply a CPU rate-control quota to `pid` via a Job Object, or clear it.
     ///
-    /// `percent == 0` clears any existing rate control (unlimited CPU).
+    /// `percent == 0` clears any existing rate control (unlimited CPU) and
+    /// reverses the Background Processing Mode fallback if it was applied.
     /// A non-zero quota is enforced as a per-job hard cap in 0.01% units. If
     /// the target cannot be assigned to a new job (it already lives in another
     /// job, common for browsers), fall back to Background Processing Mode, which
@@ -187,35 +202,49 @@ impl OsBackend {
         use windows::Win32::System::JobObjects::*;
 
         if percent == 0 {
-            // Clear: disable CPU rate control on the existing job (unlimited).
-            let jobs = self.jobs.lock().unwrap();
-            if let Some(&job) = jobs.get(&pid) {
-                let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
-                    ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL(0),
-                    ..Default::default()
-                };
-                unsafe {
-                    SetInformationJobObject(
-                        job,
-                        JobObjectCpuRateControlInformation,
-                        (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
-                        std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-                    )
+            // Clear: reverse any background-mode fallback, disable CPU rate
+            // control on the existing job (unlimited), then evict the entry so
+            // Drop does not double-handle it. The job handle is intentionally
+            // not closed here: closing the last handle to a job object destroys
+            // it and terminates the assigned processes.
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some(entry) = jobs.remove(&pid) {
+                if entry.background_mode {
+                    // The process was never assigned to our job (assign failed),
+                    // so only SetPriorityClass can take it out of Background
+                    // Processing Mode.
+                    let h = open_process(pid)?;
+                    let r = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_END) };
+                    let _ = unsafe { CloseHandle(h) };
+                    r.map_err(|e| ActionError::Job(format!("clear background mode: {e}")))?;
                 }
-                .map_err(|e| ActionError::Job(format!("clear rate control: {e}")))?;
+                if let Some(job) = entry.job {
+                    let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                        ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL(0),
+                        ..Default::default()
+                    };
+                    unsafe {
+                        SetInformationJobObject(
+                            job,
+                            JobObjectCpuRateControlInformation,
+                            (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                        )
+                    }
+                    .map_err(|e| ActionError::Job(format!("clear rate control: {e}")))?;
+                }
             }
             return Ok(());
         }
 
         // Find-or-create a job for this pid.
         let mut jobs = self.jobs.lock().unwrap();
-        let job = match jobs.get(&pid) {
-            Some(&j) => j,
-            None => {
+        let (job, fresh) = match jobs.get(&pid) {
+            Some(JobEntry { job: Some(j), .. }) => (*j, false),
+            _ => {
                 let j = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
                     .map_err(|e| ActionError::Job(format!("CreateJobObjectW: {e}")))?;
-                jobs.insert(pid, j);
-                j
+                (j, true)
             }
         };
 
@@ -240,8 +269,21 @@ impl OsBackend {
         if assigned.is_err() {
             // Fallback (spec §5.4): target already in a job (common for browsers).
             // Background Processing Mode lowers the process's I/O and CPU priority.
+            // Record the mode so a later clear can reverse it; do not track a job
+            // handle since the assign failed. If we just created an (empty) job,
+            // close it rather than leak it.
             let fb = unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_BEGIN) };
             let _ = unsafe { CloseHandle(h) };
+            if fresh {
+                let _ = unsafe { CloseHandle(job) };
+            }
+            jobs.insert(
+                pid,
+                JobEntry {
+                    job: None,
+                    background_mode: true,
+                },
+            );
             return match fb {
                 Ok(()) => Ok(()),
                 Err(e) => Err(ActionError::Job(format!(
@@ -250,6 +292,14 @@ impl OsBackend {
             };
         }
         let _ = unsafe { CloseHandle(h) };
+        // Primary path: track the job so the quota can be changed or cleared later.
+        jobs.insert(
+            pid,
+            JobEntry {
+                job: Some(job),
+                background_mode: false,
+            },
+        );
         Ok(())
     }
 }
@@ -257,6 +307,23 @@ impl OsBackend {
 impl Default for OsBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for OsBackend {
+    fn drop(&mut self) {
+        // Close every job handle still tracked (entries cleared via QoS clear
+        // have already been evicted). Guard against a null HANDLE. Closing the
+        // last handle to a job object destroys it (terminating any processes
+        // still assigned to it), which is the intended teardown semantics.
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in jobs.values() {
+            if let Some(job) = entry.job {
+                if !job.0.is_null() {
+                    let _ = unsafe { CloseHandle(job) };
+                }
+            }
+        }
     }
 }
 
