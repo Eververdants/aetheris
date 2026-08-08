@@ -40,6 +40,11 @@ pub struct GameConfig {
     pub boost_on_start: bool,
     #[serde(default)]
     pub processes: Vec<String>,
+    /// Opt-in: purge the Windows standby memory list once on game-mode entry so
+    /// the game's working set can grow from free pages. Defaults to off — the
+    /// standby list is never touched unless the user asks for it.
+    #[serde(default)]
+    pub purge_standby_on_boost: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -421,6 +426,14 @@ processes = []
         assert!(cfg.network.enabled);
         assert!(cfg.network.nagle);
         assert!(cfg.network.netbios);
+    }
+
+    #[test]
+    fn game_config_defaults_purge_off() {
+        // Standby purge is opt-in: an absent flag must keep it off (never touch
+        // the system standby list unless the user asked for it).
+        let cfg = Config::from_str("[game]\nprocesses=[]\n").unwrap();
+        assert!(!cfg.game.purge_standby_on_boost);
     }
 
     #[test]

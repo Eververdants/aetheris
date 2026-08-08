@@ -268,6 +268,15 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
                 }
             }
         }
+        // Standby memory purge is opt-in (`[game] purge_standby_on_boost`) and
+        // fires once on the Normal -> GameBoost transition. Not reversible, but
+        // harmless (the OS rebuilds its standby list). Failures are logged and
+        // never fatal to the game flow.
+        if self.cfg.game.purge_standby_on_boost {
+            if let Err(e) = crate::actions::purge_standby_list() {
+                crate::log::warn(format!("standby purge failed: {e}"));
+            }
+        }
         let mut table: Vec<(u32, String)> = self
             .table
             .iter()
@@ -399,7 +408,11 @@ mod tests {
 
     fn cfg() -> Config {
         Config {
-            game: GameConfig { boost_on_start: true, processes: vec!["game.exe".into()] },
+            game: GameConfig {
+                boost_on_start: true,
+                processes: vec!["game.exe".into()],
+                purge_standby_on_boost: false,
+            },
             background: vec![BackgroundRule {
                 name: "browser.exe".into(),
                 suspend: true,

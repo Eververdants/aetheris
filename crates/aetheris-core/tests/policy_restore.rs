@@ -41,6 +41,7 @@ fn cfg() -> Config {
         game: GameConfig {
             boost_on_start: true,
             processes: vec!["game.exe".into()],
+            purge_standby_on_boost: false,
         },
         background: vec![BackgroundRule {
             name: "dummy_proc.exe".into(),

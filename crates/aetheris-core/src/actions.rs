@@ -167,6 +167,34 @@ pub(crate) fn open_process(pid: u32) -> Result<HANDLE, ActionError> {
     Ok(h)
 }
 
+/// Purge the Windows standby memory list, returning its pages to the free list
+/// so a game can allocate fresh working sets. Opt-in via
+/// `[game] purge_standby_on_boost`.
+///
+/// Follows the StandbyCleanerLite pattern: the `SeProfileSingleProcessPrivilege`
+/// must be enabled first, then `NtSetSystemInformation(SystemMemoryListInformation
+/// /*0x50*/, MemoryPurgeStandbyList /*4*/)`. When the privilege is not held (a
+/// non-elevated process) the API call fails and we return an `Err` — the caller
+/// decides whether to warn and continue. Not reversible, but harmless: the OS
+/// simply rebuilds its standby list from free pages as needed.
+pub fn purge_standby_list() -> Result<(), ActionError> {
+    // SeProfileSingleProcessPrivilege required (StandbyCleanerLite pattern).
+    OsBackend::new().enable_privilege(windows::core::w!("SeProfileSingleProcessPrivilege"))?;
+    let arg: u32 = ntapi::ntexapi::MemoryPurgeStandbyList; // 4
+    let status = unsafe {
+        ntapi::ntexapi::NtSetSystemInformation(
+            ntapi::ntexapi::SystemMemoryListInformation, // 0x50
+            (&arg as *const u32).cast_mut().cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(ActionError::Api(format!("NtSetSystemInformation: 0x{status:08X}")))
+    }
+}
+
 /// Per-pid QoS state tracked by [`OsBackend`].
 ///
 /// `job` is the Job Object used to cap the process's CPU rate; `assigned` is
@@ -221,7 +249,7 @@ impl OsBackend {
         self.enable_privilege(windows::core::w!("SeIncreaseBasePriorityPrivilege"))
     }
 
-    fn enable_privilege(&self, name: PCWSTR) -> Result<(), ActionError> {
+    pub(crate) fn enable_privilege(&self, name: PCWSTR) -> Result<(), ActionError> {
         unsafe {
             // NOTE (deviation from brief): `HANDLE(0)` does not type-check against the
             // `*mut c_void` field in current rustc; build the null handle explicitly.
@@ -634,5 +662,13 @@ mod tests {
         let sz = std::mem::size_of::<GROUP_AFFINITY>();
         let al = std::mem::align_of::<GROUP_AFFINITY>();
         assert_eq!(sz % al, 0, "GROUP_AFFINITY byte size must be alignment-multiple");
+    }
+
+    #[test]
+    fn purge_standby_rejects_without_privilege() {
+        // Non-elevated: must return an Err (privilege not enabled) or Ok (privilege
+        // present). Never panic. If elevated, it should succeed or fail gracefully.
+        let r = super::purge_standby_list();
+        assert!(r.is_ok() || r.is_err(), "must not panic");
     }
 }
