@@ -9,8 +9,8 @@ use std::fmt;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetPriorityClass, GetProcessAffinityMask, OpenProcess, OpenProcessToken,
@@ -130,26 +130,35 @@ impl OsBackend {
             // NOTE (deviation from brief): `HANDLE(0)` does not type-check against the
             // `*mut c_void` field in current rustc; build the null handle explicitly.
             let mut token: HANDLE = HANDLE(std::ptr::null_mut());
-            OpenProcessToken(
+            let open_result = OpenProcessToken(
                 GetCurrentProcess(),
                 TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
                 &mut token,
             )
-            .map_err(|e| ActionError::Api(format!("OpenProcessToken: {e}")))?;
+            .map_err(|e| ActionError::Api(format!("OpenProcessToken: {e}")));
 
-            let mut tp = TOKEN_PRIVILEGES::default();
-            let mut luid = windows::Win32::Foundation::LUID::default();
-            LookupPrivilegeValueW(None, name, &mut luid)
-                .map_err(|e| ActionError::Api(format!("LookupPrivilegeValueW: {e}")))?;
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Luid = luid;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            let lookup_result = open_result.and_then(|()| {
+                let mut luid = windows::Win32::Foundation::LUID::default();
+                LookupPrivilegeValueW(None, name, &mut luid)
+                    .map_err(|e| ActionError::Api(format!("LookupPrivilegeValueW: {e}")))
+                    .map(|()| luid)
+            });
 
-            AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)
-                .map_err(|e| ActionError::Api(format!("AdjustTokenPrivileges: {e}")))?;
+            let adjust_result = lookup_result.and_then(|luid| {
+                let tp = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES {
+                        Luid: luid,
+                        Attributes: SE_PRIVILEGE_ENABLED,
+                    }],
+                };
+                AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)
+                    .map_err(|e| ActionError::Api(format!("AdjustTokenPrivileges: {e}")))
+            });
+
             let _ = CloseHandle(token);
+            adjust_result
         }
-        Ok(())
     }
 }
 
@@ -165,9 +174,10 @@ impl ProcessBackend for OsBackend {
         let priority = unsafe { GetPriorityClass(h) };
         let mut mask: usize = 0;
         let mut sys: usize = 0;
-        unsafe { GetProcessAffinityMask(h, &mut mask, &mut sys) }
-            .map_err(|e| ActionError::Api(format!("GetProcessAffinityMask: {e}")))?;
+        let r = unsafe { GetProcessAffinityMask(h, &mut mask, &mut sys) }
+            .map_err(|e| ActionError::Api(format!("GetProcessAffinityMask: {e}")));
         let _ = unsafe { CloseHandle(h) };
+        r?;
         Ok(ProcState {
             priority,
             affinity: mask as u64,
