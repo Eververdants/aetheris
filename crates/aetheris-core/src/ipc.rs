@@ -13,7 +13,13 @@ use std::io::{Read, Write};
 use std::os::windows::io::FromRawHandle;
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -25,6 +31,17 @@ use windows::Win32::System::Pipes::{
 
 /// Default pipe used by the service.
 pub const DEFAULT_PIPE: &str = r"\\.\pipe\aetheris";
+
+/// Default DACL for the service pipe: SYSTEM full access plus Interactive Users
+/// (`IU`, S-1-5-4) full access.
+///
+/// `GA` (generic all) on a control pipe is acceptable: GetState/QueryProcess
+/// are read-only, ReloadConfig only re-reads the admin-owned config file, and
+/// SaveConfig (v2) writes the same file. Granting the interactive-user group
+/// access is the intended non-elevated-CLI support (an elevated service must be
+/// reachable from a normal `aetheris-cli`). SYSTEM retains full access, and no
+/// other SID is granted anything, so the DACL is no broader than needed.
+pub const DEFAULT_PIPE_DACL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;IU)";
 
 /// Largest message accepted in either direction.
 const MAX_MSG: usize = 1 << 20;
@@ -60,12 +77,30 @@ pub struct ProcessInfo {
 
 pub struct IpcServer {
     pipe_name: String,
+    /// Optional DACL to apply to created pipe instances, as an SDDL string
+    /// (e.g. [`DEFAULT_PIPE_DACL`]). `None` keeps the default (service/owner
+    /// only) DACL.
+    dacl_sddl: Option<String>,
 }
 
 impl IpcServer {
+    /// Create a server whose pipe instances use the default DACL (access
+    /// restricted to the service account / SYSTEM).
     pub fn new(pipe_name: &str) -> Self {
         Self {
             pipe_name: pipe_name.to_string(),
+            dacl_sddl: None,
+        }
+    }
+
+    /// Create a server whose pipe instances carry `sddl` as their security
+    /// descriptor (converted via `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+    /// in [`IpcServer::run`]). Used to grant Interactive Users access so a
+    /// non-elevated `aetheris-cli` can talk to the elevated service.
+    pub fn new_with_dacl(pipe_name: &str, sddl: &str) -> Self {
+        Self {
+            pipe_name: pipe_name.to_string(),
+            dacl_sddl: Some(sddl.to_string()),
         }
     }
 
@@ -78,9 +113,21 @@ impl IpcServer {
             .chain(std::iter::once(0))
             .collect();
 
+        // Build the SECURITY_ATTRIBUTES (if a DACL was requested) once and reuse
+        // it for every pipe instance this loop creates. The kernel copies the
+        // security descriptor into the pipe object at CreateNamedPipeW time, so a
+        // single descriptor may be shared by all instances. `_sd_guard` frees it
+        // via LocalFree when `run` returns, covering every early-exit path.
+        let dacl_attrs: Option<(SECURITY_ATTRIBUTES, SecurityDescriptorGuard)> =
+            self.build_security_attributes()?;
+
         loop {
             // CreateNamedPipeW returns a raw HANDLE (not a Result) in the
             // windows crate; a null/INVALID_HANDLE_VALUE means failure.
+            let sa_ptr = dacl_attrs
+                .as_ref()
+                .map(|(sa, _)| sa as *const SECURITY_ATTRIBUTES)
+                .unwrap_or(std::ptr::null());
             let pipe = unsafe {
                 CreateNamedPipeW(
                     windows::core::PCWSTR(name.as_ptr()),
@@ -90,7 +137,7 @@ impl IpcServer {
                     4096,
                     4096,
                     0,
-                    None,
+                    if sa_ptr.is_null() { None } else { Some(sa_ptr) },
                 )
             };
             if pipe.is_invalid() {
@@ -149,6 +196,55 @@ impl IpcServer {
             // buffered data the client has not read yet.
             let _ = unsafe { FlushFileBuffers(pipe) };
             cleanup(pipe);
+        }
+    }
+
+    /// Convert `self.dacl_sddl` (if present) into a `SECURITY_ATTRIBUTES` whose
+    /// descriptor is owned by the returned [`SecurityDescriptorGuard`].
+    ///
+    /// Fail-safe: a failed SDDL conversion returns `Err` so `run` never creates
+    /// a pipe with an unintended (empty) security descriptor.
+    fn build_security_attributes(
+        &self,
+    ) -> Result<Option<(SECURITY_ATTRIBUTES, SecurityDescriptorGuard)>, String> {
+        let Some(sddl) = &self.dacl_sddl else {
+            return Ok(None);
+        };
+        let sddl_u: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                windows::core::PCWSTR(sddl_u.as_ptr()),
+                SDDL_REVISION_1,
+                &mut psd,
+                None,
+            )
+        };
+        if let Err(e) = ok {
+            return Err(format!("ConvertStringSecurityDescriptorToSecurityDescriptorW: {e:?}"));
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: false.into(),
+        };
+        Ok(Some((sa, SecurityDescriptorGuard(psd.0))))
+    }
+}
+
+/// Owns a security descriptor allocated by
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW`, freed via `LocalFree`
+/// on drop. `run` has several early-`return Err` paths and a loop that runs
+/// forever, so an RAII guard keeps the descriptor from leaking without a
+/// central `defer`.
+struct SecurityDescriptorGuard(*mut std::ffi::c_void);
+
+impl Drop for SecurityDescriptorGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0)));
+            }
         }
     }
 }

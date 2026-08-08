@@ -5,6 +5,7 @@ use std::time::Duration;
 use aetheris_core::ipc::{client_call, IpcServer, ProcessInfo, Request, Response, StateSnapshot};
 
 const TEST_PIPE: &str = r"\\.\pipe\aetheris_test";
+const TEST_PIPE_DACL: &str = r"\\.\pipe\aetheris_test_dacl";
 
 #[test]
 fn roundtrip_get_state_and_query() {
@@ -46,6 +47,26 @@ fn roundtrip_get_state_and_query() {
 
     let reload = client_call(TEST_PIPE, &Request::ReloadConfig).expect("call");
     assert!(matches!(reload, Response::Reload(_)));
+
+    drop(t);
+}
+
+#[test]
+fn pipe_with_interactive_dacl_connectable_from_same_token() {
+    let server = IpcServer::new_with_dacl(TEST_PIPE_DACL, aetheris_core::ipc::DEFAULT_PIPE_DACL);
+    let t = thread::spawn(move || {
+        let mut h = |_req: &Request| Response::State(StateSnapshot::default());
+        let _ = server.run(&mut h);
+    });
+
+    // Wait for the server to be listening.
+    thread::sleep(Duration::from_millis(300));
+
+    // Connect as the current (likely non-elevated) token; must succeed with the
+    // IU DACL.
+    let resp = client_call(TEST_PIPE_DACL, &Request::GetState)
+        .expect("connect with interactive DACL");
+    assert!(matches!(resp, Response::State(_)));
 
     drop(t);
 }

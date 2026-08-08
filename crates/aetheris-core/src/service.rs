@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::actions::OsBackend;
 use crate::config::Config;
 use crate::events::{ForegroundEvent, ProcessEvent};
-use crate::ipc::{IpcServer, ProcessInfo, Request, Response, StateSnapshot, DEFAULT_PIPE};
+use crate::ipc::{
+    IpcServer, ProcessInfo, Request, Response, StateSnapshot, DEFAULT_PIPE, DEFAULT_PIPE_DACL,
+};
 use crate::log;
 use crate::policy::{Mode, PolicyEngine};
 
@@ -209,7 +211,9 @@ impl Service {
         // to the main loop.
         let state = self.state.clone();
         let ipc_tx = tx.clone();
-        let ipc_server = IpcServer::new(DEFAULT_PIPE);
+        // Interactive Users DACL so a non-elevated aetheris-cli can reach the
+        // elevated service; SYSTEM retains full access.
+        let ipc_server = IpcServer::new_with_dacl(DEFAULT_PIPE, DEFAULT_PIPE_DACL);
         std::thread::spawn(move || {
             let mut handle_req = |req: &Request| -> Response {
                 match req {
