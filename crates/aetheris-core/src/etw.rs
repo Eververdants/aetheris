@@ -335,8 +335,9 @@ impl EtwMonitor {
     /// provider, and spawn the `ProcessTrace` consumer thread. Any failure
     /// returns `Err(String)` (fail-safe: the service exits, never polls).
     pub fn start() -> Result<Self, String> {
-        // Bounded so a stalled consumer cannot grow memory without limit; when
-        // the buffer is full the ETW callback simply drops the next event.
+        // Bounded so a stalled consumer cannot grow memory without limit; the
+        // callback uses `try_send`, so a full buffer drops the next event
+        // instead of blocking the ETW delivery thread.
         let (tx, rx) = sync_channel::<ProcessEvent>(4096);
         let session_name = wstr(SESSION_NAME);
         let name_bytes = session_name.len() * 2;
@@ -542,7 +543,9 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     }
     let tx = &*tx_ptr;
     if let Some(ev) = decode_event(record) {
-        let _ = tx.send(ev);
+        // Non-blocking: a full or disconnected channel is ignored, so the ETW
+        // delivery thread is never stalled and the event is simply dropped.
+        let _ = tx.try_send(ev);
     }
 }
 
