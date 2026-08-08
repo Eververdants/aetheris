@@ -82,29 +82,70 @@ boosted:
 See the committed `aetheris.toml` at the repo root. Sections:
 
 - `[game]` — `boost_on_start` (activate GameBoost on process start, not just
-  foreground) and `processes` (Aho-Corasick patterns matched against image
-  names).
+  foreground), `processes` (Aho-Corasick patterns matched against image names),
+  and `purge_standby_on_boost` (opt-in standby memory purge once per game entry;
+  see v2-A engine features).
 - `[[background]]` — processes throttled while a game runs. `name` is a
   case-insensitive substring; optional `suspend`, `priority` (`idle`,
-  `below_normal`, ...), `qos_cpu_quota` (Background-Processing-Mode CPU throttle;
-  see Known v1 gaps), `trim_memory` (working-set flush). Suspend and trim are
-  explicit opt-in and default to false — they are only applied to non-critical
-  apps.
+  `below_normal`, ...), `qos_cpu_quota` (real Job Object CPU cap — a percentage
+  of total machine CPU; see v2-A engine features), `trim_memory` (working-set
+  flush). Suspend, trim, and QoS are explicit opt-in and default to false — they
+  are only applied to non-critical apps.
+- `[network]` — opt-in network QoS (see v2-A engine features): `enabled`, `nagle`
+  (disable Nagle on every active adapter), `netbios` (disable NetBIOS over
+  TCP/IP). All default to false; applied on game-mode entry and reverted on exit.
 - `[[rule]]` — always-on rules applied in any mode.
 - `protected_extra` — additional names added to the hardcoded protected list.
+
+## v2-A engine features
+
+Three engine features landed in the v2-A slice. All are **opt-in** — nothing
+changes unless the config says so:
+
+- **Job Object CPU QoS (`qos_cpu_quota`, now real).** v1's `qos_cpu_quota` was a
+  documented no-op for external processes (Background Processing Mode is
+  current-process-only). It now caps a background process's CPU with a real Job
+  Object (`JOBOBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`),
+  where `qos_cpu_quota` is a percentage of the machine's **total** CPU capacity
+  (stored internally as `CpuRate = quota * 100`, 0.01 % units). **Reversible:** the
+  cap is cleared (`ControlFlags = 0` → unlimited) and the job handle released on
+  game exit, service stop, or process exit. The job is never created with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so closing a handle never terminates the
+  process — jobs simply stop capping. **Attach limitation:** a Job Object can
+  only be assigned a process that is **not already in another job**. Processes
+  that are already job-bound (browsers, and many apps aetheris did not launch)
+  fail the attach with `ERROR_ACCESS_DENIED` and degrade to *no CPU cap* with a
+  warn — priority / affinity / suspend still apply. The cap therefore binds
+  cleanly on processes aetheris launches fresh, and not on already-job-bound
+  ones.
+- **Network QoS (`[network]`, opt-in).** On game-mode entry, disables Nagle on
+  every active adapter (`TcpAckFrequency=1` + `TCPNoDelay=1` under
+  `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces`) and
+  optionally disables NetBIOS over TCP/IP (`DisableNetbiosOverTcpip`).
+  **Reversible:** every value is backed up before it is written and written back
+  on game exit (values that did not exist are deleted). Revert logs and swallows
+  per-key failures so a registry hiccup never fails the game flow. Touches HKLM,
+  so it needs the elevated service.
+- **Standby memory purge (`[game] purge_standby_on_boost`, opt-in).** Purges the
+  Windows standby list once per game entry
+  (`NtSetSystemInformation(SystemMemoryListInformation, MemoryPurgeStandbyList)`,
+  requires `SeProfileSingleProcessPrivilege`) so the game can grow its working
+  set from free pages. **Not reversible by design** — the OS rebuilds its standby
+  list from free pages; the purge is a one-shot at game entry. Benefit is
+  debatable on modern Win11 memory management; off unless asked for.
 
 ## Known gaps
 
 Genuine remaining debt, documented so it is not mistaken for a bug:
 
-- **`qos_cpu_quota` does not throttle external processes.** Background Processing
-  Mode (`SetPriorityClass`) is documented current-process-only, so applying it to
-  another process (the only case aetheris has) fails with `ERROR_INVALID_PARAMETER`
-  and is logged as a warning; `qos_cpu_quota` is a documented no-op for external
-  processes. This is *not* because Job Object handle-close kills processes (that
-  only happens when `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set, which it never
-  was); a real cross-process CPU cap needs Job Objects with clear-on-stop
-  semantics, deferred to v2. Priority / affinity / suspend still apply.
+- **Job QoS only caps processes that are not already in a job.** A process that
+  is already job-bound (browsers, and many apps aetheris did not launch) fails
+  the Job attach with `ERROR_ACCESS_DENIED` and degrades to *no CPU cap* (with a
+  warn); priority / affinity / suspend still apply. The cap is a hard cap (no
+  bursting) expressed as a percentage of the machine's total CPU, so on a
+  many-core host a small quota is a small fraction of one core. This is the
+  *only* attach path aetheris has; it never sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
+  so no handle close can terminate a process.
 - **Config is loaded with `std::fs::read`.** `memmap2` is a listed dependency and
   the parse-from-string path is identical, so switching to mmap is a pure I/O swap
   (not yet used).
@@ -156,5 +197,6 @@ Previously documented as v1 gaps, **closed in v1.1**:
   graceful-degradation hook.
 - **v1.1 (shipped):** real system-load sampling, live IPC state (`get-state` /
   `query`), non-elevated CLI via pipe DACL, best-effort CPU-sets affinity.
-- **v2 (planned):** kernel driver (monitor-only), DXGI overlay, Win32 config
-  UI, network QoS.
+- **v2-A (engine features, shipped):** real Job Object CPU QoS (`qos_cpu_quota`),
+  opt-in reversible network QoS (Nagle / NetBIOS), opt-in standby memory purge.
+- **v2 (remaining):** kernel driver (monitor-only), DXGI overlay, Win32 config UI.

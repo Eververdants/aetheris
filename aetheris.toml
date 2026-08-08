@@ -5,12 +5,24 @@
 boost_on_start = true
 processes = ["steam_app_*.exe", "game.exe"]
 
+# Opt-in: purge the Windows standby memory list once on game-mode entry so the
+# game's working set can grow from free pages. Off by default. Not reversible,
+# but harmless (the OS rebuilds its standby list as needed).
+purge_standby_on_boost = false
+
 # Processes throttled while a game is running. Each entry is matched
 # case-insensitively as a substring against the process image name.
 [[background]]
 name = "chrome.exe"
 suspend = false
 priority = "below_normal"
+# Real cross-process CPU cap via a Job Object (hard cap). `qos_cpu_quota` is a
+# percentage of the machine's total CPU capacity (0.01% units internally,
+# CpuRate = quota * 100). Only applied to processes NOT already in a job; a
+# process that is already job-bound degrades to no-cap with a warn (priority /
+# affinity still apply). The cap clears when the game exits or the service
+# stops. Note: browsers and many apps are already in a job, so QoS often won't
+# bind on them — it works cleanly for processes aetheris launches fresh.
 qos_cpu_quota = 50
 
 [[background]]
@@ -30,3 +42,11 @@ priority = "idle"
 
 # Extra protected processes (defaults can never be removed).
 protected_extra = []
+
+# Network QoS tweaks are explicit opt-in (all flags default to false) and are
+# applied on game-mode entry, then reverted on exit. They write registry values
+# under HKLM, so the service must be elevated to use them.
+# [network]
+# enabled = true
+# nagle = true
+# netbios = false
