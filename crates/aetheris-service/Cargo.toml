@@ -8,8 +8,3 @@ license.workspace = true
 aetheris-core = { path = "../aetheris-core" }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console"] }
 ctrlc = "3"
-
-[profile.release]
-lto = "thin"
-strip = true
-panic = "abort"
