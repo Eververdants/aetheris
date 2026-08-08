@@ -278,6 +278,15 @@ impl Service {
 
 /// Previous aggregate CPU sample, used to compute the delta between two calls
 /// to [`system_load_percent`].
+///
+/// `idle` is the summed [`IdleTime`] across all processors; `total` is the
+/// summed [`KernelTime`] + [`UserTime`]. [`KernelTime`] already includes
+/// [`IdleTime`], so `total` must NOT add idle in again — the busy delta is
+/// `Δtotal − Δidle`.
+///
+/// [`IdleTime`]: ntapi::ntexapi::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION
+/// [`KernelTime`]: ntapi::ntexapi::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION
+/// [`UserTime`]: ntapi::ntexapi::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION
 #[derive(Clone, Copy)]
 struct LoadSample {
     idle: u64,
@@ -291,10 +300,11 @@ static LOAD_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
 /// `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` samples.
 ///
 /// Idle and total processor time are summed across all processors; the ratio of
-/// the per-call deltas is the busy percentage. The first call only seeds the
-/// previous sample and returns 0 (not enough data). On any query failure the
-/// call returns 0 — safe for graceful degradation, which must never
-/// self-throttle on a broken sampler — and logs a warning once.
+/// the per-call deltas (`Δtotal − Δidle`, where `total = KernelTime + UserTime`
+/// and `KernelTime` already includes `IdleTime`) is the busy percentage. The
+/// first call only seeds the previous sample and returns 0 (not enough data). On
+/// any query failure the call returns 0 — safe for graceful degradation, which
+/// must never self-throttle on a broken sampler — and logs a warning once.
 pub fn system_load_percent() -> u32 {
     let mut cur = LoadSample { idle: 0, total: 0 };
     let ok = unsafe {
@@ -312,8 +322,9 @@ pub fn system_load_percent() -> u32 {
             let mut total = 0u64;
             for p in info.iter() {
                 idle = idle.saturating_add(*p.IdleTime.QuadPart() as u64);
+                // KernelTime already INCLUDES IdleTime, so `total` must not add
+                // it again or idle systems would report ~50% busy.
                 total = total
-                    .saturating_add(*p.IdleTime.QuadPart() as u64)
                     .saturating_add(*p.KernelTime.QuadPart() as u64)
                     .saturating_add(*p.UserTime.QuadPart() as u64);
             }
