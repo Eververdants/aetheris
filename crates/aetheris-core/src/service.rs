@@ -1,1 +1,194 @@
-//! (filled in a later task)
+//! Service: channel hub, main loop, reload, and graceful degradation.
+//!
+//! Dedicated producer threads — the ETW process monitor, the foreground window
+//! watcher, and the named-pipe IPC server — each feed one shared
+//! [`std::sync::mpsc::channel`] of [`ServiceMsg`]; the single-threaded main loop
+//! `recv()`s and dispatches to the [`PolicyEngine`]. A separate stop channel lets
+//! the launcher ask the loop to exit via [`ServiceMsg::Stop`].
+//!
+//! Graceful degradation: on [`ServiceMsg::Proc`] events the engine is only
+//! consulted when `system_load_percent()` is at or below 85; above that the
+//! action is deferred with a warn (throttled to once per second). The v1 sampler
+//! stub returns 0, so the hook never self-throttles incorrectly — the real
+//! `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` sampling
+//! lands in v1.1.
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use crate::actions::OsBackend;
+use crate::config::Config;
+use crate::events::{ForegroundEvent, ProcessEvent};
+use crate::ipc::{IpcServer, ProcessInfo, Request, Response, StateSnapshot, DEFAULT_PIPE};
+use crate::log;
+use crate::policy::{Mode, PolicyEngine};
+
+/// Messages consumed by the service main loop.
+#[derive(Debug)]
+pub enum ServiceMsg {
+    Proc(ProcessEvent),
+    Foreground(ForegroundEvent),
+    Reload,
+    Stop,
+}
+
+pub struct Service {
+    cfg_path: PathBuf,
+    engine: PolicyEngine<OsBackend>,
+    stop_tx: Sender<ServiceMsg>,
+    stop_rx: Option<Receiver<ServiceMsg>>,
+}
+
+impl Service {
+    pub fn new(cfg_path: &Path, cfg: Config) -> Self {
+        let backend = OsBackend::new();
+        if let Err(e) = backend.enable_privileges() {
+            log::warn(format!("privilege bootstrap failed: {e}"));
+        }
+        let (stop_tx, stop_rx) = channel::<ServiceMsg>();
+        Self {
+            cfg_path: cfg_path.to_path_buf(),
+            engine: PolicyEngine::new(cfg, backend),
+            stop_tx,
+            stop_rx: Some(stop_rx),
+        }
+    }
+
+    pub fn cfg_path(&self) -> &Path {
+        &self.cfg_path
+    }
+
+    /// Sender used by the launcher to stop the main loop via [`ServiceMsg::Stop`].
+    pub fn stop_sender(&self) -> Sender<ServiceMsg> {
+        self.stop_tx.clone()
+    }
+
+    /// Dispatch a message to the engine. The testable core of the loop: `Reload`
+    /// re-reads the config file and swaps it in (which exits GameBoost cleanly);
+    /// `Stop` is a no-op here (the loop itself breaks on it).
+    pub fn handle_message(&mut self, msg: &ServiceMsg) -> Result<(), String> {
+        match msg {
+            ServiceMsg::Proc(ev) => {
+                self.engine.on_process_event(ev);
+                Ok(())
+            }
+            ServiceMsg::Foreground(ev) => {
+                self.engine.on_foreground(ev);
+                Ok(())
+            }
+            ServiceMsg::Reload => {
+                let cfg = Config::load(&self.cfg_path).map_err(|e| e.to_string())?;
+                // set_config exits GameBoost cleanly (restores boosted) before swapping.
+                self.engine.set_config(cfg);
+                Ok(())
+            }
+            ServiceMsg::Stop => Ok(()),
+        }
+    }
+
+    pub fn current_state(&self) -> StateSnapshot {
+        let mode = match self.engine.mode() {
+            Mode::Normal => "Normal".to_string(),
+            Mode::GameBoost => "GameBoost".to_string(),
+        };
+        let boosted = self
+            .engine
+            .boosted()
+            .iter()
+            .map(|(&pid, _)| ProcessInfo {
+                pid,
+                name: self.engine.pid_name(pid).unwrap_or_default(),
+                is_game: false,
+            })
+            .collect();
+        StateSnapshot { mode, boosted }
+    }
+
+    /// Spawn the ETW / foreground / IPC threads, each feeding the shared event
+    /// channel, and run the main loop until a [`ServiceMsg::Stop`] arrives.
+    pub fn run(mut self) -> Result<(), String> {
+        let (tx, rx): (Sender<ServiceMsg>, Receiver<ServiceMsg>) = channel();
+
+        // Relay the stop channel into the event channel.
+        if let Some(stop_rx) = self.stop_rx.take() {
+            let t = tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(m) = stop_rx.recv() {
+                    let _ = t.send(m);
+                }
+            });
+        }
+
+        // ETW process monitor (fail-safe: any setup error exits the loop).
+        let etw = crate::etw::EtwMonitor::start()?;
+        let etw_tx = tx.clone();
+        std::thread::spawn(move || {
+            while let Some(ev) = etw.recv() {
+                if etw_tx.send(ServiceMsg::Proc(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Foreground window watcher.
+        let fg = crate::foreground::ForegroundWatcher::start()?;
+        let fg_tx = tx.clone();
+        std::thread::spawn(move || {
+            while let Some(ev) = fg.recv() {
+                if fg_tx.send(ServiceMsg::Foreground(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // IPC server: serves a stub state snapshot and forwards reloads to the
+        // main loop.
+        let ipc_tx = tx.clone();
+        let ipc_server = IpcServer::new(DEFAULT_PIPE);
+        std::thread::spawn(move || {
+            let mut handle_req = |req: &Request| -> Response {
+                match req {
+                    Request::GetState => Response::State(StateSnapshot::default()),
+                    Request::ReloadConfig => {
+                        let _ = ipc_tx.send(ServiceMsg::Reload);
+                        Response::Reload("queued".into())
+                    }
+                    Request::QueryProcess(_name) => Response::Process(None),
+                }
+            };
+            let _ = ipc_server.run(&mut handle_req);
+        });
+
+        // Graceful degradation: on high system load, defer optimization actions.
+        let mut last_degrade_warn = std::time::Instant::now();
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                ServiceMsg::Stop => break,
+                ServiceMsg::Reload => {
+                    let _ = self.handle_message(&ServiceMsg::Reload);
+                }
+                ServiceMsg::Proc(ev) => {
+                    if system_load_percent() > 85 {
+                        if last_degrade_warn.elapsed() > std::time::Duration::from_secs(1) {
+                            log::warn("high system load: deferring optimization actions");
+                            last_degrade_warn = std::time::Instant::now();
+                        }
+                    } else {
+                        let _ = self.handle_message(&ServiceMsg::Proc(ev));
+                    }
+                }
+                ServiceMsg::Foreground(ev) => {
+                    let _ = self.handle_message(&ServiceMsg::Foreground(ev));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// v1 stub: returns 0 so graceful degradation never self-throttles incorrectly.
+/// Real `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`
+/// sampling lands in v1.1.
+pub fn system_load_percent() -> u32 {
+    0
+}

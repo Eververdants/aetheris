@@ -59,6 +59,12 @@ impl<B: ProcessBackend> PolicyEngine<B> {
         &self.boosted
     }
 
+    /// Process name recorded for `pid`, if known (used by
+    /// `Service::current_state` to render a state snapshot).
+    pub fn pid_name(&self, pid: u32) -> Option<String> {
+        self.table.name(pid).map(|s| s.to_string())
+    }
+
     fn is_protected(&self, name: &str) -> bool {
         self.protected.contains(&name.to_ascii_lowercase())
     }
