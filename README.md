@@ -227,6 +227,21 @@ Genuine remaining debt, documented so it is not mistaken for a bug:
 - **Snapshot refresh is throttled to 250 ms.** The integrated message path rebuilds
   the IPC snapshot at most every 250 ms (immediately on `reload` / stop), so
   `get-state` may lag live state by up to that window under event churn.
+- **Network QoS tweaks (Nagle / NetBIOS) are not reverted on abnormal service death.**
+  The registry values set on game-mode entry are only reverted by the normal
+  restore path (game exit or graceful Stop). On a crash or kill they persist until
+  manually reverted or until a future startup reconciliation lands (planned v2.1).
+  Graceful Stop reverts them correctly.
+- **`SaveConfig` is a write path any interactive user can invoke over the pipe.** The
+  config UI's Save reaches the service's validate → atomic-persist → reload path;
+  the config is re-validated before writing, but the surface is broader than
+  read-only. A DACL tightening to GRGW + privileged-save gating is planned for v2.1.
+- **Saving or reloading the config while a game is boosting exits GameBoost and does
+  not re-enter** for the still-running game — background throttling stops until the
+  game restarts.
+- **The overlay's private memory is not measured** and will exceed the v2 spec's
+  aspirational <2 MB figure. The actual guarantee holds: the overlay is
+  non-resident with zero idle cost — the process exits when the window closes.
 
 Previously documented as v1 gaps, **closed in v1.1**:
 

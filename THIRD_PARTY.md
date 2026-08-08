@@ -49,6 +49,17 @@ document (`docs/superpowers/specs/`).
 | shawl | MIT | Service lifecycle: Ctrl-C, restart policy, thin LTO + strip release profile |
 | windows-service-rs | MIT OR Apache-2.0 | Official `windows-service` examples (future v2 service wrapper) |
 
+### v2 references (v2-A engine, v2-B UI, v2-C overlay)
+
+| Project | License | How it informed aetheris |
+|---|---|---|
+| dcomp-overlay | MIT | DirectComposition click-through overlay architecture: DComp visual + D3D11 swapchain set into the DWM composition tree (v2-C overlay). Architecture only. |
+| OpenGameBoost | MIT | Network QoS mechanism: Nagle / NetBIOS registry tweaks with apply-and-revert (v2-A engine). Architecture only. |
+| StandbyCleanerLite | None (思路 only) | Standby memory purge pattern (`NtSetSystemInformation(SystemMemoryListInformation)` + `SeProfileSingleProcessPrivilege`) — 思路/concept only, no code consulted. |
+
+All v2 code (engine features, configuration UI, overlay) is **clean-room**: no
+source from any v2 reference was copied into this repository.
+
 **Compliance statement:** No GPL, LGPL, or unlicensed code was copied into
 aetheris. All GPL-3.0 projects above (vnite, Winderust, SpecialK) were used
 strictly as read-only architecture references. The implementation of every
