@@ -217,6 +217,9 @@ fn format_state(snap: &StateSnapshot, pipe: &str) -> String {
 /// pipe, or a non-`State` response — a protocol violation) renders
 /// `service unavailable` and the caller keeps polling; it never crashes.
 fn poll_telemetry(pipe: &str) -> String {
+    // Accepted edge: client_call blocks the UI thread while reading, so a
+    // wedged-but-connected service could stall the loop (one-shot
+    // respond-then-disconnect service; service-down fails fast).
     match client_call(pipe, &Request::GetState) {
         Ok(Response::State(snap)) => format_state(&snap, pipe),
         Ok(_) => format!("aetheris-overlay\npipe: {pipe}\nservice unavailable (unexpected response)"),
@@ -392,15 +395,19 @@ fn run() -> Result<()> {
 
         // First telemetry poll + render before entering the timer loop, so the
         // panel shows live state immediately (and `service unavailable` when the
-        // service is down).
-        render_telemetry(
+        // service is down). A transient first-render failure (e.g. GPU/device
+        // lost during startup) is logged, not fatal — same non-fatal handling as
+        // the loop below, so the overlay never crashes on a bad first frame.
+        if let Err(e) = render_telemetry(
             &dctx,
             &rt,
             &swapchain,
             &text_format,
             &text_brush,
             &poll_telemetry(&pipe),
-        )?;
+        ) {
+            eprintln!("aetheris-overlay: render failed: {e}");
+        }
 
         // --- Message loop with 1 Hz telemetry deadline -----------------------
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
