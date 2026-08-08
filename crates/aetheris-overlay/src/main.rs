@@ -1,9 +1,10 @@
 //! aetheris-overlay: zero-overhead DirectComposition telemetry panel.
 //!
-//! A single-threaded, no-injection overlay that will show live aetheris
-//! telemetry (Task 2). For v2-C Task 1 it initialises the full graphics
-//! pipeline and renders a placeholder telemetry line into a small top-left
-//! panel.
+//! A single-threaded, no-injection overlay that polls the aetheris service
+//! over its named pipe at ~1 Hz and renders live telemetry (mode, boosted
+//! processes, last reload result, pipe name) into a small top-left panel. If
+//! the service is unreachable it renders `service unavailable` and keeps
+//! polling — the overlay is a diagnostic surface and never crashes.
 //!
 //! Pipeline (in `run`):
 //!
@@ -16,9 +17,10 @@
 //!    pixels, so the window itself is a hidden top-most click-through popup
 //!    (`WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED`, NULL
 //!    background brush).
-//! 3. D2D + DWrite render the placeholder text into the swapchain back buffer,
-//!    then `Present`. For Task 1 we render once at startup and run a plain
-//!    `GetMessageW` loop; Task 2 re-invokes `render_telemetry` per 1 Hz update.
+//! 3. D2D + DWrite render the telemetry text into the swapchain back buffer,
+//!    then `Present`. A deadline-arithmetic message loop (`MsgWaitForMultipleObjectsEx`
+//!    with a timeout) re-polls the service and re-invokes `render_telemetry`
+//!    once per second while staying responsive to messages.
 //!
 //! Rendering path chosen for windows 0.62.2: the D2D device context attaches
 //! to the flip-model back buffer through `ID2D1DeviceContext::
@@ -65,17 +67,20 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassW, TranslateMessage, MSG, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_NCHITTEST, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MsgWaitForMultipleObjectsEx,
+    MWMO_INPUTAVAILABLE, PeekMessageW, PM_REMOVE, PostQuitMessage, QS_ALLINPUT, RegisterClassW,
+    TranslateMessage, MSG, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_NCHITTEST, WM_QUIT, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
     HTTRANSPARENT,
 };
 
-use aetheris_core::ipc::DEFAULT_PIPE;
+use aetheris_core::ipc::{client_call, DEFAULT_PIPE, ProcessInfo, Request, Response, StateSnapshot};
 
-/// Panel size in pixels, pinned to the top-left corner of the screen.
+/// Panel size in pixels, pinned to the top-left corner of the screen. The
+/// height leaves room for the mode line, a handful of boosted processes and
+/// the last-reload line at the 18 DIP telemetry font.
 const PANEL_W: u32 = 800;
-const PANEL_H: u32 = 140;
+const PANEL_H: u32 = 200;
 
 /// Window class / title shared by the overlay popup.
 const CLASS_NAME: windows::core::PCWSTR = w!("aetheris_overlay");
@@ -184,6 +189,42 @@ unsafe fn render_telemetry(
 }
 
 // ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
+
+/// Format a [`StateSnapshot`] into the telemetry lines drawn into the panel.
+fn format_state(snap: &StateSnapshot, pipe: &str) -> String {
+    let mut s = format!("aetheris-overlay\npipe: {pipe}\nmode: {}\n", snap.mode);
+    if snap.boosted.is_empty() {
+        s.push_str("boosted: none\n");
+    } else {
+        s.push_str("boosted:\n");
+        for p in &snap.boosted {
+            let ProcessInfo { pid, name, .. } = p;
+            s.push_str(&format!("  {name} (pid {pid})\n"));
+        }
+    }
+    match &snap.last_reload {
+        Some(err) => s.push_str(&format!("last reload: failed: {err}\n")),
+        None => s.push_str("last reload: ok\n"),
+    }
+    s
+}
+
+/// Poll the service for its current state and return the panel text.
+///
+/// The overlay is a diagnostic surface: any IPC failure (service down, wrong
+/// pipe, or a non-`State` response — a protocol violation) renders
+/// `service unavailable` and the caller keeps polling; it never crashes.
+fn poll_telemetry(pipe: &str) -> String {
+    match client_call(pipe, &Request::GetState) {
+        Ok(Response::State(snap)) => format_state(&snap, pipe),
+        Ok(_) => format!("aetheris-overlay\npipe: {pipe}\nservice unavailable (unexpected response)"),
+        Err(e) => format!("aetheris-overlay\npipe: {pipe}\nservice unavailable ({e})"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -209,8 +250,8 @@ fn run() -> Result<()> {
         return Err(com.into());
     }
 
-    // Parse `--pipe <name>`; default to the service's well-known pipe. Task 2
-    // uses it for `client_call`; Task 1 only displays it in the placeholder.
+    // Parse `--pipe <name>`; default to the service's well-known pipe. Used by
+    // `poll_telemetry` (via `client_call`) on every 1 Hz tick.
     let mut pipe = DEFAULT_PIPE.to_string();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -230,10 +271,6 @@ fn run() -> Result<()> {
             }
         }
     }
-
-    let placeholder = format!(
-        "aetheris-overlay\npipe: {pipe}\nplaceholder telemetry - mode: -, boosted: -"
-    );
 
     unsafe {
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
@@ -353,23 +390,58 @@ fn run() -> Result<()> {
             None,
         )?;
 
-        render_telemetry(&dctx, &rt, &swapchain, &text_format, &text_brush, &placeholder)?;
+        // First telemetry poll + render before entering the timer loop, so the
+        // panel shows live state immediately (and `service unavailable` when the
+        // service is down).
+        render_telemetry(
+            &dctx,
+            &rt,
+            &swapchain,
+            &text_format,
+            &text_brush,
+            &poll_telemetry(&pipe),
+        )?;
 
-        // --- Message loop ----------------------------------------------------
-        // Render-on-demand: Task 1 draws once at startup; the loop only pumps
-        // messages (ESC / WM_CLOSE / WM_DESTROY). Task 2 calls
-        // `render_telemetry` from a 1 Hz timer instead of a busy render loop.
-        let mut msg = MSG::default();
-        loop {
-            let r = GetMessageW(&mut msg, None, 0, 0);
-            if r.0 == 0 {
-                break; // WM_QUIT
+        // --- Message loop with 1 Hz telemetry deadline -----------------------
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        // Deadline-arithmetic telemetry loop. `MsgWaitForMultipleObjectsEx`
+        // blocks on the thread's message queue with a timeout equal to the
+        // time remaining until the next poll, so it wakes either when a real
+        // message arrives (WM_CLOSE / ESC stay responsive) or exactly at the
+        // deadline — giving a precise ~1 Hz cadence independent of system
+        // timer pacing. On each wake the pending messages are pumped, then the
+        // telemetry refresh + re-render fires once the deadline has passed.
+        let mut next_tick = std::time::Instant::now() + POLL_INTERVAL;
+        let mut quit = false;
+        while !quit {
+            let now = std::time::Instant::now();
+            let remaining = next_tick.saturating_duration_since(now);
+            let wait_ms = remaining.as_millis().min(1000) as u32;
+            _ = MsgWaitForMultipleObjectsEx(None, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+
+            // Pump every pending message (drain, so the queue empties and the
+            // next `MsgWaitForMultipleObjectsEx` blocks again on the deadline).
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    quit = true;
+                    break;
+                }
+                _ = TranslateMessage(&msg);
+                _ = DispatchMessageW(&msg);
             }
-            if r.0 == -1 {
-                return Err(windows::core::Error::from_thread());
+
+            if !quit && std::time::Instant::now() >= next_tick {
+                // Re-poll and re-render each tick. IPC and render failures are
+                // logged but never fatal: the overlay keeps polling.
+                let text = poll_telemetry(&pipe);
+                if let Err(e) =
+                    render_telemetry(&dctx, &rt, &swapchain, &text_format, &text_brush, &text)
+                {
+                    eprintln!("aetheris-overlay: render failed: {e}");
+                }
+                next_tick = std::time::Instant::now() + POLL_INTERVAL;
             }
-            _ = TranslateMessage(&msg);
-            _ = DispatchMessageW(&msg);
         }
     }
 
