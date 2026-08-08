@@ -115,6 +115,39 @@ service was unreachable at startup so the config never loaded, Save is refused
 until a successful "Reload cfg" — so an empty editor can't overwrite the real
 config on disk.)
 
+## Overlay
+
+`aetheris-overlay` is a small click-through telemetry panel pinned to the
+top-left of the screen, showing live service state over the game. It is an
+external DirectComposition window composited by DWM — **zero injection**: no DLL,
+no hook, no game-process handle — so it is safe alongside anti-cheat. It reads
+the service over the same named pipe as the CLI and never writes.
+
+```sh
+aetheris-overlay                # against the default pipe \\.\pipe\aetheris
+aetheris-overlay --pipe <NAME>  # match the service's --pipe
+```
+
+The panel shows, refreshed at ~1 Hz:
+
+- **Mode** — `Normal` / `GameBoost`.
+- **Boosted processes** — names + pids currently throttled.
+- **Last reload** — the service's most recent `reload` result.
+- **Pipe name** — for debugging against a non-default pipe.
+
+It is **non-resident**: launch it when you want to look, close it when done —
+closing the window exits the process, so there is zero idle cost. While showing
+it polls the service once per second and draws one text frame per tick
+(measured ~0.5 % of a core); if the service is unreachable it renders
+`service unavailable` and keeps retrying rather than crashing.
+
+Known edge: the telemetry read blocks while waiting for the service's reply, so
+a wedged-but-connected service could stall the panel for that read (rare — the
+service is one-shot respond-then-disconnect, and a down service fails fast).
+Activation is currently **manual** (launch `aetheris-overlay` yourself); a
+service-side hotkey that `CreateProcess`es the overlay is a planned v2.1
+follow-up (see Roadmap).
+
 ## Config reference
 
 See the committed `aetheris.toml` at the repo root. Sections:
@@ -239,4 +272,7 @@ Previously documented as v1 gaps, **closed in v1.1**:
   opt-in reversible network QoS (Nagle / NetBIOS), opt-in standby memory purge.
 - **v2-B (configuration UI, shipped):** `GetConfig` / `SaveConfig` IPC with
   validation + atomic persist, and the `aetheris-ui` config dialog.
-- **v2 (remaining):** kernel driver (monitor-only), DXGI overlay.
+- **v2-C (overlay, shipped):** `aetheris-overlay` — DirectComposition telemetry
+  panel, manual launch, zero injection (see "Overlay" above).
+- **v2.1 (remaining):** kernel driver (monitor-only), hotkey activation (a
+  service `RegisterHotKey` → `CreateProcess` path to launch the overlay).
