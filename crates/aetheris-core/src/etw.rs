@@ -1,1 +1,470 @@
-//! (filled in a later task)
+//! Realtime ETW consumer for the `Microsoft-Windows-Kernel-Process` provider.
+//!
+//! Opens a kernel realtime trace session (`AetherisTrace`), enables the
+//! kernel-process provider (Start/Stop events) and feeds decoded
+//! [`ProcessEvent`]s into a channel for the policy engine. Requires elevation;
+//! any setup failure returns `Err` so the service fails closed instead of
+//! falling back to polling.
+//!
+//! Decode strategy: event id 1 = Start, 2 = Stop; the affected pid comes from
+//! `EVENT_HEADER.ProcessId`. The image name and parent pid are decoded through
+//! TDH (`TdhGetPropertySize`/`TdhGetProperty`) keyed by property name, with a
+//! bounded fallback that parses the documented kernel-process MOF payload
+//! layout when TDH cannot resolve the schema.
+
+use std::os::raw::c_void;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::System::Diagnostics::Etw::{
+    CloseTrace, ControlTraceW, EnableTraceEx2, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_TRACE_REAL_TIME_MODE, OpenTraceW, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, PROPERTY_DATA_DESCRIPTOR, ProcessTrace, StartTraceW,
+    TdhGetProperty, TdhGetPropertySize, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
+    CONTROLTRACE_HANDLE,
+};
+
+use crate::events::{ProcessEvent, ProcessKind};
+
+/// Session name used for the realtime trace.
+const SESSION_NAME: &str = "AetherisTrace";
+/// `Microsoft-Windows-Kernel-Process` provider GUID
+/// `{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}`. `GUID::from_u128` maps the u128 in
+/// the same order as the crate's own constants (see `windows-core` `guid.rs`:
+/// data4 is `to_be_bytes`), so this matches the canonical string form.
+const KERNEL_PROCESS_PROVIDER: u128 = 0x22FB2CD6_0E7B_422B_A0C7_2FAD1FD0E716;
+/// `WINEVENT_KEYWORD_PROCESS` from `winmeta.h`. The windows crate does not ship
+/// it, so it is defined locally.
+const WINEVENT_KEYWORD_PROCESS: u64 = 0x10;
+/// `OpenTraceW` returns this on failure (the crate exposes no constant for it).
+const INVALID_PROCESSTRACE_HANDLE: PROCESSTRACE_HANDLE = PROCESSTRACE_HANDLE { Value: u64::MAX };
+
+/// Property names tried (in order) for the image name / parent pid.
+///
+/// The provider's manifest names the image-name field `ImageFileName` and the
+/// parent `ParentId`, but the brief and several consumers document them as
+/// `ProcessName` / `ParentPID`; trying both makes the decode resilient to the
+/// naming drift across Windows versions.
+const NAME_PROPERTIES: &[&str] = &["ProcessName", "ImageFileName", "UniqueProcessName"];
+const PARENT_PROPERTIES: &[&str] = &["ParentPID", "ParentId", "ParentProcessId"];
+
+/// Raw pointer wrapper that is `Send` (raw pointers are not). The pointee (the
+/// channel sender) is only dereferenced on the thread that owns it.
+struct SendPtr(*mut c_void);
+// SAFETY: the wrapped pointer is only used from the single consumer thread that
+// receives it; ownership is transferred once and never shared.
+unsafe impl Send for SendPtr {}
+
+/// Realtime kernel-process ETW monitor. Produces [`ProcessEvent`]s on its
+/// channel; `start()` fails closed (returns `Err`) if the session cannot be
+/// created, which is the intended fail-safe.
+pub struct EtwMonitor {
+    rx: Receiver<ProcessEvent>,
+    handle: Option<JoinHandle<()>>,
+    session_name: Vec<u16>,
+    reg_handle: CONTROLTRACE_HANDLE,
+    /// Owning pointer to the callback's channel sender clone; reclaimed once
+    /// the consumer thread has stopped.
+    ctx: SendPtr,
+}
+
+fn wstr(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Decode UTF-16 units (little-endian) up to the first NUL.
+fn decode_utf16_units(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
+/// TDH property value as a string, tolerating either a 4-byte little-endian
+/// length prefix (a known quirk of some UnicodeString serializations) or a
+/// plain (possibly NUL-terminated) UTF-16 payload.
+fn property_string(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.len() >= 4 {
+        let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if len > 0 && bytes.len() >= 4 + len * 2 {
+            let s = decode_utf16_units(&bytes[4..4 + len * 2]);
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    let s = decode_utf16_units(bytes);
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// File basename of a path/name string (so a full `ImageFileName` path still
+/// yields `dummy_proc.exe`).
+fn basename(path: &str) -> String {
+    path.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches('\u{0}')
+        .to_string()
+}
+
+/// Fetch one named property's raw bytes from an event record via TDH.
+fn get_property(record: *const EVENT_RECORD, name: &str) -> Option<Vec<u8>> {
+    let name_u = wstr(name);
+    let desc = PROPERTY_DATA_DESCRIPTOR {
+        PropertyName: name_u.as_ptr() as u64,
+        ArrayIndex: u32::MAX,
+        Reserved: 0,
+    };
+    let mut size = 0u32;
+    let status = unsafe { TdhGetPropertySize(record, None, std::slice::from_ref(&desc), &mut size) };
+    if status != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let status = unsafe { TdhGetProperty(record, None, std::slice::from_ref(&desc), &mut buf) };
+    if status != 0 {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Read a null-terminated UTF-16 string from raw payload bytes.
+fn read_null_terminated_utf16(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let mut units: Vec<u16> = Vec::new();
+    for c in bytes.chunks_exact(2) {
+        let u = u16::from_le_bytes([c[0], c[1]]);
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+    }
+    let s = String::from_utf16_lossy(&units);
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Last-resort image-name decode from the documented kernel-process MOF payload
+/// layout, guarded by event version. Only meaningful for Start (id 1) events.
+///
+/// Layouts (see MicrosoftDocs/win32 ETW `process-v0-typegroup1.md` and
+/// `process-typegroup1.md`):
+///   V0  (Process_V0_TypeGroup1): ProcessId u32, ParentId u32, SID, ImageFileName
+///   V2+ (Process_TypeGroup1):    UniqueProcessKey ptr, ProcessId u32, ParentId
+///        u32, SessionId u32, ExitStatus i32, DirectoryTableBase ptr, SID,
+///        ImageFileName (null-terminated UTF-16), CommandLine, ...
+fn decode_name_from_payload(record: *const EVENT_RECORD) -> Option<String> {
+    let er = unsafe { &*record };
+    if er.EventHeader.EventDescriptor.Id != 1 {
+        return None;
+    }
+    let data =
+        unsafe { std::slice::from_raw_parts(er.UserData as *const u8, er.UserDataLength as usize) };
+    let ptr = std::mem::size_of::<usize>();
+    let fixed = if er.EventHeader.EventDescriptor.Version == 0 {
+        8
+    } else {
+        2 * ptr + 16
+    };
+    if data.len() < fixed + 8 {
+        return None;
+    }
+    // Skip the variable-length SID: byte0 revision, byte1 sub-authority count,
+    // 6 authority bytes, then count * 4 bytes of sub-authorities.
+    let sid_count = data[fixed + 1] as usize;
+    let off = fixed + 8 + sid_count * 4;
+    if off >= data.len() {
+        return None;
+    }
+    let name = basename(&read_null_terminated_utf16(&data[off..])?);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Last-resort parent-pid decode from the documented payload layout.
+fn decode_parent_pid_from_payload(record: *const EVENT_RECORD) -> Option<u32> {
+    let er = unsafe { &*record };
+    if er.EventHeader.EventDescriptor.Id != 1 {
+        return None;
+    }
+    let data =
+        unsafe { std::slice::from_raw_parts(er.UserData as *const u8, er.UserDataLength as usize) };
+    let ptr = std::mem::size_of::<usize>();
+    // ParentId sits right after ProcessId: V0 at offset 4; V2+ after the
+    // pointer-sized UniqueProcessKey + 4-byte ProcessId.
+    let off = if er.EventHeader.EventDescriptor.Version == 0 {
+        4
+    } else {
+        ptr + 4
+    };
+    if data.len() >= off + 4 {
+        Some(u32::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+        ]))
+    } else {
+        None
+    }
+}
+
+fn decode_name(record: *const EVENT_RECORD) -> String {
+    for prop in NAME_PROPERTIES {
+        if let Some(bytes) = get_property(record, prop) {
+            if let Some(s) = property_string(&bytes) {
+                if !s.is_empty() {
+                    return basename(&s);
+                }
+            }
+        }
+    }
+    decode_name_from_payload(record).unwrap_or_default()
+}
+
+fn decode_parent_pid(record: *const EVENT_RECORD) -> u32 {
+    for prop in PARENT_PROPERTIES {
+        if let Some(bytes) = get_property(record, prop) {
+            if bytes.len() >= 4 {
+                return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            }
+        }
+    }
+    decode_parent_pid_from_payload(record).unwrap_or(0)
+}
+
+fn decode_event(record: *const EVENT_RECORD) -> Option<ProcessEvent> {
+    let header = unsafe { &(*record).EventHeader };
+    let id = header.EventDescriptor.Id;
+    let pid = header.ProcessId;
+    if pid == 0 {
+        return None;
+    }
+    let kind = match id {
+        1 => ProcessKind::Start,
+        2 => ProcessKind::Stop,
+        _ => return None,
+    };
+    let name = decode_name(record);
+    let parent_pid = decode_parent_pid(record);
+    Some(ProcessEvent {
+        pid,
+        name,
+        parent_pid,
+        kind,
+    })
+}
+
+impl EtwMonitor {
+    /// Create a realtime kernel trace session, enable the kernel-process
+    /// provider, and spawn the `ProcessTrace` consumer thread. Any failure
+    /// returns `Err(String)` (fail-safe: the service exits, never polls).
+    pub fn start() -> Result<Self, String> {
+        let (tx, rx) = channel::<ProcessEvent>();
+        let session_name = wstr(SESSION_NAME);
+        let name_bytes = session_name.len() * 2;
+
+        // EVENT_TRACE_PROPERTIES with the session name embedded at
+        // LoggerNameOffset. The buffer must outlive the StartTraceW call.
+        let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes + 2;
+        let mut buf = vec![0u8; props_size];
+        let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        unsafe {
+            (*props).Wnode.BufferSize = props_size as u32;
+            (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+            (*props).Wnode.ClientContext = 1; // QPC time base
+            (*props).BufferSize = 128; // 128 KB
+            (*props).MinimumBuffers = 5;
+            (*props).MaximumBuffers = 25;
+            (*props).FlushTimer = 1; // 1 s flush
+            (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+            (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+            let dst = buf
+                .as_mut_ptr()
+                .add(std::mem::size_of::<EVENT_TRACE_PROPERTIES>())
+                as *mut u16;
+            std::ptr::copy_nonoverlapping(session_name.as_ptr(), dst, session_name.len());
+        }
+
+        let mut reg_handle = CONTROLTRACE_HANDLE::default();
+        let status = unsafe { StartTraceW(&mut reg_handle, PCWSTR(session_name.as_ptr()), props) };
+        if status != ERROR_SUCCESS {
+            // A session with this name may already be running (e.g. a leftover
+            // from a previous run). Stop it and retry once.
+            let _ = unsafe {
+                ControlTraceW(
+                    CONTROLTRACE_HANDLE::default(),
+                    PCWSTR(session_name.as_ptr()),
+                    props,
+                    EVENT_TRACE_CONTROL_STOP,
+                )
+            };
+            let status2 = unsafe { StartTraceW(&mut reg_handle, PCWSTR(session_name.as_ptr()), props) };
+            if status2 != ERROR_SUCCESS {
+                return Err(format!("StartTraceW failed: status 0x{:08X}", status2.0));
+            }
+        }
+
+        let provider = GUID::from_u128(KERNEL_PROCESS_PROVIDER);
+        let enable_status = unsafe {
+            EnableTraceEx2(
+                reg_handle,
+                &provider,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                TRACE_LEVEL_INFORMATION as u8,
+                WINEVENT_KEYWORD_PROCESS,
+                0, // match-all keyword
+                0, // timeout
+                None,
+            )
+        };
+        if enable_status != ERROR_SUCCESS {
+            let _ = unsafe {
+                ControlTraceW(
+                    reg_handle,
+                    PCWSTR(std::ptr::null()),
+                    props,
+                    EVENT_TRACE_CONTROL_STOP,
+                )
+            };
+            return Err(format!(
+                "EnableTraceEx2 failed: status 0x{:08X}",
+                enable_status.0
+            ));
+        }
+
+        // Open a consumer on the same session, delivering EVENT_RECORDs. The
+        // Context pointer is surfaced to the callback as
+        // EVENT_RECORD.UserContext and carries a clone of the channel sender.
+        let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
+        logfile.LoggerName = PWSTR(session_name.as_ptr() as *mut u16);
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        let ctx = SendPtr(Box::into_raw(Box::new(tx.clone())) as *mut c_void);
+        logfile.Context = ctx.0;
+        logfile.Anonymous2.EventRecordCallback = Some(event_callback);
+
+        let trace_handle = unsafe { OpenTraceW(&mut logfile) };
+        if trace_handle == INVALID_PROCESSTRACE_HANDLE {
+            let _ = unsafe {
+                ControlTraceW(
+                    reg_handle,
+                    PCWSTR(std::ptr::null()),
+                    props,
+                    EVENT_TRACE_CONTROL_STOP,
+                )
+            };
+            unsafe { drop(Box::from_raw(ctx.0 as *mut Sender<ProcessEvent>)) };
+            return Err("OpenTraceW failed".into());
+        }
+
+        // The consumer thread only needs the (Copy) trace handle; the callback
+        // sender stays owned by this struct and is reclaimed in `shutdown()`
+        // once ProcessTrace has returned (no callbacks can fire after that).
+        let handle = thread::spawn(move || {
+            let handles = [trace_handle];
+            unsafe {
+                let _ = ProcessTrace(&handles, None, None);
+                let _ = CloseTrace(trace_handle);
+            }
+        });
+
+        Ok(Self {
+            rx,
+            handle: Some(handle),
+            session_name,
+            reg_handle,
+            ctx,
+        })
+    }
+
+    /// Blocking receive of the next process event.
+    pub fn recv(&self) -> Option<ProcessEvent> {
+        self.rx.recv().ok()
+    }
+
+    /// Receive with a timeout (useful for poll loops and the smoke test).
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<ProcessEvent> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+
+    /// Stop the trace session and join the consumer thread.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        // Stop the session, then join the ProcessTrace thread. The properties
+        // buffer must embed the session name and stay alive for the call.
+        let name_bytes = self.session_name.len() * 2;
+        let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes + 2;
+        let mut buf = vec![0u8; props_size];
+        let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        unsafe {
+            (*props).Wnode.BufferSize = props_size as u32;
+            (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+            (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+            let dst = buf
+                .as_mut_ptr()
+                .add(std::mem::size_of::<EVENT_TRACE_PROPERTIES>())
+                as *mut u16;
+            std::ptr::copy_nonoverlapping(self.session_name.as_ptr(), dst, self.session_name.len());
+            let _ = ControlTraceW(
+                self.reg_handle,
+                PCWSTR(std::ptr::null()),
+                props,
+                EVENT_TRACE_CONTROL_STOP,
+            );
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        // Reclaim the callback sender now that the trace has stopped.
+        if !self.ctx.0.is_null() {
+            unsafe { drop(Box::from_raw(self.ctx.0 as *mut Sender<ProcessEvent>)) };
+            self.ctx.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for EtwMonitor {
+    fn drop(&mut self) {
+        // Fail-safe resource cleanup if the caller forgets `stop()`.
+        self.shutdown();
+    }
+}
+
+unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
+    if record.is_null() {
+        return;
+    }
+    let tx_ptr = (*record).UserContext as *const Sender<ProcessEvent>;
+    if tx_ptr.is_null() {
+        return;
+    }
+    let tx = &*tx_ptr;
+    if let Some(ev) = decode_event(record) {
+        let _ = tx.send(ev);
+    }
+}
