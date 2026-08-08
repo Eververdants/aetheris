@@ -1,0 +1,31 @@
+[advisories]
+# cargo-deny >= 0.20: vulnerability advisories always error (no `vulnerability`
+# key), and `unmaintained`/`unsound` take scoped values ("all" = every crate).
+unmaintained = "all"
+unsound = "all"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Unlicense",
+  "BSD-3-Clause",
+  "BSD-2-Clause",
+  "ISC",
+  "Zlib",
+  # Unicode-3.0 (via unicode-ident, transitive of proc-macro2/syn) is a
+  # permissive license from the Unicode Consortium.
+  "Unicode-3.0",
+]
+# cargo-deny >= 0.20 removed `copyleft`/`default` lint keys; any license not in
+# `allow` (including copyleft) is now denied by default.
+confidence-threshold = 0.9
