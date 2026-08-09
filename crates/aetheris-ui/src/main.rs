@@ -5,7 +5,7 @@
 //!
 //! * **Status panel** (top): live mode, boosted-process count/names and the
 //!   last-reload result, re-pulled on demand by the Refresh button
-//!   (`client_call(GetState)`).
+//!   (`GetState`).
 //! * **Rule editor** (middle): three `SysListView32` lists — game processes,
 //!   `[[background]]` rules and `[[rule]]` always-rules. Selecting a background
 //!   or rule row loads its fields into the shared editor (name, priority combo,
@@ -14,10 +14,19 @@
 //!   selected row; "Reload cfg" re-fetches `GetConfig` into the editor (and
 //!   clears the startup load error once a fetch succeeds).
 //! * **Save / Reload / Exit** (bottom): Save validates the local config and
-//!   pushes it to the service via `client_call(SaveConfig(local))` — refused
-//!   while the startup `GetConfig` failed, so the empty stub config can't
-//!   overwrite the real config on disk; Reload asks the service to re-read its
-//!   config file; Exit closes the window.
+//!   pushes it to the service via `SaveConfig(local)` — refused while the
+//!   startup `GetConfig` failed, so the empty stub config can't overwrite the
+//!   real config on disk; Reload asks the service to re-read its config file;
+//!   Exit closes the window.
+//!
+//! Every pipe call (the startup `GetConfig`/`GetState`, Refresh, Save, "Reload
+//! cfg", Reload) runs on a detached worker thread: the worker calls
+//! [`client_call`] and posts the outcome back as a custom `WM_IPC_RESULT`
+//! message whose `wparam` is the call id and whose `lparam` is a
+//! `*mut Result<Response, String>` the worker allocates and the wndproc
+//! frees. The UI thread never blocks on the pipe, so with the service down the
+//! dialog still opens instantly and stays responsive (the retry budget in
+//! `client_call` is spent off the UI thread).
 //!
 //! The dialog state (pipe name, working `Config`, list↔row index maps and
 //! control handles) lives in a `UiState` box stored on the window via
@@ -31,6 +40,7 @@
 //! only (it never overwrites the editor's working copy).
 
 use std::ffi::c_void;
+use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -50,11 +60,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CB_ADDSTRING, CB_GETCURSEL,
     CB_SETCURSEL, CBS_DROPDOWNLIST, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
-    GWLP_USERDATA, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MSG, PostQuitMessage,
-    RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, SW_SHOW,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NOTIFY,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
+    GWLP_USERDATA, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    SW_SHOW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE,
+    WM_DESTROY, WM_NOTIFY, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
 };
 
 use aetheris_core::config::{AffinitySpec, AlwaysRule, BackgroundRule, Config, PriorityClass};
@@ -89,6 +99,47 @@ const IDC_BTN_SAVE: isize = 141;
 const IDC_BTN_RELOAD: isize = 142;
 const IDC_BTN_EXIT: isize = 143;
 
+/// Custom message: a worker thread posts a pipe-call outcome here. `wparam`
+/// carries the [`IpcCall`] id, `lparam` a `*mut Result<Response, String>`
+/// that the worker allocated and the wndproc takes ownership of (and frees).
+/// `WM_APP + 1` sits in the application-defined range, clear of any system
+/// message.
+const WM_IPC_RESULT: u32 = WM_APP + 1;
+
+/// Identifies which worker-thread IPC call a `WM_IPC_RESULT` message answers.
+/// The worker posts it in `wparam`; the wndproc routes on it to the matching
+/// state-update method.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IpcCall {
+    /// Startup `GetConfig` — loads the working config, clears `init_error`.
+    GetConfig,
+    /// `GetState` — startup status pull and the Refresh button.
+    GetState,
+    /// "Reload cfg" — re-fetch `GetConfig` into the editor.
+    ReloadCfg,
+    /// "Reload" — ask the service to re-read its config file.
+    Reload,
+    /// "Save" — `SaveConfig`.
+    Save,
+}
+
+impl IpcCall {
+    fn as_wparam(self) -> usize {
+        self as usize
+    }
+
+    fn from_wparam(w: usize) -> Option<IpcCall> {
+        match w {
+            0 => Some(IpcCall::GetConfig),
+            1 => Some(IpcCall::GetState),
+            2 => Some(IpcCall::ReloadCfg),
+            3 => Some(IpcCall::Reload),
+            4 => Some(IpcCall::Save),
+            _ => None,
+        }
+    }
+}
+
 /// Display order of the priority combo: index 0 is "(default)" = `None`, then
 /// the six `PriorityClass` variants in their serde snake_case spelling.
 const PRIORITIES: &[(PriorityClass, &str)] = &[
@@ -112,7 +163,16 @@ enum ListKind {
 struct UiState {
     pipe: String,
     cfg: Config,
+    /// Set when a `GetConfig`-style load fails (startup) and shown until a
+    /// fetch succeeds; while set, Save is refused so the stub config can't
+    /// overwrite the real one, and `set_result_if_loaded` keeps the error line
+    /// visible.
     init_error: Option<String>,
+    /// True once a `GetConfig` has succeeded at least once. The window opens
+    /// with a `Config::default()` stub and the real config arrives on a worker
+    /// thread, so Save is also refused until this is set (the config may not be
+    /// loaded yet even though no error has been reported).
+    config_loaded: bool,
     /// True while a list is being mutated/rebuild from code. The `WM_NOTIFY`
     /// (`LVN_ITEMCHANGED`) handler returns immediately while this is set, so a
     /// selection change triggered by `list_set_sel`/`LVM_SETITEMSTATE` cannot
@@ -172,11 +232,137 @@ impl Drop for BusyGuard {
 }
 
 /// Startup payload passed as `CreateWindowExW`'s `lpParam`; consumed by
-/// `WM_CREATE` (which runs synchronously inside the call).
+/// `WM_CREATE` (which runs synchronously inside the call). The config is no
+/// longer pre-loaded — the dialog opens immediately on a `Config::default()`
+/// stub and the real config is fetched on a worker thread (see [`WM_IPC_RESULT`]).
 struct InitData {
     pipe: String,
-    cfg: Config,
-    error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Async IPC: worker threads post results back as WM_IPC_RESULT
+// ---------------------------------------------------------------------------
+
+/// Registry of IPC result boxes (`Box<Result<Response, String>>`) that worker
+/// threads have handed to the UI thread but that have not been delivered to the
+/// wndproc yet. Pointers are stored as `usize` because raw pointers are
+/// `!Send`/`!Sync` and can't live in a `static`. [`WM_IPC_RESULT`] handling
+/// untracks and frees each one; [`ipc_teardown`] frees whatever is left when
+/// the dialog is destroyed, so closing the window with a call in flight (e.g.
+/// with the service down) never leaks a worker allocation.
+struct PendingIpc {
+    /// Set once the dialog is being torn down. Workers that observe it reclaim
+    /// their own box instead of posting to a dead window.
+    destroyed: bool,
+    boxes: Vec<usize>,
+}
+
+static PENDING_IPC: Mutex<PendingIpc> = Mutex::new(PendingIpc {
+    destroyed: false,
+    boxes: Vec::new(),
+});
+
+fn pending_lock() -> std::sync::MutexGuard<'static, PendingIpc> {
+    PENDING_IPC.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hand a worker's `client_call` outcome to the UI thread by posting
+/// `WM_IPC_RESULT`, taking ownership of a freshly boxed copy of `result`. The
+/// box is registered in [`PENDING_IPC`] *before* the post so [`ipc_teardown`]
+/// can reclaim it if the dialog is closed mid-call.
+///
+/// Returns `false` (and reclaims the box here) if the dialog is already gone,
+/// so nothing leaks.
+///
+/// # Safety
+/// `hwnd` must be the dialog's window (a stale handle makes `PostMessageW`
+/// fail, which is handled without touching the box twice).
+unsafe fn ipc_post(hwnd: HWND, call_id: usize, result: Result<Response, String>) -> bool {
+    let raw = Box::into_raw(Box::new(result)) as isize;
+    let destroyed = {
+        let mut g = pending_lock();
+        if g.destroyed {
+            true
+        } else {
+            g.boxes.push(raw as usize);
+            false
+        }
+    };
+    if destroyed {
+        // The dialog was already torn down; the message can never be
+        // dispatched, so reclaim the box here.
+        drop(Box::from_raw(raw as *mut Result<Response, String>));
+        return false;
+    }
+    if PostMessageW(Some(hwnd), WM_IPC_RESULT, WPARAM(call_id), LPARAM(raw)).is_err() {
+        // The window handle died between registration and the post. Teardown
+        // may already have freed the box — reclaim it only if it is still
+        // tracked (otherwise it was torn down and must not be touched again).
+        let still_tracked = {
+            let mut g = pending_lock();
+            let n = g.boxes.len();
+            g.boxes.retain(|&p| p != raw as usize);
+            g.boxes.len() != n
+        };
+        if still_tracked {
+            drop(Box::from_raw(raw as *mut Result<Response, String>));
+        }
+        return false;
+    }
+    true
+}
+
+/// Remove `raw` (an `lparam` from `WM_IPC_RESULT`) from [`PENDING_IPC`] and
+/// return the owned box, or `None` if it was already reclaimed by
+/// [`ipc_teardown`] — a stray queued message for a window that is going away.
+///
+/// # Safety
+/// `raw` must be an address handed to the wndproc by [`ipc_post`].
+unsafe fn ipc_reclaim(raw: isize) -> Option<Box<Result<Response, String>>> {
+    let tracked = {
+        let mut g = pending_lock();
+        let n = g.boxes.len();
+        g.boxes.retain(|&p| p != raw as usize);
+        g.boxes.len() != n
+    };
+    if !tracked {
+        return None;
+    }
+    Some(Box::from_raw(raw as *mut Result<Response, String>))
+}
+
+/// Reclaim every not-yet-delivered result box and mark the registry closed.
+/// Called from `WM_DESTROY` so closing the dialog with IPC calls in flight
+/// never leaks the workers' allocations.
+///
+/// # Safety
+/// Only call from the UI thread once the dialog is being destroyed.
+unsafe fn ipc_teardown() {
+    let mut g = pending_lock();
+    g.destroyed = true;
+    for p in g.boxes.drain(..) {
+        drop(Box::from_raw(p as *mut Result<Response, String>));
+    }
+}
+
+/// Run one pipe request on a detached worker thread and post the outcome back
+/// to the dialog as [`WM_IPC_RESULT`]. The UI thread never blocks on the pipe,
+/// so with the service down `client_call`'s retry budget is spent off-thread
+/// and the dialog stays responsive (and closable) the whole time.
+///
+/// `hwnd` is not `Send` in the pinned windows crate, so the raw handle value is
+/// handed across and the (Copy) handle is rebuilt inside the worker.
+fn spawn_worker(hwnd: HWND, call_id: usize, pipe: String, req: Request) {
+    let raw_hwnd = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        // A panic inside client_call must not silently drop the result: surface
+        // it as an error message instead (mirrors the wndproc's catch_unwind).
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client_call(&pipe, &req)))
+                .unwrap_or_else(|_| Err("internal error: IPC call panicked".to_string()));
+        let hwnd = HWND(raw_hwnd as *mut c_void);
+        let _ = unsafe { ipc_post(hwnd, call_id, result) };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -503,12 +689,22 @@ impl UiState {
         set_text(self.h_status_reload, &format!("Last reload: {rel}"));
     }
 
-    /// Re-pull `GetState` and repaint the status panel. Never touches the
+    /// Kick off an IPC call on a worker thread; the outcome is applied on the
+    /// UI thread when the posted [`WM_IPC_RESULT`] is dispatched. Never blocks.
+    fn spawn(&self, hwnd: HWND, call: IpcCall, req: Request) {
+        spawn_worker(hwnd, call.as_wparam(), self.pipe.clone(), req);
+    }
+
+    /// Start a Refresh: re-pull `GetState` on a worker thread.
+    unsafe fn start_refresh(&self, hwnd: HWND) {
+        self.spawn(hwnd, IpcCall::GetState, Request::GetState);
+    }
+
+    /// Apply a completed `GetState` to the status panel. Never touches the
     /// editor's local config copy, and while `init_error` is set it leaves the
     /// result line untouched so the "config failed to load" warning persists.
-    unsafe fn refresh_from_service(&mut self, hwnd: HWND) {
-        let pipe = self.pipe.clone();
-        match client_call(&pipe, &Request::GetState) {
+    unsafe fn on_get_state_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        match result {
             Ok(Response::State(s)) => {
                 self.mode = s.mode;
                 self.boosted = s.boosted;
@@ -757,21 +953,49 @@ impl UiState {
         self.set_result(hwnd, "Added a new row");
     }
 
-    /// Re-fetch the service's config into the editor. On success the working
-    /// copy is replaced, any startup `init_error` is cleared (re-enabling
-    /// Save), and the lists are rebuilt. Replaces the former no-op "Edit" row.
-    unsafe fn reload_config(&mut self, hwnd: HWND) {
-        let pipe = self.pipe.clone();
-        match client_call(&pipe, &Request::GetConfig) {
-            Ok(Response::Config(c)) => {
-                self.cfg = c;
-                self.init_error = None;
-                self.rebuild_all(hwnd);
-                self.set_result(hwnd, "Config reloaded from service");
-            }
+    /// Re-fetch the service's config into the editor on a worker thread
+    /// ("Reload cfg"). On success the working copy is replaced, any startup
+    /// `init_error` is cleared (re-enabling Save), and the lists are rebuilt.
+    unsafe fn start_reload_cfg(&self, hwnd: HWND) {
+        self.spawn(hwnd, IpcCall::ReloadCfg, Request::GetConfig);
+    }
+
+    unsafe fn on_reload_cfg_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        match result {
+            Ok(Response::Config(c)) => self.apply_config(hwnd, c, "Config reloaded from service"),
             Ok(_) => self.set_result(hwnd, "Reload config: unexpected response"),
             Err(e) => self.set_result(hwnd, &format!("Reload config failed: {e}")),
         }
+    }
+
+    /// Startup `GetConfig` outcome: swap in the real config, or (on failure)
+    /// arm the save-blocked guard and surface the error.
+    unsafe fn on_get_config_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        match result {
+            Ok(Response::Config(c)) => {
+                self.apply_config(hwnd, c, "Config loaded. Click Refresh for live status.");
+            }
+            Ok(_) => self.fail_init(hwnd, "GetConfig: unexpected response"),
+            Err(e) => self.fail_init(hwnd, &format!("GetConfig failed: {e}")),
+        }
+    }
+
+    /// Swap in a config fetched from the service: replace the working copy,
+    /// mark the config loaded (unblocking Save), clear any startup `init_error`
+    /// and rebuild the lists.
+    unsafe fn apply_config(&mut self, hwnd: HWND, c: Config, msg: &str) {
+        self.config_loaded = true;
+        self.cfg = c;
+        self.init_error = None;
+        self.rebuild_all(hwnd);
+        self.set_result(hwnd, msg);
+    }
+
+    /// Record a failed config load: arm the save-blocked guard and show the
+    /// error (kept visible until a `GetConfig` succeeds).
+    unsafe fn fail_init(&mut self, hwnd: HWND, msg: &str) {
+        self.init_error = Some(msg.to_string());
+        self.set_result(hwnd, msg);
     }
 
     /// Remove the selected row from the local config.
@@ -818,15 +1042,17 @@ impl UiState {
     }
 
     /// Save: commit the editor fields to the selected row, validate the whole
-    /// local config, then push it to the service. Invalid configs are rejected
-    /// locally *before* any round-trip (the service validates again on its side,
-    /// so an invalid config can never reach the file).
+    /// local config, then push it to the service on a worker thread. Invalid
+    /// configs are rejected locally *before* any round-trip (the service
+    /// validates again on its side, so an invalid config can never reach the
+    /// file).
     ///
-    /// If the startup `GetConfig` failed, the local config is a `Config::default()`
-    /// stub and `init_error` is set; saving that stub would overwrite the real
-    /// config on disk, so Save is refused until a successful `reload_config`.
+    /// If no `GetConfig` has succeeded yet, the local config is a
+    /// `Config::default()` stub; saving that stub would overwrite the real
+    /// config on disk, so Save is refused until a successful load (startup or
+    /// "Reload cfg") — tracked by `init_error`/`config_loaded`.
     unsafe fn do_save(&mut self, hwnd: HWND) {
-        if self.init_error.is_some() {
+        if self.init_error.is_some() || !self.config_loaded {
             self.set_result(
                 hwnd,
                 "Save blocked: config not loaded from service — click 'Reload cfg' first",
@@ -839,30 +1065,32 @@ impl UiState {
         match self.cfg.validate() {
             Err(e) => self.set_result(hwnd, &format!("Config invalid: {e}")),
             Ok(_) => {
-                let pipe = self.pipe.clone();
                 let cfg = self.cfg.clone();
-                match client_call(&pipe, &Request::SaveConfig(cfg)) {
-                    Ok(Response::SaveConfig(Ok(m))) => {
-                        self.set_result(hwnd, &format!("Saved: {m}"));
-                    }
-                    Ok(Response::SaveConfig(Err(e))) => {
-                        self.set_result(hwnd, &format!("Save failed: {e}"));
-                    }
-                    Ok(_) => self.set_result(hwnd, "Save: unexpected response"),
-                    Err(e) => self.set_result(hwnd, &format!("Save failed: {e}")),
-                }
+                self.spawn(hwnd, IpcCall::Save, Request::SaveConfig(cfg));
             }
         }
     }
 
-    /// Ask the service to re-read its config file from disk.
-    unsafe fn do_reload(&mut self, hwnd: HWND) {
-        let pipe = self.pipe.clone();
-        match client_call(&pipe, &Request::ReloadConfig) {
+    unsafe fn on_save_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        match result {
+            Ok(Response::SaveConfig(Ok(m))) => self.set_result(hwnd, &format!("Saved: {m}")),
+            Ok(Response::SaveConfig(Err(e))) => self.set_result(hwnd, &format!("Save failed: {e}")),
+            Ok(_) => self.set_result(hwnd, "Save: unexpected response"),
+            Err(e) => self.set_result(hwnd, &format!("Save failed: {e}")),
+        }
+    }
+
+    /// Ask the service to re-read its config file from disk (worker thread).
+    unsafe fn do_reload(&self, hwnd: HWND) {
+        self.spawn(hwnd, IpcCall::Reload, Request::ReloadConfig);
+    }
+
+    unsafe fn on_reload_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        match result {
             Ok(Response::Reload(m)) => {
                 self.set_result(hwnd, &format!("Reload queued: {m}"));
                 // Pull the fresh snapshot so last_reload reflects the outcome.
-                self.refresh_from_service(hwnd);
+                self.start_refresh(hwnd);
             }
             Ok(_) => self.set_result(hwnd, "Reload: unexpected response"),
             Err(e) => self.set_result(hwnd, &format!("Reload failed: {e}")),
@@ -886,15 +1114,13 @@ impl UiState {
         }
     }
 
-    /// First paint: rebuild the lists, show startup status, surface any
-    /// startup load error.
+    /// First paint: rebuild the lists and show a loading placeholder. The
+    /// startup `GetConfig`/`GetState` are in flight on worker threads and
+    /// replace it (with the real config, or the load error) when they land.
     unsafe fn init_widgets(&mut self, hwnd: HWND) {
         self.rebuild_all(hwnd);
         self.update_status(hwnd);
-        match self.init_error.clone() {
-            Some(e) => self.set_result(hwnd, &e),
-            None => self.set_result(hwnd, "Ready. Click Refresh for live status."),
-        }
+        self.set_result(hwnd, "Loading config from service...");
     }
 }
 
@@ -916,7 +1142,7 @@ unsafe extern "system" fn wndproc(
             // Consume the startup payload handed in via lpParam.
             let cs = &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW);
             let init = Box::from_raw(cs.lpCreateParams as *mut InitData);
-            let st = create_state(hwnd, *init);
+            let st = create_state(hwnd, init.pipe);
             SetWindowLongPtrW(
                 hwnd,
                 GWLP_USERDATA,
@@ -933,14 +1159,18 @@ unsafe extern "system" fn wndproc(
             let code = ((wparam.0 >> 16) & 0xffff) as u32;
             let s = state_mut(hwnd);
             match id {
-                IDC_BTN_REFRESH if code == 0 => s.refresh_from_service(hwnd),
+                // The pipe-touching buttons just hand the request to a worker
+                // thread and return; the result is applied when the posted
+                // WM_IPC_RESULT is dispatched, so the dialog never blocks on a
+                // down service.
+                IDC_BTN_REFRESH if code == 0 => s.start_refresh(hwnd),
                 IDC_BTN_SAVE if code == 0 => s.do_save(hwnd),
                 IDC_BTN_RELOAD if code == 0 => s.do_reload(hwnd),
                 IDC_BTN_EXIT if code == 0 => {
                     let _ = DestroyWindow(hwnd);
                 }
                 IDC_BTN_ADD if code == 0 => s.add_row(hwnd),
-                IDC_BTN_RELOAD_CFG if code == 0 => s.reload_config(hwnd),
+                IDC_BTN_RELOAD_CFG if code == 0 => s.start_reload_cfg(hwnd),
                 IDC_BTN_DELETE if code == 0 => s.delete_row(hwnd),
                 IDC_BTN_APPLY if code == 0 => {
                     s.apply_fields(hwnd);
@@ -978,7 +1208,34 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
+        WM_IPC_RESULT => {
+            // Take ownership of the worker's result box (the worker registered
+            // the pointer in PENDING_IPC before posting; we untrack and free
+            // it). If it is no longer tracked, WM_DESTROY's teardown already
+            // freed it because the dialog was closed mid-call — drop the stray
+            // message without touching the (now-freed) pointer.
+            let Some(boxed) = ipc_reclaim(lparam.0) else {
+                return LRESULT(0);
+            };
+            let result = *boxed;
+            let s = state_mut(hwnd);
+            match IpcCall::from_wparam(wparam.0) {
+                Some(IpcCall::GetConfig) => s.on_get_config_result(hwnd, result),
+                Some(IpcCall::GetState) => s.on_get_state_result(hwnd, result),
+                Some(IpcCall::ReloadCfg) => s.on_reload_cfg_result(hwnd, result),
+                Some(IpcCall::Reload) => s.on_reload_result(hwnd, result),
+                Some(IpcCall::Save) => s.on_save_result(hwnd, result),
+                // Unknown call id: the box was freed above; nothing to apply.
+                None => {}
+            }
+            LRESULT(0)
+        }
+
         WM_DESTROY => {
+            // Free any in-flight worker results before the window state, so
+            // closing the dialog (e.g. with the service down and calls still
+            // retrying) leaks nothing.
+            ipc_teardown();
             let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if p != 0 {
                 drop(Box::from_raw(p as *mut UiState));
@@ -1004,8 +1261,11 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-/// Create every child control and assemble the initial `UiState`.
-unsafe fn create_state(hwnd: HWND, init: InitData) -> UiState {
+/// Create every child control and assemble the initial `UiState`. The config
+/// starts as a `Config::default()` stub with `config_loaded` unset: the real
+/// config arrives from the startup `GetConfig` worker, which also arms (or
+/// clears) the Save guard.
+unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
     let hinst: HINSTANCE = GetModuleHandleW(None)
         .expect("module handle")
         .into();
@@ -1327,9 +1587,10 @@ unsafe fn create_state(hwnd: HWND, init: InitData) -> UiState {
     );
 
     UiState {
-        pipe: init.pipe,
-        cfg: init.cfg,
-        init_error: init.error,
+        pipe,
+        cfg: Config::default(),
+        init_error: None,
+        config_loaded: false,
         busy: false,
         mode: String::new(),
         boosted: Vec::new(),
@@ -1423,15 +1684,11 @@ fn run() -> windows::core::Result<()> {
         let _ = InitCommonControlsEx(&icce);
     }
 
-    // Load the current config once. If the service is not reachable we still
-    // open the editor with an empty config and surface the error in the result
-    // line (bounded by client_call's pipe-retry timeout).
-    let (mut cfg, mut init_error) = (Config::default(), None);
-    match client_call(&pipe, &Request::GetConfig) {
-        Ok(Response::Config(c)) => cfg = c,
-        Ok(_) => init_error = Some("GetConfig: unexpected response".to_string()),
-        Err(e) => init_error = Some(format!("GetConfig failed: {e}")),
-    }
+    // The dialog opens immediately on a default config; the real config is
+    // fetched on a worker thread (spawned below) and applied when the posted
+    // WM_IPC_RESULT is dispatched. With the service down the dialog is still
+    // responsive — client_call's retry budget is spent off the UI thread, and
+    // the load error (if any) surfaces in the result line when it lands.
 
     let hwnd: HWND;
     unsafe {
@@ -1470,12 +1727,8 @@ fn run() -> windows::core::Result<()> {
         let win_w = rc.right - rc.left;
         let win_h = rc.bottom - rc.top;
 
-        // Hand the pipe + config to the dialog via lpParam (consumed in WM_CREATE).
-        let init = Box::into_raw(Box::new(InitData {
-            pipe,
-            cfg,
-            error: init_error,
-        }));
+        // Hand the pipe to the dialog via lpParam (consumed in WM_CREATE).
+        let init = Box::into_raw(Box::new(InitData { pipe }));
 
         hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -1495,10 +1748,13 @@ fn run() -> windows::core::Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
 
-    // Pull live status once after the window is up (Refresh re-pulls later).
+    // Kick off the startup config load and status pull on worker threads; the
+    // outcomes are applied on the UI thread when the posted WM_IPC_RESULT
+    // messages arrive (the Refresh button re-pulls later).
     unsafe {
-        let s = state_mut(hwnd); // hwnd moved? No — `hwnd` is a Copy handle.
-        s.refresh_from_service(hwnd);
+        let s = state_mut(hwnd);
+        s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
+        s.spawn(hwnd, IpcCall::GetState, Request::GetState);
     }
 
     // Standard message loop; returns when WM_QUIT arrives (window closed).
