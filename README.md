@@ -104,6 +104,8 @@ The dialog is three parts:
 - **Save / Reload / Exit** (bottom): **Save** commits the editor and pushes the
   config to the service; **Reload** asks the service to re-read its config file
   from disk; **Exit** closes the window, which quits the process.
+  **Save requires an elevated `aetheris-ui`** (the service only accepts config
+  writes from an elevated client) — run the dialog as administrator to save.
 
 Save runs the same validate-then-persist path the service uses internally: the
 UI validates its working copy before anything leaves the process, then

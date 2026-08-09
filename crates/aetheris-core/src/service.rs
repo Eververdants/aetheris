@@ -397,7 +397,9 @@ impl Service {
                         // the elevation check counts as not elevated, and the
                         // file is never touched in that case.
                         if !crate::ipc::is_client_elevated(pipe).unwrap_or(false) {
-                            return Response::SaveConfig(Err("requires elevation".into()));
+                            return Response::SaveConfig(Err(
+                                "SaveConfig requires an elevated client — run aetheris-ui as administrator".into(),
+                            ));
                         }
                         let (tx, rx) = channel();
                         let _ = ipc_tx.send(ServiceMsg::SaveConfig {
