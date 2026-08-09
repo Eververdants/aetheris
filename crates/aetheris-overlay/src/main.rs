@@ -65,13 +65,16 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MsgWaitForMultipleObjectsEx,
     MWMO_INPUTAVAILABLE, PeekMessageW, PM_REMOVE, PostQuitMessage, QS_ALLINPUT, RegisterClassW,
-    TranslateMessage, MSG, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_NCHITTEST, WM_QUIT, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
-    HTTRANSPARENT,
+    TranslateMessage, MSG, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_NCHITTEST, WM_QUIT, WM_RBUTTONUP,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_VISIBLE, HTTRANSPARENT,
 };
 
 use aetheris_core::ipc::{client_call, DEFAULT_PIPE, ProcessInfo, Request, Response, StateSnapshot};
@@ -106,6 +109,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+        }
+
+        // Right-click closes the overlay — the manual close affordance
+        // alongside WM_CLOSE/taskbar-close. Right-click works without
+        // activating a WS_EX_NOACTIVATE window; DestroyWindow here follows the
+        // same path as WM_CLOSE (WM_DESTROY → PostQuitMessage → exit 0).
+        // Note: the panel is normally click-through (HTTRANSPARENT +
+        // WS_EX_TRANSPARENT), so this arm fires for right-clicks that reach
+        // the window rather than every click on the desktop.
+        WM_RBUTTONUP => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
         }
 
         WM_CLOSE => {
@@ -239,6 +254,18 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Declare per-monitor DPI awareness (V2) before any window is created so
+    // the 800x140 panel is sized and positioned in physical pixels on scaled
+    // (high-DPI) displays rather than being DPI-scaled to a blurry mismatch.
+    // Failure is non-fatal: if the context is already set (e.g. by a manifest)
+    // or the OS predates Windows 10 1703 the overlay still runs, just with
+    // system-DPI scaling.
+    if let Err(e) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        eprintln!("aetheris-overlay: SetProcessDpiAwarenessContext failed: {e}");
+    }
+
     // COM must be initialized before creating a shared DWrite factory
     // (DWRITE_FACTORY_TYPE_SHARED), D2D or DComp — all assume COM and would
     // fail with CO_E_NOTINITIALIZED otherwise. This is a single-threaded UI
