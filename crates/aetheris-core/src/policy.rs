@@ -12,6 +12,7 @@
 //! - Protected processes are never acted on.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::actions::{ProcessBackend, ProcState, QosLifecycle, TargetAction};
 use crate::config::{AffinitySpec, Config};
@@ -44,6 +45,11 @@ pub struct PolicyEngine<B: ProcessBackend + QosLifecycle> {
     // Backup of network QoS registry tweaks applied on GameBoost entry, reverted
     // on exit. `Some` only while `Mode::GameBoost` and `cfg.network.enabled`.
     network_backup: Option<Vec<crate::network::BackupEntry>>,
+    // Crash-reconciliation marker path: `Service::new` reconciles stale tweaks
+    // from a service death mid-boost here at startup; `enter_game_mode` writes
+    // it and `exit_game_mode` clears it. Set from a service-provided path
+    // (default: PROGRAMDATA, see `network::default_marker_path`).
+    network_marker: PathBuf,
 }
 
 impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
@@ -65,6 +71,7 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
             always_names: Vec::new(),
             protected_hashes: HashSet::new(),
             network_backup: None,
+            network_marker: crate::network::default_marker_path(),
         };
         engine.rebuild_matchers();
         engine
@@ -78,6 +85,13 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
     /// can clone it into the shared IPC snapshot for `GetConfig`.
     pub fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Override the crash-reconciliation marker path. The service calls this
+    /// with the same path it reconciled at startup, so `enter_game_mode` writes
+    /// and `exit_game_mode` clears the marker that the next startup consumes.
+    pub fn set_network_marker(&mut self, path: PathBuf) {
+        self.network_marker = path;
     }
 
     /// Read access to the backend, used by tests to inspect OS-level QoS state
@@ -270,7 +284,22 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         // to the game flow. Stored so `exit_game_mode` can revert them.
         if self.cfg.network.enabled {
             match crate::network::apply(self.cfg.network.nagle, self.cfg.network.netbios) {
-                Ok(backup) => self.network_backup = Some(backup),
+                Ok(backup) => {
+                    // Persist the backup as a crash marker so a service death
+                    // mid-GameBoost can be reconciled (reverted) on the next
+                    // startup. Guard: never write an empty marker — an apply
+                    // that modified nothing has nothing to reconcile. A
+                    // marker-write failure is logged, never fatal to the game
+                    // flow (a missing marker just means no auto-revert).
+                    if !backup.is_empty() {
+                        if let Err(e) =
+                            crate::network::write_marker(&backup, &self.network_marker)
+                        {
+                            crate::log::warn(format!("network marker write failed: {e}"));
+                        }
+                    }
+                    self.network_backup = Some(backup);
+                }
                 Err(e) => {
                     crate::log::warn(format!("network QoS apply failed: {e}"));
                     self.network_backup = None;
@@ -312,6 +341,11 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         // logs and swallows per-entry failures — never fail the game flow.
         if let Some(backup) = self.network_backup.take() {
             crate::network::revert(&backup);
+            // The tweaks are reverted, so the crash marker is stale — clear it
+            // so the next startup does not re-revert. (A per-entry revert
+            // failure is logged inside `revert`; the marker is still removed so
+            // a later reconcile cannot double-apply a partially-reverted state.)
+            crate::network::remove_marker(&self.network_marker);
         }
         for (pid, state) in std::mem::take(&mut self.boosted) {
             let _ = self.backend.restore(pid, &state);

@@ -79,6 +79,14 @@ impl Service {
     /// the `Arc` to whichever thread must answer live-state queries (in v1 the
     /// IPC thread spawned by [`Service::run`]).
     pub fn new(cfg_path: &Path, cfg: Config) -> (Self, Arc<RwLock<StateSnapshot>>) {
+        // Reconcile stale network-QoS tweaks left by a service that died
+        // mid-GameBoost: if the crash marker exists, revert exactly what it
+        // lists and remove it — BEFORE the engine starts, so a previous crash
+        // never leaves applied tweaks with no revert path. Safe: only reverts
+        // what the marker says the service set, and only when the marker exists.
+        let network_marker = crate::network::default_marker_path();
+        crate::network::reconcile(&network_marker);
+
         let backend = OsBackend::new();
         if let Err(e) = backend.enable_privileges() {
             log::warn(format!("privilege bootstrap failed: {e}"));
@@ -90,10 +98,14 @@ impl Service {
         // before any event would read `Config::default()` from GetConfig (and
         // an unedited save would clobber the real config).
         state.write().unwrap().config = cfg.clone();
+        let mut engine = PolicyEngine::new(cfg, backend);
+        // The engine writes/clears this same marker on GameBoost entry/exit, so
+        // the next startup reconciles precisely what this run applied.
+        engine.set_network_marker(network_marker);
         (
             Self {
                 cfg_path: cfg_path.to_path_buf(),
-                engine: PolicyEngine::new(cfg, backend),
+                engine,
                 stop_tx,
                 stop_rx: Some(stop_rx),
                 state: state.clone(),

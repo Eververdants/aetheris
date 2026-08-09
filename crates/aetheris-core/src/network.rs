@@ -18,6 +18,8 @@
 //! backup/apply/revert mechanics against a scoped test key under `HKCU` without
 //! ever touching real network settings.
 
+use std::path::{Path, PathBuf};
+
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE,
@@ -36,7 +38,7 @@ const NETBT_PARAMETERS_KEY: &str = "SYSTEM\\CurrentControlSet\\Services\\NetBT\\
 /// reversed on game exit. `path` is the full registry path (relative to the
 /// hive root), `value_name` is the value, and `old` is the prior DWORD (`None`
 /// means the value did not exist before the tweak).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackupEntry {
     pub path: String,
     pub value_name: String,
@@ -258,6 +260,60 @@ pub fn revert(entries: &[BackupEntry]) {
     }
 }
 
+/// Default crash-reconciliation marker path: `%PROGRAMDATA%\aetheris\network-tweaks.marker`
+/// (falling back to `C:\ProgramData` when the env var is unset). Living under
+/// PROGRAMDATA — not the config dir — lets the marker survive a config move.
+pub fn default_marker_path() -> PathBuf {
+    let base = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("aetheris").join("network-tweaks.marker")
+}
+
+/// Persist `entries` as the crash marker at `path`. The marker is bincode-encoded
+/// so [`reconcile`] can read the exact backup back on the next startup and revert
+/// only what `apply` actually modified. Creates the parent directory.
+///
+/// Guard: a marker is only meaningful when it lists at least one applied value,
+/// so an empty backup is rejected (the policy engine also guards before calling).
+pub fn write_marker(entries: &[BackupEntry], path: &Path) -> Result<(), String> {
+    if entries.is_empty() {
+        return Err("write_marker: refusing to persist an empty backup".into());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create marker dir {}: {e}", parent.display()))?;
+    }
+    let bytes = bincode::serialize(entries).map_err(|e| format!("serialize marker: {e}"))?;
+    std::fs::write(path, bytes).map_err(|e| format!("write marker {}: {e}", path.display()))
+}
+
+/// Read the crash marker back as the persisted backup. `None` when no marker
+/// exists — or when it cannot be read/decoded, so a corrupt marker never blocks
+/// startup (it is simply treated as absent and left for cleanup).
+pub fn read_marker(path: &Path) -> Option<Vec<BackupEntry>> {
+    let bytes = std::fs::read(path).ok()?;
+    bincode::deserialize(&bytes).ok()
+}
+
+/// Delete the crash marker. Missing file is a no-op.
+pub fn remove_marker(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// Reconcile stale network-QoS tweaks after a service death mid-GameBoost: if
+/// the crash marker exists, revert every entry it lists, then remove the marker.
+///
+/// Safe by construction: it never guesses what was applied — it reverts only the
+/// entries the marker says the service set, and only when the marker exists.
+pub fn reconcile(path: &Path) {
+    let Some(entries) = read_marker(path) else {
+        return;
+    };
+    revert(&entries);
+    remove_marker(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +450,64 @@ mod tests {
     fn apply_noop_when_flags_off() {
         let backup = apply(false, false).expect("no-op apply");
         assert!(backup.is_empty(), "nothing applied when all flags off");
+    }
+
+    /// Marker persistence + crash reconciliation against a temp path:
+    ///
+    /// - `write_marker`/`read_marker` roundtrip the backup byte-for-byte, so a
+    ///   startup `reconcile` reverts exactly the values `apply` actually
+    ///   modified (and nothing else).
+    /// - `remove_marker` (normal game exit) clears it, so the next startup
+    ///   reconciles nothing.
+    /// - `reconcile` consumes the marker: it reads back the listed entries,
+    ///   reverts them (`revert` — covered end-to-end at the registry level by
+    ///   `apply_continues_past_per_adapter_failure_and_reverts_what_applied`),
+    ///   and removes the marker, so a second reconcile is a no-op. It only ever
+    ///   acts on the entries the marker lists — never reverts on a guess.
+    /// - The empty guard: a marker is only meaningful when it lists ≥1 entry,
+    ///   so `write_marker` refuses an empty backup (the policy wires the same
+    ///   guard before calling it).
+    #[test]
+    fn marker_roundtrip_and_reconcile() {
+        let dir = std::env::temp_dir().join(format!("aetheris_net_{}", std::process::id()));
+        let path = dir.join("marker.bin");
+        let entries = vec![
+            BackupEntry {
+                path: "Software\\AetherisTests\\MarkerA".into(),
+                value_name: "V1".into(),
+                old: Some(5),
+            },
+            BackupEntry {
+                path: "Software\\AetherisTests\\MarkerB".into(),
+                value_name: "V2".into(),
+                old: None,
+            },
+        ];
+
+        // Roundtrip: the marker stores exactly what was written.
+        write_marker(&entries, &path).expect("write marker");
+        assert_eq!(read_marker(&path).expect("read marker"), entries);
+
+        // Normal exit removes the marker: the next startup reconciles nothing.
+        remove_marker(&path);
+        assert!(read_marker(&path).is_none(), "removed marker must not be read");
+
+        // A leftover crash marker is reconciled away: entries reverted and the
+        // marker removed. A second reconcile sees no marker and is a no-op
+        // (never reverts unless the marker exists).
+        write_marker(&entries, &path).expect("write marker again");
+        reconcile(&path);
+        assert!(
+            read_marker(&path).is_none(),
+            "reconcile must remove the marker it consumed"
+        );
+        reconcile(&path); // no marker -> nothing to revert, no panic
+
+        // Empty guard: never persist a marker that lists nothing to revert.
+        let err = write_marker(&[], &path);
+        assert!(err.is_err(), "write_marker must reject an empty backup");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A mid-enumeration failure must not strand earlier entries: `apply` logs
