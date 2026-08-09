@@ -338,14 +338,18 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         self.mode = Mode::Normal;
         self.game_pids.clear();
         // Revert any network QoS registry tweaks applied on entry. `revert`
-        // logs and swallows per-entry failures — never fail the game flow.
+        // logs and swallows per-entry failures — never fail the game flow —
+        // and returns how many entries were actually reverted.
         if let Some(backup) = self.network_backup.take() {
-            crate::network::revert(&backup);
-            // The tweaks are reverted, so the crash marker is stale — clear it
-            // so the next startup does not re-revert. (A per-entry revert
-            // failure is logged inside `revert`; the marker is still removed so
-            // a later reconcile cannot double-apply a partially-reverted state.)
-            crate::network::remove_marker(&self.network_marker);
+            let reverted = crate::network::revert(&backup);
+            // The marker is only stale once every tweak is fully reverted. On a
+            // partial revert, leave it in place so the next startup reconcile
+            // retries the remaining values — clearing it would strand them with
+            // no reconcile path, the exact failure mode the marker exists to
+            // recover.
+            if reverted == backup.len() {
+                crate::network::remove_marker(&self.network_marker);
+            }
         }
         for (pid, state) in std::mem::take(&mut self.boosted) {
             let _ = self.backend.restore(pid, &state);

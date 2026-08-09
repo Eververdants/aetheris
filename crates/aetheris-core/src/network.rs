@@ -250,14 +250,22 @@ fn apply_at(
     Ok(backup)
 }
 
-/// Revert every entry back to its pre-boost state. Failures are logged and
-/// swallowed — a registry hiccup must never fail the game flow.
-pub fn revert(entries: &[BackupEntry]) {
+/// Revert every entry back to its pre-boost state. Returns the number of
+/// entries successfully reverted (0..=entries.len()). Failures are logged and
+/// swallowed — a registry hiccup must never fail the game flow — so callers
+/// that need to know whether the revert was complete (e.g. crash-marker
+/// cleanup) can compare the returned count against `entries.len()`.
+pub fn revert(entries: &[BackupEntry]) -> usize {
+    let mut reverted = 0;
     for e in entries {
-        if let Err(err) = revert_entry(HKEY_LOCAL_MACHINE, e) {
-            crate::log::warn(format!("network revert {}\\{}: {err}", e.path, e.value_name));
+        match revert_entry(HKEY_LOCAL_MACHINE, e) {
+            Ok(()) => reverted += 1,
+            Err(err) => {
+                crate::log::warn(format!("network revert {}\\{}: {err}", e.path, e.value_name))
+            }
         }
     }
+    reverted
 }
 
 /// Default crash-reconciliation marker path: `%PROGRAMDATA%\aetheris\network-tweaks.marker`
