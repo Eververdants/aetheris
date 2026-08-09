@@ -9,6 +9,12 @@ use windows::Win32::Foundation::HANDLE;
 const TEST_PIPE: &str = r"\\.\pipe\aetheris_test";
 const TEST_PIPE_DACL: &str = r"\\.\pipe\aetheris_test_dacl";
 
+/// `call_with_retry` deadline: how long to keep polling the pipe for a
+/// transient one-shot-server race before giving up.
+const RETRY_DEADLINE: Duration = Duration::from_secs(5);
+/// `call_with_retry` pause between polling attempts.
+const RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Unit: the DACL grants IU read+write but not WRITE_DAC/WRITE_OWNER.
 #[test]
 fn dacl_least_privilege_for_interactive_users() {
@@ -38,7 +44,7 @@ fn is_client_elevated_fails_closed_on_invalid_handle() {
 /// (slowly) after the deadline. Protocol mismatches surface as panics at the
 /// call sites' `match`, which this helper does not retry.
 fn call_with_retry(pipe: &str, req: &Request) -> Result<Response, String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + RETRY_DEADLINE;
     loop {
         match client_call(pipe, req) {
             Ok(r) => return Ok(r),
@@ -46,7 +52,7 @@ fn call_with_retry(pipe: &str, req: &Request) -> Result<Response, String> {
                 if std::time::Instant::now() >= deadline {
                     return Err(e);
                 }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(RETRY_INTERVAL);
             }
         }
     }

@@ -1,3 +1,8 @@
+// Windows GUI application: no console window alongside the dialog. With no
+// console, `eprintln!` output is invisible — startup/fatal errors are surfaced
+// via [`report_error`] (message box + `%TEMP%\aetheris-ui.log`).
+#![windows_subsystem = "windows"]
+
 //! aetheris-ui: status panel + rule editor + save flow.
 //!
 //! A programmatic Win32 dialog (no `.rc`, no GUI framework) wired to the
@@ -60,11 +65,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CB_ADDSTRING, CB_GETCURSEL,
     CB_SETCURSEL, CBS_DROPDOWNLIST, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
-    GWLP_USERDATA, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    SW_SHOW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_NOTIFY, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
+    GWLP_USERDATA, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK,
+    MESSAGEBOX_STYLE, MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, SW_SHOW, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NOTIFY, WNDCLASSW,
+    WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
 };
 
 use aetheris_core::config::{AffinitySpec, AlwaysRule, BackgroundRule, Config, PriorityClass};
@@ -382,6 +388,35 @@ fn spawn_worker(hwnd: HWND, call_id: usize, pipe: String, req: Request) {
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Append a line to `%TEMP%\aetheris-ui.log` (best-effort: a failure to open or
+/// write is ignored). This binary is `windows_subsystem = "windows"`, so there
+/// is no console for `eprintln!` to reach; the log file is the persistent
+/// record of errors that fall outside the message-box path.
+fn log_err(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("aetheris-ui.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// Surface a fatal error: append it to [`log_err`]'s log file and show it in a
+/// message box. With `windows_subsystem = "windows"` the dialog is the only
+/// visible surface, so startup/argument errors must pop a box rather than
+/// `eprintln!` to nothing.
+fn report_error(msg: &str) {
+    log_err(msg);
+    unsafe {
+        let wide = to_wide(&format!("aetheris-ui\n\n{msg}"));
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(wide.as_ptr()),
+            w!("aetheris-ui"),
+            MESSAGEBOX_STYLE(MB_OK.0 | MB_ICONERROR.0),
+        );
+    }
 }
 
 /// Get the boxed `UiState` for the window. Safe only after `WM_CREATE`.
@@ -1274,7 +1309,7 @@ unsafe extern "system" fn wndproc(
                 .map(|s| (*s).to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| format!("{payload:?}"));
-            eprintln!("aetheris-ui: panic in wndproc (msg {msg:#010x}): {text}");
+            report_error(&format!("panic in wndproc (msg {msg:#010x}): {text}"));
             LRESULT(0)
         }
     }
@@ -1668,7 +1703,7 @@ unsafe fn mk_list(parent: HWND, id: isize, x: i32, y: i32, w: i32, h: i32, hinst
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("aetheris-ui: {e}");
+        report_error(&format!("{e}"));
         std::process::exit(1);
     }
 }
@@ -1685,11 +1720,11 @@ fn run() -> windows::core::Result<()> {
                 i += 2;
             }
             "--pipe" => {
-                eprintln!("aetheris-ui: --pipe requires a value");
+                report_error("--pipe requires a value");
                 std::process::exit(2);
             }
             other => {
-                eprintln!("aetheris-ui: unknown argument: {other}");
+                report_error(&format!("unknown argument: {other}"));
                 std::process::exit(2);
             }
         }

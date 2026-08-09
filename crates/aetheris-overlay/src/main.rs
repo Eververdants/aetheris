@@ -1,3 +1,9 @@
+// Windows GUI application: no console window alongside the overlay. With no
+// console, `eprintln!` output is invisible — fatal startup errors are surfaced
+// via [`report_error`] (message box + `%TEMP%\aetheris-overlay.log`) and
+// non-fatal warnings go to the log file via [`log_err`].
+#![windows_subsystem = "windows"]
+
 //! aetheris-overlay: zero-overhead DirectComposition telemetry panel.
 //!
 //! A single-threaded, no-injection overlay that polls the aetheris service
@@ -70,11 +76,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MsgWaitForMultipleObjectsEx,
-    MWMO_INPUTAVAILABLE, PeekMessageW, PM_REMOVE, PostQuitMessage, QS_ALLINPUT, RegisterClassW,
-    TranslateMessage, MSG, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_NCHITTEST, WM_QUIT, WM_RBUTTONUP,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-    WS_VISIBLE, HTTRANSPARENT,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MB_ICONERROR, MB_OK,
+    MESSAGEBOX_STYLE, MessageBoxW, MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, PeekMessageW,
+    PM_REMOVE, PostQuitMessage, QS_ALLINPUT, RegisterClassW, TranslateMessage, MSG, WM_CLOSE,
+    WM_DESTROY, WM_KEYDOWN, WM_NCHITTEST, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE, HTTRANSPARENT,
 };
 
 use aetheris_core::ipc::{client_call, DEFAULT_PIPE, ProcessInfo, Request, Response, StateSnapshot};
@@ -87,6 +93,42 @@ const PANEL_H: u32 = 200;
 
 /// Window class / title shared by the overlay popup.
 const CLASS_NAME: windows::core::PCWSTR = w!("aetheris_overlay");
+
+// ---------------------------------------------------------------------------
+// Error reporting (no console: `windows_subsystem = "windows"`)
+// ---------------------------------------------------------------------------
+
+/// Append a line to `%TEMP%\aetheris-overlay.log` (best-effort: a failure to
+/// open or write is ignored). This binary is `windows_subsystem = "windows"`,
+/// so there is no console for `eprintln!` to reach; non-fatal warnings (DPI,
+/// COM init, per-frame render failures) go here instead.
+fn log_err(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("aetheris-overlay.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// Surface a fatal startup error: append it to [`log_err`]'s log file and show
+/// it in a message box. With `windows_subsystem = "windows"` the message box is
+/// the only visible surface, so startup/argument errors must pop a box rather
+/// than `eprintln!` to nothing.
+fn report_error(msg: &str) {
+    log_err(msg);
+    let wide: Vec<u16> = format!("aetheris-overlay\n\n{msg}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(wide.as_ptr()),
+            w!("aetheris-overlay"),
+            MESSAGEBOX_STYLE(MB_OK.0 | MB_ICONERROR.0),
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Window procedure
@@ -248,7 +290,7 @@ fn poll_telemetry(pipe: &str) -> String {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("aetheris-overlay: {e}");
+        report_error(&format!("{e}"));
         std::process::exit(1);
     }
 }
@@ -263,7 +305,7 @@ fn run() -> Result<()> {
     if let Err(e) =
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
     {
-        eprintln!("aetheris-overlay: SetProcessDpiAwarenessContext failed: {e}");
+        log_err(&format!("SetProcessDpiAwarenessContext failed: {e}"));
     }
 
     // COM must be initialized before creating a shared DWrite factory
@@ -275,7 +317,7 @@ fn run() -> Result<()> {
     // keep going; anything else that failed is fatal.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if com == S_FALSE {
-        eprintln!("aetheris-overlay: COM already initialized on this thread (S_FALSE)");
+        log_err("COM already initialized on this thread (S_FALSE)");
     } else if com.is_err() {
         return Err(com.into());
     }
@@ -292,11 +334,11 @@ fn run() -> Result<()> {
                 i += 2;
             }
             "--pipe" => {
-                eprintln!("aetheris-overlay: --pipe requires a value");
+                report_error("--pipe requires a value");
                 std::process::exit(2);
             }
             other => {
-                eprintln!("aetheris-overlay: unknown argument: {other}");
+                report_error(&format!("unknown argument: {other}"));
                 std::process::exit(2);
             }
         }
@@ -433,7 +475,7 @@ fn run() -> Result<()> {
             &text_brush,
             &poll_telemetry(&pipe),
         ) {
-            eprintln!("aetheris-overlay: render failed: {e}");
+            log_err(&format!("render failed: {e}"));
         }
 
         // --- Message loop with 1 Hz telemetry deadline -----------------------
@@ -472,7 +514,7 @@ fn run() -> Result<()> {
                 if let Err(e) =
                     render_telemetry(&dctx, &rt, &swapchain, &text_format, &text_brush, &text)
                 {
-                    eprintln!("aetheris-overlay: render failed: {e}");
+                    log_err(&format!("render failed: {e}"));
                 }
                 next_tick = std::time::Instant::now() + POLL_INTERVAL;
             }

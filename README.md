@@ -144,9 +144,10 @@ it polls the service once per second and draws one text frame per tick
 Known edge: the telemetry read blocks while waiting for the service's reply, so
 a wedged-but-connected service could stall the panel for that read (rare — the
 service is one-shot respond-then-disconnect, and a down service fails fast).
-Activation is currently **manual** (launch `aetheris-overlay` yourself); a
-service-side hotkey that `CreateProcess`es the overlay is a planned v2.1
-follow-up (see Roadmap).
+Activation is either **manual** (launch `aetheris-overlay` yourself) or via the
+service-side hotkey: with `[overlay] hotkey = "ctrl+alt+o"` in the config, the
+service launches the overlay when the hotkey is pressed. Close it with a
+right-click on the panel or the window close path.
 
 ## Config reference
 
@@ -227,18 +228,10 @@ Genuine remaining debt, documented so it is not mistaken for a bug:
 - **Snapshot refresh is throttled to 250 ms.** The integrated message path rebuilds
   the IPC snapshot at most every 250 ms (immediately on `reload` / stop), so
   `get-state` may lag live state by up to that window under event churn.
-- **Network QoS tweaks (Nagle / NetBIOS) are not reverted on abnormal service death.**
-  The registry values set on game-mode entry are only reverted by the normal
-  restore path (game exit or graceful Stop). On a crash or kill they persist until
-  manually reverted or until a future startup reconciliation lands (planned v2.1).
-  Graceful Stop reverts them correctly.
-- **`SaveConfig` is a write path any interactive user can invoke over the pipe.** The
-  config UI's Save reaches the service's validate → atomic-persist → reload path;
-  the config is re-validated before writing, but the surface is broader than
-  read-only. A DACL tightening to GRGW + privileged-save gating is planned for v2.1.
-- **Saving or reloading the config while a game is boosting exits GameBoost and does
-  not re-enter** for the still-running game — background throttling stops until the
-  game restarts.
+- **Config reload re-enters GameBoost for a single game.** The re-entry path
+  (`reenter_if_game_running`) picks the first process matching the game matcher and
+  boosts around it; if several processes match at once (multiple games, or a broad
+  pattern), only the first is boosted — there is no multi-game re-entry.
 - **The overlay's private memory is not measured** and will exceed the v2 spec's
   aspirational <2 MB figure. The actual guarantee holds: the overlay is
   non-resident with zero idle cost — the process exits when the window closes.
@@ -289,5 +282,9 @@ Previously documented as v1 gaps, **closed in v1.1**:
   validation + atomic persist, and the `aetheris-ui` config dialog.
 - **v2-C (overlay, shipped):** `aetheris-overlay` — DirectComposition telemetry
   panel, manual launch, zero injection (see "Overlay" above).
-- **v2.1 (remaining):** kernel driver (monitor-only), hotkey activation (a
-  service `RegisterHotKey` → `CreateProcess` path to launch the overlay).
+- **v2.1 (hardening, shipped):** least-privilege pipe DACL + elevated-only
+  SaveConfig, hotkey-launched overlay, overlay DPI awareness + right-click
+  close, non-blocking UI IPC, GameBoost re-entry after config save/reload,
+  network-QoS crash reconciliation via marker, QoS PID-reuse protection, GUI
+  window-subsystem polish.
+- **v2.2 (planned):** kernel driver (monitor-only).
