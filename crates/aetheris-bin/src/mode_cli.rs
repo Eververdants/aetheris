@@ -19,7 +19,7 @@ pub fn main(args: Vec<String>) -> i32 {
                     pipe = args[i].clone();
                 }
             }
-            "get-state" | "reload" | "query" => {
+            "get-state" | "reload" | "query" | "stop" | "toggle-overlay" => {
                 cmd = Some(args[i].clone());
                 if args[i] == "query" && i + 1 < args.len() {
                     arg = Some(args[i + 1].clone());
@@ -34,8 +34,12 @@ pub fn main(args: Vec<String>) -> i32 {
         Some("get-state") => Request::GetState,
         Some("reload") => Request::ReloadConfig,
         Some("query") => Request::QueryProcess(arg.unwrap_or_default()),
+        Some("stop") => Request::StopService,
+        Some("toggle-overlay") => Request::ToggleOverlay,
         _ => {
-            eprintln!("usage: aetheris cli [--pipe NAME] get-state|reload|query <name>");
+            eprintln!(
+                "usage: aetheris cli [--pipe NAME] get-state|reload|query <name>|stop|toggle-overlay"
+            );
             return 2;
         }
     };

@@ -69,6 +69,16 @@ pub enum Request {
     ReloadConfig,
     SaveConfig(Config),
     QueryProcess(String),
+    /// Ask the service to stop: the IPC thread relays `ServiceMsg::Stop`, which
+    /// exits GameBoost cleanly (restores every boosted process) and breaks the
+    /// service main loop so the elevated process exits. Answers
+    /// `Response::Reload("stopping")` before the loop breaks; the response is
+    /// best-effort (the process may exit before the client reads it).
+    StopService,
+    /// Ask the service to toggle the overlay (launch, or close a running
+    /// overlay window). Relayed as `ServiceMsg::ToggleOverlay`; answers
+    /// `Response::Reload("toggled")`.
+    ToggleOverlay,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

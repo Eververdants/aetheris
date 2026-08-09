@@ -391,6 +391,19 @@ impl Service {
                         let _ = ipc_tx.send(ServiceMsg::Reload);
                         Response::Reload("queued".into())
                     }
+                    Request::StopService => {
+                        // Relay Stop to the main loop, which exits GameBoost
+                        // cleanly and breaks; the elevated service process then
+                        // exits. The reply is best-effort — the process may tear
+                        // down before the client reads it, which the UI treats
+                        // as "service not running".
+                        let _ = ipc_tx.send(ServiceMsg::Stop);
+                        Response::Reload("stopping".into())
+                    }
+                    Request::ToggleOverlay => {
+                        let _ = ipc_tx.send(ServiceMsg::ToggleOverlay);
+                        Response::Reload("toggled".into())
+                    }
                     Request::SaveConfig(cfg) => {
                         // SaveConfig rewrites the admin-owned config file, so it
                         // requires an elevated client. Fail closed: an Err from

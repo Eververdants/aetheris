@@ -8,6 +8,8 @@ use windows::Win32::Foundation::HANDLE;
 
 const TEST_PIPE: &str = r"\\.\pipe\aetheris_test";
 const TEST_PIPE_DACL: &str = r"\\.\pipe\aetheris_test_dacl";
+const TEST_PIPE_STOP: &str = r"\\.\pipe\aetheris_test_stop";
+const TEST_PIPE_TOGGLE: &str = r"\\.\pipe\aetheris_test_toggle";
 
 /// `call_with_retry` deadline: how long to keep polling the pipe for a
 /// transient one-shot-server race before giving up.
@@ -83,6 +85,10 @@ fn roundtrip_get_state_and_query() {
                     ..Default::default()
                 }),
                 Request::SaveConfig(_cfg) => Response::SaveConfig(Ok("saved".into())),
+                // Mirror the real service's IPC handler: the two control
+                // requests answer `Reload` with the relay message name.
+                Request::StopService => Response::Reload("stopping".into()),
+                Request::ToggleOverlay => Response::Reload("toggled".into()),
             }
         };
         let _ = server.run(&mut handler);
@@ -113,6 +119,57 @@ fn roundtrip_get_state_and_query() {
 
     let save = call_with_retry(TEST_PIPE, &Request::SaveConfig(cfg)).expect("call");
     assert!(matches!(save, Response::SaveConfig(Ok(_))));
+
+    drop(t);
+}
+
+/// v2.2: `Request::StopService` roundtrips to the `Reload("stopping")` reply the
+/// real service returns after relaying `ServiceMsg::Stop` to its main loop.
+#[test]
+fn roundtrip_stop_service() {
+    let server = IpcServer::new(TEST_PIPE_STOP);
+    let t = thread::spawn(move || {
+        let mut handler = |_pipe: HANDLE, req: &Request| -> Response {
+            match req {
+                // Mirror the real service's IPC thread arm.
+                Request::StopService => Response::Reload("stopping".into()),
+                // The other requests are not exercised on this pipe; answer
+                // safely so the match stays exhaustive.
+                _ => Response::Reload("unhandled".into()),
+            }
+        };
+        let _ = server.run(&mut handler);
+    });
+
+    let stop = call_with_retry(TEST_PIPE_STOP, &Request::StopService).expect("call");
+    match stop {
+        Response::Reload(m) => assert_eq!(m, "stopping"),
+        other => panic!("StopService roundtrip: got {other:?}"),
+    }
+
+    drop(t);
+}
+
+/// v2.2: `Request::ToggleOverlay` roundtrips to `Reload("toggled")`, the reply
+/// the real service returns after relaying `ServiceMsg::ToggleOverlay`.
+#[test]
+fn roundtrip_toggle_overlay() {
+    let server = IpcServer::new(TEST_PIPE_TOGGLE);
+    let t = thread::spawn(move || {
+        let mut handler = |_pipe: HANDLE, req: &Request| -> Response {
+            match req {
+                Request::ToggleOverlay => Response::Reload("toggled".into()),
+                _ => Response::Reload("unhandled".into()),
+            }
+        };
+        let _ = server.run(&mut handler);
+    });
+
+    let toggle = call_with_retry(TEST_PIPE_TOGGLE, &Request::ToggleOverlay).expect("call");
+    match toggle {
+        Response::Reload(m) => assert_eq!(m, "toggled"),
+        other => panic!("ToggleOverlay roundtrip: got {other:?}"),
+    }
 
     drop(t);
 }

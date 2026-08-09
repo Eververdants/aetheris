@@ -49,9 +49,12 @@ use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{GetSysColorBrush, COLOR_BTNFACE};
+use windows::Win32::Graphics::Gdi::{
+    CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
+    DeleteObject, FillRect, GetDC, GetSysColorBrush, ReleaseDC, SelectObject, COLOR_BTNFACE,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_LISTVIEW_CLASSES, BST_CHECKED,
@@ -61,16 +64,23 @@ use windows::Win32::UI::Controls::{
     LVIS_SELECTED, LVNI_SELECTED, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SINGLESEL, NMHDR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Shell::{
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CB_ADDSTRING, CB_GETCURSEL,
-    CB_SETCURSEL, CBS_DROPDOWNLIST, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
-    GWLP_USERDATA, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK,
-    MESSAGEBOX_STYLE, MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, SW_SHOW, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NOTIFY, WNDCLASSW,
-    WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
-    WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
+    AdjustWindowRectEx, AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CB_ADDSTRING,
+    CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CreateIconIndirect, CreatePopupMenu,
+    CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
+    DispatchMessageW, ES_AUTOHSCROLL, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
+    GWLP_USERDATA, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, KillTimer, LoadCursorW,
+    LoadIconW, MB_ICONERROR, MB_OK, MESSAGEBOX_STYLE, MessageBoxW, MF_SEPARATOR, MF_STRING, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, SIZE_MINIMIZED, SW_HIDE, SW_SHOW,
+    TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NOTIFY, WM_RBUTTONUP, WM_SIZE, WM_TIMER,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
 };
 
 use aetheris_core::config::{AffinitySpec, AlwaysRule, BackgroundRule, Config, PriorityClass};
@@ -111,6 +121,28 @@ const IDC_BTN_EXIT: isize = 143;
 /// `WM_APP + 1` sits in the application-defined range, clear of any system
 /// message.
 const WM_IPC_RESULT: u32 = WM_APP + 1;
+
+/// Notification message the tray icon posts to the dialog's wndproc (`lparam`
+/// carries the mouse message — `WM_LBUTTONUP` / `WM_RBUTTONUP`). Registered via
+/// `NOTIFYICONDATAW.uCallbackMessage`.
+const WM_TRAYICON: u32 = WM_APP + 2;
+
+/// Tray icon identifier (`NOTIFYICONDATAW.uID` / `NIM_MODIFY`).
+const TRAY_ICON_ID: u32 = 1;
+
+/// Timer that re-pulls service status for the tray icon (`SetTimer` id, fired
+/// every [`TRAY_STATUS_INTERVAL_MS`]).
+const TRAY_STATUS_TIMER_ID: usize = 2;
+const TRAY_STATUS_INTERVAL_MS: u32 = 5000;
+
+/// Tray popup-menu command ids (`AppendMenuW.uidnewitem`). Their values are
+/// matched against `TrackPopupMenu(TPM_RETURNCMD)`'s return in the
+/// `WM_TRAYICON` handler.
+const IDM_START_SERVICE: isize = 1000;
+const IDM_STOP_SERVICE: isize = 1001;
+const IDM_TOGGLE_OVERLAY: isize = 1002;
+const IDM_OPEN_UI: isize = 1003;
+const IDM_EXIT: isize = 1004;
 
 /// Identifies which worker-thread IPC call a `WM_IPC_RESULT` message answers.
 /// The worker posts it in `wparam`; the wndproc routes on it to the matching
@@ -214,6 +246,15 @@ struct UiState {
     h_qos: HWND,
     h_suspend: HWND,
     h_trim: HWND,
+    /// Tray status icons (owned, freed on `WM_DESTROY` via `DestroyIcon`):
+    /// green when the service answers `GetState`, gray when it does not.
+    h_icon_green: HICON,
+    h_icon_gray: HICON,
+    /// True while a tray-status `GetState` probe is in flight on a worker
+    /// thread. The `WM_TIMER` tick skips while set so a down service (whose
+    /// `client_call` spends its retry budget off-thread) cannot pile up stuck
+    /// workers faster than they drain.
+    status_probe_in_flight: bool,
 }
 
 /// RAII guard for `UiState::busy`. Setting it clears the flag on `drop`, so the
@@ -596,6 +637,177 @@ unsafe fn mk_child(
 }
 
 // ---------------------------------------------------------------------------
+// Tray icon + status menu (Shell_NotifyIcon)
+// ---------------------------------------------------------------------------
+
+/// Build the `NOTIFYICONDATAW` for the tray icon: message notifications to
+/// [`WM_TRAYICON`], a status [`HICON`], and the "aetheris" tooltip. `hIcon` is
+/// swapped per status color via `NIM_MODIFY`; the struct is otherwise reused
+/// for `NIM_ADD` / `NIM_DELETE`.
+fn tray_data(hwnd: HWND, hicon: HICON) -> NOTIFYICONDATAW {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_TRAYICON,
+        hIcon: hicon,
+        ..Default::default()
+    };
+    let tip: Vec<u16> = "aetheris".encode_utf16().collect();
+    // szTip is zero-initialized by Default, so a non-null-terminated copy is a
+    // valid null-terminated string.
+    data.szTip[..tip.len()].copy_from_slice(&tip);
+    data
+}
+
+unsafe fn tray_send(msg: NOTIFY_ICON_MESSAGE, hwnd: HWND, hicon: HICON) -> bool {
+    let data = tray_data(hwnd, hicon);
+    unsafe { Shell_NotifyIconW(msg, &data).as_bool() }
+}
+
+unsafe fn tray_add(hwnd: HWND, hicon: HICON) -> bool {
+    tray_send(NIM_ADD, hwnd, hicon)
+}
+
+unsafe fn tray_modify_icon(hwnd: HWND, hicon: HICON) -> bool {
+    tray_send(NIM_MODIFY, hwnd, hicon)
+}
+
+unsafe fn tray_delete(hwnd: HWND) -> bool {
+    tray_send(NIM_DELETE, hwnd, HICON::default())
+}
+
+/// Build a solid 16x16 status [`HICON`] in `rgb`.
+///
+/// Simplest approach that compiles cleanly on the pinned windows crate: fill a
+/// compatible bitmap with a solid brush, wrap it with a fully-opaque
+/// monochrome mask (all zero bits), and hand both to `CreateIconIndirect`
+/// (which copies the bitmaps into the icon). A flat square is all the tray
+/// needs to distinguish "service up" (green) from "service down" (gray). Any
+/// GDI failure fails closed to a null icon, which `Shell_NotifyIconW` ignores.
+unsafe fn make_status_icon(rgb: COLORREF) -> HICON {
+    let hdc = GetDC(None);
+    if hdc.0.is_null() {
+        return HICON::default();
+    }
+    let mem = CreateCompatibleDC(Some(hdc));
+    let bmp = CreateCompatibleBitmap(hdc, 16, 16);
+    if mem.0.is_null() || bmp.0.is_null() {
+        if !mem.0.is_null() {
+            let _ = DeleteDC(mem);
+        }
+        if !bmp.0.is_null() {
+            let _ = DeleteObject(bmp.into());
+        }
+        let _ = ReleaseDC(None, hdc);
+        return HICON::default();
+    }
+    let old = SelectObject(mem, bmp.into());
+    let brush = CreateSolidBrush(rgb);
+    let rc = RECT {
+        left: 0,
+        top: 0,
+        right: 16,
+        bottom: 16,
+    };
+    let _ = FillRect(mem, &rc, brush);
+    let _ = SelectObject(mem, old);
+    let _ = DeleteObject(brush.into());
+    let _ = DeleteDC(mem);
+    let _ = ReleaseDC(None, hdc);
+
+    // Opaque monochrome mask (all zero bits) so the color bitmap shows through
+    // everywhere.
+    let mask = CreateBitmap(16, 16, 1, 1, None);
+    let info = ICONINFO {
+        fIcon: true.into(),
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: mask,
+        hbmColor: bmp,
+    };
+    let icon = CreateIconIndirect(&info);
+    // CreateIconIndirect copies the bitmaps into the icon; ours can go now.
+    let _ = DeleteObject(bmp.into());
+    let _ = DeleteObject(mask.into());
+    icon.unwrap_or_default()
+}
+
+/// Bring the dialog to the foreground (left-click on the tray icon, "Open UI",
+/// or a restore from the taskbar).
+unsafe fn show_and_foreground(hwnd: HWND) {
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = SetForegroundWindow(hwnd);
+}
+
+/// Launch the service elevated via `ShellExecuteW(runas)`. The service is a
+/// separate elevated process, so a UAC prompt appears when the UI is not
+/// already elevated. Failures (unresolvable exe, refused launch) are logged;
+/// the UI keeps running.
+fn start_service() {
+    let Some(exe) = std::env::current_exe().ok() else {
+        log_err("start service: cannot resolve current exe");
+        return;
+    };
+    let exe_w = to_wide(&exe.to_string_lossy());
+    let rc = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            PCWSTR(exe_w.as_ptr()),
+            w!("service"),
+            None,
+            SW_SHOW,
+        )
+    };
+    // ShellExecuteW returns a value > 32 on success; <= 32 is an error code.
+    if (rc.0 as isize) <= 32 {
+        log_err("start service: ShellExecuteW(runas) failed");
+    }
+}
+
+/// Show the tray popup menu at the cursor and dispatch the chosen command.
+///
+/// The menu is built per click and destroyed after `TrackPopupMenu` returns.
+/// `TPM_RETURNCMD` makes the selected command id the return value (0 = no
+/// selection), so no `WM_COMMAND` plumbing is needed.
+unsafe fn show_tray_menu(hwnd: HWND) {
+    let menu = match CreatePopupMenu() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let _ = AppendMenuW(menu, MF_STRING, IDM_START_SERVICE as usize, w!("Start service"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_STOP_SERVICE as usize, w!("Stop service"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_OVERLAY as usize, w!("Toggle overlay"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+    let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_UI as usize, w!("Open UI"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, w!("Exit"));
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    // SetForegroundWindow is the documented prerequisite for a popup menu to
+    // dismiss on an outside click.
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD, pt.x, pt.y, Some(0), hwnd, None);
+    let _ = DestroyMenu(menu);
+    if cmd.0 != 0 {
+        // Same pattern as WM_COMMAND: mint the state borrow only for the arms
+        // that need it, after the nested menu loop has fully unwound.
+        let s = state_mut(hwnd);
+        match cmd.0 as isize {
+            IDM_START_SERVICE => start_service(),
+            IDM_STOP_SERVICE => s.stop_service(),
+            IDM_TOGGLE_OVERLAY => s.toggle_overlay(),
+            IDM_OPEN_UI => show_and_foreground(hwnd),
+            IDM_EXIT => {
+                let _ = DestroyWindow(hwnd);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Value formatting / parsing (config <-> editor strings)
 // ---------------------------------------------------------------------------
 
@@ -746,19 +958,80 @@ impl UiState {
         self.spawn(hwnd, IpcCall::GetState, Request::GetState);
     }
 
+    /// Kick the tray-status `GetState` probe (driven by [`WM_TIMER`]). Skipped
+    /// while a previous probe is still in flight so a down service (whose
+    /// `client_call` spends its retry budget on a worker thread) can't pile up
+    /// stuck workers. The outcome lands in `on_get_state_result`, which flips
+    /// the tray icon green/gray.
+    unsafe fn start_status_probe(&mut self, hwnd: HWND) {
+        if self.status_probe_in_flight {
+            return;
+        }
+        self.status_probe_in_flight = true;
+        self.spawn(hwnd, IpcCall::GetState, Request::GetState);
+    }
+
+    /// Set the tray icon's status color via `NIM_MODIFY` (green = service
+    /// responding, gray = service down). No-op when the icon was never added.
+    unsafe fn update_tray_status(&self, hwnd: HWND, running: bool) {
+        let icon = if running {
+            self.h_icon_green
+        } else {
+            self.h_icon_gray
+        };
+        let _ = tray_modify_icon(hwnd, icon);
+    }
+
+    /// Ask the service to stop over the pipe (worker thread, never blocks the
+    /// UI). A pipe failure means the service is already down — the desired end
+    /// state of a stop — so it is logged, not surfaced.
+    fn stop_service(&self) {
+        let pipe = self.pipe.clone();
+        std::thread::spawn(move || match client_call(&pipe, &Request::StopService) {
+            Ok(Response::Reload(m)) => log_err(&format!("stop service: {m}")),
+            Ok(_) => log_err("stop service: unexpected response"),
+            Err(e) => log_err(&format!("stop service: service not running ({e})")),
+        });
+    }
+
+    /// Ask the service to toggle the overlay (worker thread, never blocks the
+    /// UI). A pipe failure means the service is not running — logged.
+    fn toggle_overlay(&self) {
+        let pipe = self.pipe.clone();
+        std::thread::spawn(move || match client_call(&pipe, &Request::ToggleOverlay) {
+            Ok(Response::Reload(m)) => log_err(&format!("toggle overlay: {m}")),
+            Ok(_) => log_err("toggle overlay: unexpected response"),
+            Err(e) => log_err(&format!("toggle overlay: service not running ({e})")),
+        });
+    }
+
     /// Apply a completed `GetState` to the status panel. Never touches the
     /// editor's local config copy, and while `init_error` is set it leaves the
     /// result line untouched so the "config failed to load" warning persists.
+    ///
+    /// Every `GetState` outcome (startup pull, Refresh button, tray-status
+    /// timer) also drives the tray icon: green when the service answered, gray
+    /// when it did not.
     unsafe fn on_get_state_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        // The in-flight tray-status probe (if any) has landed — allow the next
+        // WM_TIMER tick to start a fresh one.
+        self.status_probe_in_flight = false;
         match result {
             Ok(Response::State(s)) => {
                 self.mode = s.mode;
                 self.boosted = s.boosted;
                 self.last_reload = s.last_reload;
+                self.update_tray_status(hwnd, true);
                 self.set_result_if_loaded(hwnd, "Status refreshed");
             }
-            Ok(_) => self.set_result_if_loaded(hwnd, "Refresh: unexpected response"),
-            Err(e) => self.set_result_if_loaded(hwnd, &format!("Refresh failed: {e}")),
+            Ok(_) => {
+                self.update_tray_status(hwnd, false);
+                self.set_result_if_loaded(hwnd, "Refresh: unexpected response");
+            }
+            Err(e) => {
+                self.update_tray_status(hwnd, false);
+                self.set_result_if_loaded(hwnd, &format!("Refresh failed: {e}"));
+            }
         }
         self.update_status(hwnd);
     }
@@ -1205,6 +1478,36 @@ unsafe extern "system" fn wndproc(
             let s = state_mut(hwnd);
             s.setup_columns();
             s.init_widgets(hwnd);
+            // Register the tray icon (gray until the first GetState flips it).
+            let _ = tray_add(hwnd, s.h_icon_gray);
+            LRESULT(0)
+        }
+
+        WM_TRAYICON => {
+            // `lparam` carries the mouse message that activated the icon.
+            match lparam.0 as u32 {
+                WM_LBUTTONUP => show_and_foreground(hwnd),
+                WM_RBUTTONUP => show_tray_menu(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+
+        WM_SIZE => {
+            // Minimize-to-tray: hide instead of minimizing so the dialog
+            // disappears from the taskbar while the tray icon stays as the
+            // only surface.
+            if wparam.0 as u32 == SIZE_MINIMIZED {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            LRESULT(0)
+        }
+
+        WM_TIMER => {
+            if wparam.0 == TRAY_STATUS_TIMER_ID {
+                let s = state_mut(hwnd);
+                s.start_status_probe(hwnd);
+            }
             LRESULT(0)
         }
 
@@ -1290,8 +1593,15 @@ unsafe extern "system" fn wndproc(
             // closing the dialog (e.g. with the service down and calls still
             // retrying) leaks nothing.
             ipc_teardown();
+            let _ = KillTimer(Some(hwnd), TRAY_STATUS_TIMER_ID);
             let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if p != 0 {
+                // Remove the tray icon and free the status HICONs before the
+                // state box (which owns them) is dropped.
+                let st = &mut *(p as *mut UiState);
+                let _ = tray_delete(hwnd);
+                let _ = DestroyIcon(st.h_icon_green);
+                let _ = DestroyIcon(st.h_icon_gray);
                 drop(Box::from_raw(p as *mut UiState));
                 let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
@@ -1640,6 +1950,11 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         hinst,
     );
 
+    // Solid status icons for the tray: green (0x00FF00) = service up, gray
+    // (0x808080) = service down. Owned here and freed on WM_DESTROY.
+    let h_icon_green = make_status_icon(COLORREF(0x0000FF00));
+    let h_icon_gray = make_status_icon(COLORREF(0x00808080));
+
     UiState {
         pipe,
         cfg: Config::default(),
@@ -1669,6 +1984,9 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         h_qos,
         h_suspend,
         h_trim,
+        h_icon_green,
+        h_icon_gray,
+        status_probe_in_flight: false,
     }
 }
 
@@ -1803,6 +2121,17 @@ fn run(args: Vec<String>) -> i32 {
             )?;
 
             let _ = ShowWindow(hwnd, SW_SHOW);
+
+            // Tray status probe: every TRAY_STATUS_INTERVAL_MS the WM_TIMER
+            // handler re-pulls GetState on a worker thread and flips the tray
+            // icon green/gray. Runs for the whole dialog lifetime so the icon
+            // tracks the service even while the window is hidden to the tray.
+            let _ = SetTimer(
+                Some(hwnd),
+                TRAY_STATUS_TIMER_ID,
+                TRAY_STATUS_INTERVAL_MS,
+                None,
+            );
         }
 
         // Kick off the startup config load and status pull on worker threads;
