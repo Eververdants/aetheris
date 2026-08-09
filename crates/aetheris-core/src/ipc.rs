@@ -266,8 +266,7 @@ impl IpcServer {
 /// The check impersonates the named-pipe client (the calling thread's security
 /// context becomes the client's), opens the calling thread's *impersonation*
 /// token, and queries its `TokenElevation` level. [`OpenThreadToken`] — not
-/// [OpenProcessToken](windows::Win32::System::Threading::OpenProcessToken) — is
-/// used on purpose: impersonation swaps the calling
+/// `OpenProcessToken` — is used on purpose: impersonation swaps the calling
 /// thread's token while the process token is untouched, so
 /// `OpenProcessToken(GetCurrentProcess())` would report the *service's* own
 /// elevation, not the client's.
@@ -291,7 +290,7 @@ pub fn is_client_elevated(pipe: HANDLE) -> Result<bool, String> {
     let mut token: HANDLE = HANDLE(std::ptr::null_mut());
     let open = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, false, &mut token) };
     // Always revert, regardless of the token-open outcome.
-    let _ = unsafe { RevertToSelf() };
+    unsafe { RevertToSelf() }.map_err(|e| format!("RevertToSelf: {e}"))?;
     open.map_err(|e| format!("OpenThreadToken (client token): {e}"))?;
 
     let mut elev = TOKEN_ELEVATION::default();

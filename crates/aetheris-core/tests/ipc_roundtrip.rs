@@ -19,6 +19,15 @@ fn dacl_least_privilege_for_interactive_users() {
     assert!(!d.contains("(A;;GA;;;IU)"), "IU must NOT get generic-all (WRITE_DAC/WRITE_OWNER)");
 }
 
+#[test]
+fn is_client_elevated_fails_closed_on_invalid_handle() {
+    // A non-pipe handle (or null) must return Err — the fail-closed contract
+    // that denies SaveConfig when elevation can't be established.
+    let r =
+        aetheris_core::ipc::is_client_elevated(windows::Win32::Foundation::HANDLE(std::ptr::null_mut()));
+    assert!(r.is_err(), "invalid handle must fail closed, got {:?}", r);
+}
+
 /// The one-shot server tears each connection down before recreating the next
 /// pipe instance, so a client call can fail transiently even though a previous
 /// call succeeded: a write landing inside the close-then-recreate window gets
