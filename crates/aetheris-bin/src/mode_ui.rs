@@ -78,7 +78,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, SIZE_MINIMIZED, SW_HIDE, SW_SHOW,
     TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NOTIFY, WM_RBUTTONUP, WM_SIZE, WM_TIMER,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NOTIFY, WM_RBUTTONUP, WM_SIZE,
+    WM_TIMER,
     WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
     WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
 };
@@ -667,11 +668,19 @@ unsafe fn tray_send(msg: NOTIFY_ICON_MESSAGE, hwnd: HWND, hicon: HICON) -> bool 
 }
 
 unsafe fn tray_add(hwnd: HWND, hicon: HICON) -> bool {
-    tray_send(NIM_ADD, hwnd, hicon)
+    let ok = tray_send(NIM_ADD, hwnd, hicon);
+    if !ok {
+        log_err("tray: NIM_ADD failed");
+    }
+    ok
 }
 
 unsafe fn tray_modify_icon(hwnd: HWND, hicon: HICON) -> bool {
-    tray_send(NIM_MODIFY, hwnd, hicon)
+    let ok = tray_send(NIM_MODIFY, hwnd, hicon);
+    if !ok {
+        log_err("tray: NIM_MODIFY failed");
+    }
+    ok
 }
 
 unsafe fn tray_delete(hwnd: HWND) -> bool {
@@ -718,8 +727,13 @@ unsafe fn make_status_icon(rgb: COLORREF) -> HICON {
     let _ = ReleaseDC(None, hdc);
 
     // Opaque monochrome mask (all zero bits) so the color bitmap shows through
-    // everywhere.
-    let mask = CreateBitmap(16, 16, 1, 1, None);
+    // everywhere. The bits are passed explicitly: CreateBitmap with NULL
+    // lpvBits leaves the mask buffer uninitialized (not guaranteed zero), and
+    // nonzero mask bits would make icon pixels transparent/speckled. The buffer
+    // only needs to live for the CreateBitmap call (which copies the bits);
+    // keep it in scope for the whole function anyway.
+    let mask_bits = vec![0u8; (16 * 16) / 8];
+    let mask = CreateBitmap(16, 16, 1, 1, Some(mask_bits.as_ptr().cast()));
     let info = ICONINFO {
         fIcon: true.into(),
         xHotspot: 0,
@@ -1483,6 +1497,15 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
+        WM_CLOSE => {
+            // Title-bar close: hide to the tray instead of destroying the
+            // window. Destroying would run WM_DESTROY -> PostQuitMessage and
+            // quit the UI; only the tray Exit item (IDM_EXIT) and the Exit
+            // button (IDC_BTN_EXIT) call DestroyWindow and are the quit path.
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            LRESULT(0)
+        }
+
         WM_TRAYICON => {
             // `lparam` carries the mouse message that activated the icon.
             match lparam.0 as u32 {
@@ -1499,8 +1522,12 @@ unsafe extern "system" fn wndproc(
             // only surface.
             if wparam.0 as u32 == SIZE_MINIMIZED {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                LRESULT(0)
+            } else {
+                // Let DefWindowProc handle normal restores/resizes (reflowing
+                // min/max buttons etc.) instead of swallowing them.
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            LRESULT(0)
         }
 
         WM_TIMER => {
