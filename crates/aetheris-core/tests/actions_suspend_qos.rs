@@ -219,6 +219,19 @@ fn qos_reams_after_missed_stop_pid_reuse() {
         .apply(new_pid, &TargetAction::QosCpuQuota { percent: 50 })
         .expect("re-apply qos after pid reuse");
 
+    // THE regression guard: with the fix the job is no longer empty — the new
+    // process was genuinely assigned into it. Without the fix the re-apply only
+    // re-configures the job's rate control (via SetInformationJobObject) and
+    // never assigns the process, so the active-process count stays 0 and this
+    // assertion fails. `entry.assigned` and the rate-control read-back below are
+    // both true either way — they prove the JOB is armed/configured, not that
+    // the new process is in it.
+    assert_eq!(
+        backend.job_active_processes(new_pid),
+        Some(1),
+        "new process must be re-assigned to the job after a missed-Stop PID reuse"
+    );
+
     let jobs = backend.jobs.lock().unwrap();
     let entry = jobs.get(&new_pid).expect("entry present after re-apply");
     assert!(entry.assigned, "re-arm must re-assign the new process");
@@ -241,12 +254,15 @@ fn qos_reams_after_missed_stop_pid_reuse() {
     );
     assert_eq!(unsafe { info.Anonymous.CpuRate }, 5000, "cap is 50%");
 
-    // Cleanup.
+    // Cleanup. Kill + wait the child FIRST, then on_process_exit — closing the
+    // job handle is only safe after the process has exited (the documented
+    // contract); there is no KILL_ON_JOB_CLOSE, so order matters only for the
+    // handle-lifecycle contract, never for process termination.
     drop(jobs);
     backend
         .apply(new_pid, &TargetAction::QosCpuQuota { percent: 0 })
         .expect("clear qos");
-    backend.on_process_exit(new_pid);
     let _ = new_child.kill();
     let _ = new_child.wait();
+    backend.on_process_exit(new_pid);
 }
