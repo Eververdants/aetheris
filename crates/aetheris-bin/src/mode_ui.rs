@@ -88,7 +88,135 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use aetheris_core::config::{AffinitySpec, AlwaysRule, BackgroundRule, Config, PriorityClass};
+use aetheris_core::i18n::Lang;
 use aetheris_core::ipc::{client_call, ProcessInfo, Request, Response, DEFAULT_PIPE};
+
+// ---------------------------------------------------------------------------
+// Bilingual string table (zh/en)
+// ---------------------------------------------------------------------------
+
+/// Bilingual UI strings. `tr(lang, key)` returns `key`'s translation in
+/// `lang`; every key resolves to a non-empty, non-placeholder string in BOTH
+/// languages, enforced by `tests::table_is_complete_for_both_langs`, which
+/// walks `keys` (generated from the same match arms, so the two can never
+/// drift).
+///
+/// Keys cover every user-visible string the UI can render: window title,
+/// status lines, buttons, list column headers, global options, the language
+/// button, the running-process picker, save messages, the tray menu and the
+/// advanced editor's field labels. `apply_language` drives controls from this
+/// table; the current dialog body still uses its hardcoded English until Task
+/// 3 rewires the layout.
+macro_rules! define_strings {
+    ($( $key:literal => $zh:literal, $en:literal ),* $(,)?) => {
+        fn tr(lang: Lang, key: &str) -> &'static str {
+            let s: (&'static str, &'static str) = match key {
+                $( $key => ($zh, $en), )*
+                other => {
+                    // A caller asking for a key the table doesn't know is a
+                    // programmer error: catch it in debug builds (and in tests)
+                    // rather than silently returning a placeholder.
+                    debug_assert!(false, "tr: unknown key '{other}'");
+                    ("", "")
+                }
+            };
+            match lang {
+                Lang::Zh => s.0,
+                Lang::En => s.1,
+            }
+        }
+
+        /// Every key [`tr`] translates, in match-arm order. `keys` is the
+        /// canonical list the table-completeness test walks; being generated
+        /// from the same arms, it can never miss one.
+        #[cfg(test)]
+        fn keys() -> &'static [&'static str] {
+            &[ $( $key ),* ]
+        }
+    };
+}
+
+define_strings! {
+    // Window title (product name — identical in both languages).
+    "title" => "aetheris", "aetheris",
+    // Status area: service mode.
+    "status_running" => "正在优化中", "Optimizing",
+    "status_stopped" => "未运行", "Not running",
+    // Service lifecycle messages (startup probe).
+    "service_starting" => "正在启动服务…", "Starting service…",
+    "service_giveup" => "无法启动服务 — 请手动（以管理员身份）运行 `aetheris service`",
+        "unable to start service — run `aetheris service` manually (elevated)",
+    // Main-view buttons.
+    "btn_start" => "启动服务", "Start service",
+    "btn_stop" => "停止服务", "Stop service",
+    "btn_save" => "保存", "Save",
+    "btn_add" => "添加", "Add",
+    "btn_pick_running" => "从运行中的进程选择", "Pick from running",
+    "btn_advanced" => "高级设置", "Advanced",
+    "btn_reload" => "重载", "Reload",
+    // List column headers.
+    "list_games" => "游戏", "Games",
+    "list_background" => "后台应用", "Background apps",
+    "list_process_name" => "进程名", "Process name",
+    // Global optimization options.
+    "opt_suspend" => "挂起", "Suspend",
+    "opt_low_priority" => "降低优先级", "Lower priority",
+    "opt_cpu" => "限制 CPU", "Limit CPU",
+    "opt_mem" => "清理内存", "Trim memory",
+    // CPU-limit levels.
+    "cpu_low" => "低", "Low",
+    "cpu_med" => "中", "Medium",
+    "cpu_high" => "高", "High",
+    // Language toggle button.
+    "lang" => "语言", "Language",
+    // Running-process picker dialog.
+    "pick_title" => "选择运行中的进程", "Pick running process",
+    "pick_hint" => "勾选要添加的进程，然后点击确定", "Check the processes to add, then OK",
+    "pick_ok" => "确定", "OK",
+    // Save outcomes.
+    "save_ok" => "保存成功", "Saved",
+    "save_requires_elevation" => "保存需要管理员权限", "Save requires administrator rights",
+    // Tray popup menu.
+    "tray_start" => "启动服务", "Start service",
+    "tray_stop" => "停止服务", "Stop service",
+    "tray_overlay" => "切换悬浮窗", "Toggle overlay",
+    "tray_open" => "打开界面", "Open UI",
+    "tray_exit" => "退出", "Exit",
+    // Advanced editor.
+    "advanced_title" => "高级设置", "Advanced settings",
+    "field_name" => "名称", "Name",
+    "field_priority" => "优先级", "Priority",
+    "field_affinity" => "亲和性", "Affinity",
+    "field_qos" => "QoS", "QoS",
+    "field_suspend" => "挂起", "Suspend",
+    "field_trim" => "清理内存", "Trim memory",
+}
+
+/// Re-render the window in `lang`: set the window title, record the active
+/// language (the tray popup, rebuilt fresh on each right-click, reads it) and —
+/// once the new layout lands in Task 3 — every control's text and list column
+/// headers. Guarded to be a safe no-op for controls that don't exist yet, so
+/// the mechanism can be called before the layout it re-renders is created.
+///
+/// Called at startup (after the dialog is created) with the loaded language,
+/// and re-run by the language toggle (Task 4) whenever the user switches
+/// zh/en.
+///
+/// # Safety
+/// `hwnd` must be the dialog window with a live [`UiState`] in `GWLP_USERDATA`
+/// (i.e. after `WM_CREATE` has run inside `CreateWindowExW`).
+unsafe fn apply_language(hwnd: HWND, lang: Lang) {
+    // Record the active language first: `show_tray_menu` rebuilds the popup on
+    // every right-click from this field, so the tray strings follow the toggle
+    // without needing a persistent menu handle to rebuild here.
+    state_mut(hwnd).lang = lang;
+    // Window title.
+    set_text(hwnd, tr(lang, "title"));
+    // Task 3 wires the per-control texts (`GetDlgItemW(id)` -> `SetWindowTextW`)
+    // and list column headers (`LVM_SETCOLUMNW`) here, keyed to the new
+    // layout's control ids; until those controls exist this stays a no-op for
+    // them. Only the title and tray menu change language in this task.
+}
 
 // ---------------------------------------------------------------------------
 // Control identifiers
@@ -227,6 +355,11 @@ enum ListKind {
 /// Per-window dialog state, stashed in `GWLP_USERDATA` as a heap box.
 struct UiState {
     pipe: String,
+    /// The currently active UI language, loaded at startup from ui.toml
+    /// (defaulting to the detected system language) and applied via
+    /// [`apply_language`]. The tray menu is rebuilt per click from this field;
+    /// the language toggle (Task 4) flips it and re-runs [`apply_language`].
+    lang: Lang,
     cfg: Config,
     /// Set when a `GetConfig`-style load fails (startup) and shown until a
     /// fetch succeeds; while set, Save is refused so the stub config can't
@@ -880,16 +1013,25 @@ fn startup_probe(hwnd: HWND, pipe: String) {
 /// `TPM_RETURNCMD` makes the selected command id the return value (0 = no
 /// selection), so no `WM_COMMAND` plumbing is needed.
 unsafe fn show_tray_menu(hwnd: HWND) {
+    // The popup is ephemeral — built per click — so the strings come from the
+    // current language (stored on the state by `apply_language`) rather than a
+    // persistent menu the toggle would have to rebuild.
+    let lang = state_mut(hwnd).lang;
     let menu = match CreatePopupMenu() {
         Ok(m) => m,
         Err(_) => return,
     };
-    let _ = AppendMenuW(menu, MF_STRING, IDM_START_SERVICE as usize, w!("Start service"));
-    let _ = AppendMenuW(menu, MF_STRING, IDM_STOP_SERVICE as usize, w!("Stop service"));
-    let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_OVERLAY as usize, w!("Toggle overlay"));
+    let start = to_wide(tr(lang, "tray_start"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_START_SERVICE as usize, PCWSTR(start.as_ptr()));
+    let stop = to_wide(tr(lang, "tray_stop"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_STOP_SERVICE as usize, PCWSTR(stop.as_ptr()));
+    let overlay = to_wide(tr(lang, "tray_overlay"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_OVERLAY as usize, PCWSTR(overlay.as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-    let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_UI as usize, w!("Open UI"));
-    let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, w!("Exit"));
+    let open = to_wide(tr(lang, "tray_open"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_UI as usize, PCWSTR(open.as_ptr()));
+    let exit = to_wide(tr(lang, "tray_exit"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit.as_ptr()));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     // SetForegroundWindow is the documented prerequisite for a popup menu to
@@ -2162,6 +2304,9 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
 
     UiState {
         pipe,
+        // Placeholder until `apply_language` runs right after window creation
+        // with the language loaded from ui.toml (default: detected system).
+        lang: Lang::En,
         cfg: Config::default(),
         init_error: None,
         config_loaded: false,
@@ -2327,6 +2472,14 @@ fn run(args: Vec<String>) -> i32 {
 
             let _ = ShowWindow(hwnd, SW_SHOW);
 
+            // Apply the loaded language (ui.toml, defaulting to the detected
+            // system language): sets the window title and the language the tray
+            // menu is built in. Control texts / column headers join here once
+            // the new layout exists (Task 3); until then the dialog body keeps
+            // its current strings.
+            let lang = aetheris_core::i18n::load_ui_settings().lang;
+            apply_language(hwnd, lang);
+
             // Tray status probe: every TRAY_STATUS_INTERVAL_MS the WM_TIMER
             // handler re-pulls GetState on a worker thread and flips the tray
             // icon green/gray. Runs for the whole dialog lifetime so the icon
@@ -2381,7 +2534,30 @@ fn run(args: Vec<String>) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::needs_elevation;
+    use super::{keys, needs_elevation, tr};
+    use aetheris_core::i18n::Lang;
+
+    /// Every key in the string table resolves to a non-empty, non-placeholder
+    /// string for BOTH languages. `keys()` is generated from the same match
+    /// arms as `tr`, so this test can never drift from the table.
+    #[test]
+    fn table_is_complete_for_both_langs() {
+        assert!(!keys().is_empty(), "string table must define at least one key");
+        for &key in keys() {
+            for lang in [Lang::Zh, Lang::En] {
+                let s = tr(lang, key);
+                assert!(
+                    !s.is_empty(),
+                    "tr({lang:?}, {key:?}) is an empty string (missing translation)"
+                );
+                assert_ne!(
+                    s,
+                    key,
+                    "tr({lang:?}, {key:?}) returns the key itself (untranslated)"
+                );
+            }
+        }
+    }
 
     #[test]
     fn save_refusal_mentions_elevated_client() {
