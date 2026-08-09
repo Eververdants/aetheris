@@ -4,8 +4,11 @@
 //! - Always-rules are applied whenever a matching process starts.
 //! - Entering GameBoost snapshots and applies the background rule for every
 //!   running background-matched process; processes that start mid-boost get the
-//!   same treatment. Exiting GameBoost (or a config reload while boosting)
-//!   restores every snapshot.
+//!   same treatment. Exiting GameBoost restores every snapshot.
+//! - A config reload/save exits GameBoost to apply the new config, then
+//!   re-enters it if a game is still running (see [`reenter_if_game_running`]):
+//!   a running game emits no new Start/foreground event, so without re-entry the
+//!   optimization would stay OFF until the game restarts.
 //! - Protected processes are never acted on.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -358,12 +361,37 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         self.boosted.insert(pid, state);
     }
 
+    /// Re-enter GameBoost for a still-running game after a config reload or
+    /// save. `set_config` exits GameBoost (restore + revert) to swap in the new
+    /// config, but a game already running produces no new Start/foreground
+    /// event, so without re-entry the optimization stays OFF until the game
+    /// restarts. Scans the process table for a process matching the CURRENT
+    /// game matcher; if one is found, `enter_game_mode` re-applies the
+    /// background rules to running processes (and re-applies the network QoS
+    /// tweaks / standby purge when enabled). No-op when already GameBoost.
+    pub fn reenter_if_game_running(&mut self) {
+        if self.mode == Mode::GameBoost {
+            return;
+        }
+        // Collect the first matching game (owned) so the table borrow is
+        // released before `enter_game_mode` takes `&mut self`.
+        let game = self
+            .table
+            .iter()
+            .find(|(_, name, _)| self.is_game(name))
+            .map(|(pid, name, _)| (pid, name.to_string()));
+        if let Some((pid, name)) = game {
+            self.enter_game_mode(pid, &name);
+        }
+    }
+
     pub fn set_config(&mut self, cfg: Config) {
         self.exit_game_mode();
         self.cfg = cfg;
         self.matcher = PatternMatcher::new(self.cfg.game.processes.clone());
         self.protected = self.cfg.protected_set();
         self.rebuild_matchers();
+        self.reenter_if_game_running();
     }
 }
 
@@ -526,11 +554,35 @@ mod tests {
         eng.on_process_event(&start(100, "browser.exe"));
         eng.on_process_event(&start(200, "game.exe"));
         assert_eq!(eng.mode(), Mode::GameBoost);
+        // The game exits before the reload, so there is no running process to
+        // re-enter GameBoost for — the reload must leave the engine Normal with
+        // every snapshot restored (re-enter must NOT fire).
+        eng.on_process_event(&stop(200, "game.exe"));
+        assert_eq!(eng.mode(), Mode::Normal);
         eng.set_config(cfg());
         assert_eq!(eng.mode(), Mode::Normal);
         assert!(eng.boosted().is_empty());
         let calls = backend.calls();
         assert!(calls.iter().any(|c| c.pid == 100 && c.restore.is_some()));
+    }
+
+    #[test]
+    fn set_config_reenters_gameboost_for_running_game() {
+        // A config reload/save swaps the matcher and exits GameBoost, but a
+        // game that is still running emits no new Start/foreground event, so the
+        // engine must scan the process table and re-enter GameBoost for it.
+        let backend = RecordingBackend::default();
+        let mut eng = PolicyEngine::new(cfg(), backend.clone());
+        eng.on_process_event(&start(100, "browser.exe"));
+        eng.on_process_event(&start(200, "game.exe"));
+        assert_eq!(eng.mode(), Mode::GameBoost);
+        eng.set_config(cfg());
+        assert_eq!(eng.mode(), Mode::GameBoost, "running game must re-enter after reload");
+        assert!(eng.boosted().contains_key(&100), "browser re-boosted on re-entry");
+        let calls = backend.calls();
+        assert!(calls
+            .iter()
+            .any(|c| c.pid == 100 && c.action == Some(TargetAction::Suspend)));
     }
 
     #[test]
