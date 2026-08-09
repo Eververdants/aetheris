@@ -45,6 +45,7 @@
 //! only (it never overwrites the editor's working copy).
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -138,6 +139,20 @@ const WM_SERVICE_START: u32 = WM_APP + 3;
 /// after a UAC launch; the dialog re-runs its startup `GetConfig`/`GetState` so
 /// the config editor and Save path unblock without a manual "Reload cfg".
 const WM_SERVICE_UP: u32 = WM_APP + 4;
+
+/// Posted by the startup probe worker when its ~5 s retry window closes with
+/// the service still down; the dialog replaces the stale "starting service…"
+/// line with a manual-launch instruction instead of leaving it stuck.
+const WM_SERVICE_GIVEUP: u32 = WM_APP + 5;
+
+/// One-shot guard so only a single elevated service launch is in flight at a
+/// time. Two UI instances, or a tray "Start service" click while the startup
+/// probe is mid-retry, must not each call `ShellExecuteW(runas)` — that would
+/// double-prompt UAC and double-launch the service. Won with
+/// `compare_exchange(false, true)` immediately before the elevated launch and
+/// released when the launching probe succeeds or gives up (or a tray launch
+/// returns), so any concurrent launcher sees `true` and skips.
+static LAUNCH_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Tray icon identifier (`NOTIFYICONDATAW.uID` / `NIM_MODIFY`).
 const TRAY_ICON_ID: u32 = 1;
@@ -795,9 +810,18 @@ fn shell_launch_service() -> bool {
 }
 
 /// Launch the service elevated (tray menu "Start service"). Failures
-/// (unresolvable exe, refused launch) are logged; the UI keeps running.
+/// (unresolvable exe, refused launch) are logged; the UI keeps running. While
+/// [`LAUNCH_PENDING`] is set (the startup probe's retry window, or another
+/// launch already underway), the click is skipped so UAC isn't double-prompted.
 fn start_service() {
+    if LAUNCH_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return; // a launch is already in flight; skip the duplicate
+    }
     let _ = shell_launch_service();
+    LAUNCH_PENDING.store(false, Ordering::Release);
 }
 
 /// Startup probe: check once whether the service answers `GetState`; if it is
@@ -818,7 +842,17 @@ fn startup_probe(hwnd: HWND, pipe: String) {
         if probe() {
             return; // service already up; the normal startup workers handle it
         }
+        // Win the single-launch guard before UAC-prompting so a concurrent tray
+        // "Start service" or a second UI instance cannot double-launch the
+        // service. Held until the probe succeeds or gives up.
+        if LAUNCH_PENDING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // another launch is already in flight
+        }
         if !shell_launch_service() {
+            LAUNCH_PENDING.store(false, Ordering::Release); // launch refused/cancelled
             return; // launch refused/cancelled; the dialog reports the pipe error
         }
         let hwnd = HWND(raw_hwnd as *mut c_void);
@@ -826,11 +860,17 @@ fn startup_probe(hwnd: HWND, pipe: String) {
         for _ in 0..5 {
             std::thread::sleep(Duration::from_millis(1000));
             if probe() {
+                LAUNCH_PENDING.store(false, Ordering::Release); // launched successfully
                 let _ =
                     unsafe { PostMessageW(Some(hwnd), WM_SERVICE_UP, WPARAM(0), LPARAM(0)) };
                 return;
             }
         }
+        // The retry window closed with the service still down. Release the
+        // launch guard and replace the stale "starting service…" line with an
+        // explicit manual-launch instruction.
+        LAUNCH_PENDING.store(false, Ordering::Release);
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_SERVICE_GIVEUP, WPARAM(0), LPARAM(0)) };
     });
 }
 
@@ -955,6 +995,15 @@ fn parse_qos(s: &str) -> Result<Option<u32>, String> {
         .parse()
         .map_err(|_| format!("qos: '{t}' is not a number"))?;
     Ok(Some(q))
+}
+
+/// True when the service's Save refusal means "run the UI elevated". The
+/// service refuses `SaveConfig` with different phrasings across builds, so the
+/// detection is a pure, unit-tested classifier rather than inline string
+/// sniffing that a message reword could silently break.
+fn needs_elevation(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("elevat")
+        || msg.to_ascii_lowercase().contains("administrator")
 }
 
 // ---------------------------------------------------------------------------
@@ -1481,8 +1530,7 @@ impl UiState {
     /// instance (exit 0, the new instance takes over). Declining just surfaces
     /// the service's error.
     unsafe fn on_save_elevation(&mut self, hwnd: HWND, msg: &str) {
-        let needs_elevation = msg.to_ascii_lowercase().contains("elevat");
-        if needs_elevation && !aetheris_core::actions::is_elevated() {
+        if needs_elevation(msg) && !aetheris_core::actions::is_elevated() {
             let wide = to_wide(
                 "Save requires administrator rights.\n\nRelaunch aetheris as administrator and try again?",
             );
@@ -1653,6 +1701,18 @@ unsafe extern "system" fn wndproc(
             // was down, and Refresh only re-pulls status, not the config).
             s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
             s.start_refresh(hwnd);
+            LRESULT(0)
+        }
+
+        WM_SERVICE_GIVEUP => {
+            // The startup probe gave up: its ~5 s retry window closed with the
+            // service still down. Drop the stale "starting service…" line for an
+            // explicit manual-launch instruction.
+            let s = state_mut(hwnd);
+            s.set_result(
+                hwnd,
+                "unable to start service — run `aetheris service` manually (elevated)",
+            );
             LRESULT(0)
         }
 
@@ -2316,5 +2376,27 @@ fn run(args: Vec<String>) -> i32 {
             report_error(&format!("{e}"));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_elevation;
+
+    #[test]
+    fn save_refusal_mentions_elevated_client() {
+        assert!(needs_elevation(
+            "SaveConfig requires an elevated client — run aetheris-ui as administrator"
+        ));
+    }
+
+    #[test]
+    fn save_refusal_mentions_administrator() {
+        assert!(needs_elevation("requires administrator rights"));
+    }
+
+    #[test]
+    fn unrelated_pipe_error_is_not_elevation() {
+        assert!(!needs_elevation("pipe unavailable after retries"));
     }
 }
