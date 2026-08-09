@@ -1,9 +1,9 @@
-// Windows GUI application: no console window alongside the overlay. With no
-// console, `eprintln!` output is invisible — fatal startup errors are surfaced
-// via [`report_error`] (message box + `%TEMP%\aetheris-overlay.log`) and
-// non-fatal warnings go to the log file via [`log_err`].
-#![windows_subsystem = "windows"]
-
+//! Windows GUI mode of the single `aetheris` binary. On entry [`main`] calls
+//! `FreeConsole()` so the overlay detaches from any console; with no console,
+//! `eprintln!` output is invisible — fatal startup errors are surfaced via
+//! [`report_error`] (message box + `%TEMP%\aetheris-overlay.log`) and
+//! non-fatal warnings go to the log file via [`log_err`].
+//!
 //! aetheris-overlay: zero-overhead DirectComposition telemetry panel.
 //!
 //! A single-threaded, no-injection overlay that polls the aetheris service
@@ -99,9 +99,10 @@ const CLASS_NAME: windows::core::PCWSTR = w!("aetheris_overlay");
 // ---------------------------------------------------------------------------
 
 /// Append a line to `%TEMP%\aetheris-overlay.log` (best-effort: a failure to
-/// open or write is ignored). This binary is `windows_subsystem = "windows"`,
-/// so there is no console for `eprintln!` to reach; non-fatal warnings (DPI,
-/// COM init, per-frame render failures) go here instead.
+/// open or write is ignored). The overlay mode detaches from its console
+/// (`FreeConsole()`), so there is no console for `eprintln!` to reach;
+/// non-fatal warnings (DPI, COM init, per-frame render failures) go here
+/// instead.
 fn log_err(msg: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("aetheris-overlay.log");
@@ -111,9 +112,9 @@ fn log_err(msg: &str) {
 }
 
 /// Surface a fatal startup error: append it to [`log_err`]'s log file and show
-/// it in a message box. With `windows_subsystem = "windows"` the message box is
-/// the only visible surface, so startup/argument errors must pop a box rather
-/// than `eprintln!` to nothing.
+/// it in a message box. With the console detached (`FreeConsole()`) the message
+/// box is the only visible surface, so startup/argument errors must pop a box
+/// rather than `eprintln!` to nothing.
 fn report_error(msg: &str) {
     log_err(msg);
     let wide: Vec<u16> = format!("aetheris-overlay\n\n{msg}")
@@ -288,14 +289,15 @@ fn poll_telemetry(pipe: &str) -> String {
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn main() {
-    if let Err(e) = run() {
-        report_error(&format!("{e}"));
-        std::process::exit(1);
-    }
+pub fn main(args: Vec<String>) -> i32 {
+    // Detach from any console: the overlay is a GUI mode, so no console window
+    // may appear alongside the panel. Errors surface via `report_error`
+    // (message box + log file) instead of `eprintln!`.
+    let _ = unsafe { windows::Win32::System::Console::FreeConsole() };
+    run(args)
 }
 
-fn run() -> Result<()> {
+fn run(args: Vec<String>) -> i32 {
     // Declare per-monitor DPI awareness (V2) before any window is created so
     // the 800x200 panel is sized and positioned in physical pixels on scaled
     // (high-DPI) displays rather than being DPI-scaled to a blurry mismatch.
@@ -319,13 +321,15 @@ fn run() -> Result<()> {
     if com == S_FALSE {
         log_err("COM already initialized on this thread (S_FALSE)");
     } else if com.is_err() {
-        return Err(com.into());
+        report_error(&windows::core::Error::from(com).to_string());
+        return 1;
     }
 
     // Parse `--pipe <name>`; default to the service's well-known pipe. Used by
-    // `poll_telemetry` (via `client_call`) on every 1 Hz tick.
+    // `poll_telemetry` (via `client_call`) on every 1 Hz tick. The `overlay`
+    // subcommand word has already been consumed by the dispatcher, so parse the
+    // passed slice directly (not `std::env::args()`).
     let mut pipe = DEFAULT_PIPE.to_string();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -335,16 +339,17 @@ fn run() -> Result<()> {
             }
             "--pipe" => {
                 report_error("--pipe requires a value");
-                std::process::exit(2);
+                return 2;
             }
             other => {
                 report_error(&format!("unknown argument: {other}"));
-                std::process::exit(2);
+                return 2;
             }
         }
     }
 
-    unsafe {
+    let result: windows::core::Result<()> = (|| {
+        unsafe {
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
 
         // Hidden top-most click-through popup. A NULL background brush means
@@ -519,7 +524,15 @@ fn run() -> Result<()> {
                 next_tick = std::time::Instant::now() + POLL_INTERVAL;
             }
         }
-    }
+        }
+        Ok(())
+    })();
 
-    Ok(())
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            report_error(&format!("{e}"));
+            1
+        }
+    }
 }

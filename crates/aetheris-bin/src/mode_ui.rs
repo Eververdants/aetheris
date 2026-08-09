@@ -1,8 +1,8 @@
-// Windows GUI application: no console window alongside the dialog. With no
-// console, `eprintln!` output is invisible — startup/fatal errors are surfaced
-// via [`report_error`] (message box + `%TEMP%\aetheris-ui.log`).
-#![windows_subsystem = "windows"]
-
+//! Windows GUI mode of the single `aetheris` binary. On entry [`main`] calls
+//! `FreeConsole()` so the dialog detaches from any console; with no console,
+//! `eprintln!` output is invisible — startup/fatal errors are surfaced via
+//! [`report_error`] (message box + `%TEMP%\aetheris-ui.log`).
+//!
 //! aetheris-ui: status panel + rule editor + save flow.
 //!
 //! A programmatic Win32 dialog (no `.rc`, no GUI framework) wired to the
@@ -391,9 +391,9 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 /// Append a line to `%TEMP%\aetheris-ui.log` (best-effort: a failure to open or
-/// write is ignored). This binary is `windows_subsystem = "windows"`, so there
-/// is no console for `eprintln!` to reach; the log file is the persistent
-/// record of errors that fall outside the message-box path.
+/// write is ignored). The UI mode detaches from its console (`FreeConsole()`),
+/// so there is no console for `eprintln!` to reach; the log file is the
+/// persistent record of errors that fall outside the message-box path.
 fn log_err(msg: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("aetheris-ui.log");
@@ -403,8 +403,8 @@ fn log_err(msg: &str) {
 }
 
 /// Surface a fatal error: append it to [`log_err`]'s log file and show it in a
-/// message box. With `windows_subsystem = "windows"` the dialog is the only
-/// visible surface, so startup/argument errors must pop a box rather than
+/// message box. With the console detached (`FreeConsole()`) the dialog is the
+/// only visible surface, so startup/argument errors must pop a box rather than
 /// `eprintln!` to nothing.
 fn report_error(msg: &str) {
     log_err(msg);
@@ -1701,17 +1701,19 @@ unsafe fn mk_list(parent: HWND, id: isize, x: i32, y: i32, w: i32, h: i32, hinst
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn main() {
-    if let Err(e) = run() {
-        report_error(&format!("{e}"));
-        std::process::exit(1);
-    }
+pub fn main(args: Vec<String>) -> i32 {
+    // Detach from any console: the UI is a GUI mode, so no console window may
+    // appear alongside the dialog. Errors surface via `report_error` (message
+    // box + log file) instead of `eprintln!`.
+    let _ = unsafe { windows::Win32::System::Console::FreeConsole() };
+    run(args)
 }
 
-fn run() -> windows::core::Result<()> {
-    // Parse `--pipe <name>`; default to the service's well-known pipe.
+fn run(args: Vec<String>) -> i32 {
+    // Parse `--pipe <name>`; default to the service's well-known pipe. The
+    // `ui` subcommand word has already been consumed by the dispatcher, so
+    // parse the passed slice directly (not `std::env::args()`).
     let mut pipe = DEFAULT_PIPE.to_string();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1721,11 +1723,11 @@ fn run() -> windows::core::Result<()> {
             }
             "--pipe" => {
                 report_error("--pipe requires a value");
-                std::process::exit(2);
+                return 2;
             }
             other => {
                 report_error(&format!("unknown argument: {other}"));
-                std::process::exit(2);
+                return 2;
             }
         }
     }
@@ -1744,88 +1746,97 @@ fn run() -> windows::core::Result<()> {
     // WM_IPC_RESULT is dispatched. With the service down the dialog is still
     // responsive — client_call's retry budget is spent off the UI thread, and
     // the load error (if any) surfaces in the result line when it lands.
-
-    let hwnd: HWND;
-    unsafe {
-        let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
-
-        let wc = WNDCLASSW {
-            style: Default::default(),
-            lpfnWndProc: Some(wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
-            lpszMenuName: PCWSTR::null(),
-            lpszClassName: w!("aetheris_main"),
-        };
-
-        if RegisterClassW(&wc) == 0 {
-            return Err(windows::core::Error::from_thread());
-        }
-
-        // Size the window so the 900x520 client layout fits exactly.
-        let mut rc = RECT {
-            left: 0,
-            top: 0,
-            right: 900,
-            bottom: 520,
-        };
-        let _ = AdjustWindowRectEx(
-            &mut rc,
-            WS_OVERLAPPEDWINDOW,
-            false,
-            WINDOW_EX_STYLE::default(),
-        );
-        let win_w = rc.right - rc.left;
-        let win_h = rc.bottom - rc.top;
-
-        // Hand the pipe to the dialog via lpParam (consumed in WM_CREATE).
-        let init = Box::into_raw(Box::new(InitData { pipe }));
-
-        hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("aetheris_main"),
-            w!("aetheris"),
-            WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            win_w,
-            win_h,
-            None,
-            None,
-            Some(hinstance),
-            Some(init as *mut c_void),
-        )?;
-
-        let _ = ShowWindow(hwnd, SW_SHOW);
-    }
-
-    // Kick off the startup config load and status pull on worker threads; the
-    // outcomes are applied on the UI thread when the posted WM_IPC_RESULT
-    // messages arrive (the Refresh button re-pulls later).
-    unsafe {
-        let s = state_mut(hwnd);
-        s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
-        s.spawn(hwnd, IpcCall::GetState, Request::GetState);
-    }
-
-    // Standard message loop; returns when WM_QUIT arrives (window closed).
-    let mut msg = MSG::default();
-    loop {
-        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if r.0 == 0 {
-            break; // WM_QUIT
-        }
-        if r.0 == -1 {
-            return Err(windows::core::Error::from_thread());
-        }
+    let result: windows::core::Result<()> = (|| {
+        let hwnd: HWND;
         unsafe {
-            _ = TranslateMessage(&msg);
-            _ = DispatchMessageW(&msg);
+            let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
+
+            let wc = WNDCLASSW {
+                style: Default::default(),
+                lpfnWndProc: Some(wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinstance,
+                hIcon: LoadIconW(None, IDI_APPLICATION)?,
+                hCursor: LoadCursorW(None, IDC_ARROW)?,
+                hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+                lpszMenuName: PCWSTR::null(),
+                lpszClassName: w!("aetheris_main"),
+            };
+
+            if RegisterClassW(&wc) == 0 {
+                return Err(windows::core::Error::from_thread());
+            }
+
+            // Size the window so the 900x520 client layout fits exactly.
+            let mut rc = RECT {
+                left: 0,
+                top: 0,
+                right: 900,
+                bottom: 520,
+            };
+            let _ = AdjustWindowRectEx(
+                &mut rc,
+                WS_OVERLAPPEDWINDOW,
+                false,
+                WINDOW_EX_STYLE::default(),
+            );
+            let win_w = rc.right - rc.left;
+            let win_h = rc.bottom - rc.top;
+
+            // Hand the pipe to the dialog via lpParam (consumed in WM_CREATE).
+            let init = Box::into_raw(Box::new(InitData { pipe }));
+
+            hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("aetheris_main"),
+                w!("aetheris"),
+                WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                win_w,
+                win_h,
+                None,
+                None,
+                Some(hinstance),
+                Some(init as *mut c_void),
+            )?;
+
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+
+        // Kick off the startup config load and status pull on worker threads;
+        // the outcomes are applied on the UI thread when the posted
+        // WM_IPC_RESULT messages arrive (the Refresh button re-pulls later).
+        unsafe {
+            let s = state_mut(hwnd);
+            s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
+            s.spawn(hwnd, IpcCall::GetState, Request::GetState);
+        }
+
+        // Standard message loop; returns when WM_QUIT arrives (window closed).
+        let mut msg = MSG::default();
+        loop {
+            let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+            if r.0 == 0 {
+                break; // WM_QUIT
+            }
+            if r.0 == -1 {
+                return Err(windows::core::Error::from_thread());
+            }
+            unsafe {
+                _ = TranslateMessage(&msg);
+                _ = DispatchMessageW(&msg);
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            report_error(&format!("{e}"));
+            1
         }
     }
-    Ok(())
 }

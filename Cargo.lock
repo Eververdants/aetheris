@@ -3,10 +3,12 @@
 version = 4
 
 [[package]]
-name = "aetheris-cli"
+name = "aetheris-bin"
 version = "1.0.0"
 dependencies = [
  "aetheris-core",
+ "ctrlc",
+ "windows",
 ]
 
 [[package]]
@@ -20,31 +22,6 @@ dependencies = [
  "ntapi",
  "serde",
  "toml",
- "windows",
-]
-
-[[package]]
-name = "aetheris-overlay"
-version = "1.0.0"
-dependencies = [
- "aetheris-core",
- "windows",
-]
-
-[[package]]
-name = "aetheris-service"
-version = "1.0.0"
-dependencies = [
- "aetheris-core",
- "ctrlc",
- "windows",
-]
-
-[[package]]
-name = "aetheris-ui"
-version = "1.0.0"
-dependencies = [
- "aetheris-core",
  "windows",
 ]
 

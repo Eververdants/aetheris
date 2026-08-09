@@ -1,11 +1,16 @@
+//! aetheris `cli` subcommand: one-shot pipe commands.
+//!
+//! Moved verbatim from the old `aetheris-cli` binary. Parses its own args from
+//! the passed slice (the `cli` subcommand word is already consumed by the
+//! dispatcher), keeps stderr, and returns the process exit code (0/1/2).
+
 use aetheris_core::ipc::{Response, Request, client_call, DEFAULT_PIPE};
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+pub fn main(args: Vec<String>) -> i32 {
     let mut pipe = DEFAULT_PIPE.to_string();
     let mut cmd: Option<String> = None;
     let mut arg: Option<String> = None;
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--pipe" => {
@@ -30,8 +35,8 @@ fn main() {
         Some("reload") => Request::ReloadConfig,
         Some("query") => Request::QueryProcess(arg.unwrap_or_default()),
         _ => {
-            eprintln!("usage: aetheris-cli [--pipe NAME] get-state|reload|query <name>");
-            std::process::exit(2);
+            eprintln!("usage: aetheris cli [--pipe NAME] get-state|reload|query <name>");
+            return 2;
         }
     };
 
@@ -63,7 +68,8 @@ fn main() {
         Ok(Response::Process(None)) => println!("not found"),
         Err(e) => {
             eprintln!("error: {e}");
-            std::process::exit(1);
+            return 1;
         }
     }
+    0
 }
