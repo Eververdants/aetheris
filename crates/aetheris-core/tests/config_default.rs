@@ -15,7 +15,7 @@ fn default_config_path_is_programdata() {
 
 #[test]
 fn default_config_str_is_valid_toml() {
-    let s = aetheris_core::config::default_config_str();
+    let s = aetheris_core::config::default_config_str(aetheris_core::i18n::Lang::En);
     let cfg = Config::from_str(&s).expect("default config parses");
     assert!(cfg.validate().is_ok());
 }

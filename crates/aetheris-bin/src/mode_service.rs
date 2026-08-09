@@ -49,7 +49,7 @@ pub fn main(args: Vec<String>) -> i32 {
                 );
             }
         }
-        match std::fs::write(&cfg_path, default_config_str()) {
+        match std::fs::write(&cfg_path, default_config_str(aetheris_core::i18n::detect_system())) {
             Ok(()) => println!("created default config: {}", cfg_path.display()),
             Err(e) => eprintln!(
                 "warning: could not write default config {}: {e}",

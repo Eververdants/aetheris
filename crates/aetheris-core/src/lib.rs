@@ -8,6 +8,7 @@ pub mod etw;
 pub mod events;
 pub mod foreground;
 pub mod hotkey;
+pub mod i18n;
 pub mod ipc;
 pub mod log;
 pub mod network;

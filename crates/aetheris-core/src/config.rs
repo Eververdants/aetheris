@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::Lang;
+
 pub const DEFAULT_PROTECTED: &[&str] = &[
     "csrss.exe",
     "services.exe",
@@ -123,11 +125,9 @@ pub fn default_config_path() -> PathBuf {
     base.join("aetheris").join("aetheris.toml")
 }
 
-/// First-run template written before [`Config::load`]: the repo's example
-/// `aetheris.toml` content, fully commented so nothing is active until the
-/// user uncomments/edits. A no-op template parses to a valid (default) config.
-pub fn default_config_str() -> String {
-    r#"# aetheris default configuration - auto-generated on first run.
+/// English template: the repo's example `aetheris.toml`, fully commented so
+/// nothing is active until the user uncomments/edits.
+const EN_TEMPLATE: &str = r#"# aetheris default configuration - auto-generated on first run.
 # Edit via `aetheris ui` or this file; the service reads this at startup and on
 # `ReloadConfig`. Everything below is commented as a template: uncomment to
 # enable.
@@ -181,8 +181,74 @@ pub fn default_config_str() -> String {
 # enabled = true
 # nagle = true
 # netbios = false
-"#
-    .to_string()
+"#;
+
+/// Chinese template: the same example `aetheris.toml` with translated comments.
+/// The TOML structure and values are byte-identical to [`EN_TEMPLATE`] — only
+/// the comment text differs.
+const ZH_TEMPLATE: &str = r#"# aetheris 默认配置 - 首次运行时自动生成。
+# 可通过 `aetheris ui` 或本文件编辑;服务在启动及收到
+# `ReloadConfig` 时读取。以下全部以注释形式作为模板:取消注释以启用。
+
+# [game]
+# boost_on_start = true
+# processes = ["steam_app_*.exe", "game.exe"]
+
+# # 可选:进入游戏模式时清理一次 Windows 待机内存列表,以便游戏的
+# # 工作集可以使用空闲内存页。默认关闭。不可逆,但无害
+# # (系统会在需要时重建待机列表)。
+# purge_standby_on_boost = false
+
+# # 游戏运行时被节流的进程。每个条目按进程映像名,不区分大小写,
+# # 以子串方式匹配。
+# [[background]]
+# name = "chrome.exe"
+# suspend = false
+# priority = "below_normal"
+# # 通过 Job Object 实现真正的跨进程 CPU 上限(硬上限)。`qos_cpu_quota`
+# # 是机器总 CPU 容量的百分比(内部以 0.01% 为单位,CpuRate = quota * 100)。
+# # 仅应用于尚不在任何 Job 中的进程;已在 Job 中的进程会降级为无上限并
+# # 发出警告(优先级 / 亲和性仍然生效)。上限在游戏退出或服务停止时清除。
+# # 注意:浏览器和许多应用已经在 Job 中,因此 QoS 往往无法绑定它们 -
+# # 它对 aetheris 新启动的进程工作良好。
+# qos_cpu_quota = 50
+
+# [[background]]
+# name = "msedge.exe"
+# suspend = false
+# priority = "below_normal"
+
+# # 内存清理是显式选择,只对非关键应用安全。
+# [[background]]
+# name = "spotify.exe"
+# trim_memory = true
+
+# # 始终生效的规则(任意模式)。
+# [[rule]]
+# name = "updater.exe"
+# priority = "idle"
+
+# # 额外保护进程(默认项永远无法移除)。
+# protected_extra = []
+
+# # 网络 QoS 调整是显式选择(所有标志默认均为 false),在进入游戏模式时
+# # 应用,退出时还原。它们写入 HKLM 下的注册表值,因此服务必须以管理员
+# # 权限运行才能使用。
+# [network]
+# enabled = true
+# nagle = true
+# netbios = false
+"#;
+
+/// First-run template written before [`Config::load`]: the repo's example
+/// `aetheris.toml` content in the given language, fully commented so nothing
+/// is active until the user uncomments/edits. A no-op template parses to a
+/// valid (default) config in both languages.
+pub fn default_config_str(lang: Lang) -> String {
+    match lang {
+        Lang::En => EN_TEMPLATE.to_string(),
+        Lang::Zh => ZH_TEMPLATE.to_string(),
+    }
 }
 
 #[derive(Debug)]
