@@ -41,8 +41,10 @@ pub enum ServiceMsg {
         cfg: Config,
         reply: Sender<Result<String, String>>,
     },
-    /// Launch the overlay process (`aetheris-overlay.exe` next to the service).
-    /// Sent by the hotkey watcher thread on a configured hotkey press.
+    /// Toggle the overlay: close the running overlay window if one exists
+    /// (graceful `WM_CLOSE`), otherwise launch `aetheris-overlay.exe` next to
+    /// the service. Sent by the hotkey watcher thread on a configured hotkey
+    /// press.
     ToggleOverlay,
     Stop,
 }
@@ -452,14 +454,39 @@ impl Service {
     }
 }
 
-/// Launch `aetheris-overlay.exe` next to the service binary, if present.
+/// Toggle the overlay: close the running overlay window if one exists,
+/// otherwise launch `aetheris-overlay.exe` next to the service binary.
 ///
 /// This is the overlay toggle: the hotkey watcher sends [`ServiceMsg::ToggleOverlay`]
-/// and the main loop calls this. A missing overlay binary or a failed
-/// `CreateProcessW` is non-fatal — the failure is logged and the service keeps
-/// running. The process handles are closed immediately after spawn: the overlay
-/// is a standalone window process expected to detach and outlive the service.
+/// and the main loop calls this. Pressing the hotkey again finds the running
+/// overlay window (class `aetheris_overlay`) and posts `WM_CLOSE` to it — the
+/// overlay exits on `WM_CLOSE` (`WM_DESTROY` → `PostQuitMessage` → exit 0), so
+/// a second press can never stack a duplicate panel. If no window exists the
+/// overlay is launched. A missing overlay binary or a failed `CreateProcessW`
+/// is non-fatal — the failure is logged and the service keeps running. The
+/// process handles are closed immediately after spawn: the overlay is a
+/// standalone window process expected to detach and outlive the service.
 fn launch_overlay() {
+    // Close the running overlay window (class `aetheris_overlay`) instead of
+    // launching a duplicate. FindWindowW returns Err when no such window
+    // exists, so `Ok` here means the overlay is up and we toggle it off.
+    let existing = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+            windows::core::w!("aetheris_overlay"),
+            None,
+        )
+    };
+    if let Ok(hwnd) = existing {
+        let _ = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(hwnd),
+                windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            )
+        };
+        return;
+    }
     let overlay = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))

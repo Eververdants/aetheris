@@ -10,7 +10,7 @@
 //!
 //! 1. `CreateDXGIFactory2` → `D3D11CreateDevice` (hardware, `BGRA_SUPPORT` for
 //!    D2D interop) → `IDXGIFactory2::CreateSwapChainForComposition` with an
-//!    `DXGI_ALPHA_MODE_PREMULTIPLIED` flip-model swapchain (800x140).
+//!    `DXGI_ALPHA_MODE_PREMULTIPLIED` flip-model swapchain (800x200).
 //! 2. `DCompositionCreateDevice` (on the device's `IDXGIDevice`) →
 //!    `IDCompositionDevice::CreateVisual` → `SetContent(swapchain)` →
 //!    `CreateTargetForHwnd` → `SetRoot` → `Commit`. The visual supplies all
@@ -255,7 +255,7 @@ fn main() {
 
 fn run() -> Result<()> {
     // Declare per-monitor DPI awareness (V2) before any window is created so
-    // the 800x140 panel is sized and positioned in physical pixels on scaled
+    // the 800x200 panel is sized and positioned in physical pixels on scaled
     // (high-DPI) displays rather than being DPI-scaled to a blurry mismatch.
     // Failure is non-fatal: if the context is already set (e.g. by a manifest)
     // or the OS predates Windows 10 1703 the overlay still runs, just with
