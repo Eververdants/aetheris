@@ -173,6 +173,13 @@ struct UiState {
     /// thread, so Save is also refused until this is set (the config may not be
     /// loaded yet even though no error has been reported).
     config_loaded: bool,
+    /// True while a `SaveConfig` is in flight on a worker thread. Save is
+    /// refused while set, so a second click can't spawn a second worker with a
+    /// newer config that the one-shot pipe server applies out of order — the
+    /// server persists in *connection* order, not click order, so an older
+    /// config could otherwise be written last. Cleared when the `Save`
+    /// `WM_IPC_RESULT` is dispatched (success or error).
+    save_in_flight: bool,
     /// True while a list is being mutated/rebuild from code. The `WM_NOTIFY`
     /// (`LVN_ITEMCHANGED`) handler returns immediately while this is set, so a
     /// selection change triggered by `list_set_sel`/`LVM_SETITEMSTATE` cannot
@@ -253,6 +260,10 @@ struct InitData {
 struct PendingIpc {
     /// Set once the dialog is being torn down. Workers that observe it reclaim
     /// their own box instead of posting to a dead window.
+    ///
+    /// Sticky for the process lifetime: this is a single-window tool, so the
+    /// flag is never reset — after `WM_DESTROY` no further window exists and no
+    /// more posts can legitimately be made.
     destroyed: bool,
     boxes: Vec<usize>,
 }
@@ -1052,6 +1063,10 @@ impl UiState {
     /// config on disk, so Save is refused until a successful load (startup or
     /// "Reload cfg") — tracked by `init_error`/`config_loaded`.
     unsafe fn do_save(&mut self, hwnd: HWND) {
+        if self.save_in_flight {
+            self.set_result(hwnd, "Save already in progress");
+            return;
+        }
         if self.init_error.is_some() || !self.config_loaded {
             self.set_result(
                 hwnd,
@@ -1066,12 +1081,16 @@ impl UiState {
             Err(e) => self.set_result(hwnd, &format!("Config invalid: {e}")),
             Ok(_) => {
                 let cfg = self.cfg.clone();
+                self.save_in_flight = true;
                 self.spawn(hwnd, IpcCall::Save, Request::SaveConfig(cfg));
             }
         }
     }
 
     unsafe fn on_save_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        // The one in-flight save has landed (success or error); clear the flag so
+        // the next click starts a fresh save.
+        self.save_in_flight = false;
         match result {
             Ok(Response::SaveConfig(Ok(m))) => self.set_result(hwnd, &format!("Saved: {m}")),
             Ok(Response::SaveConfig(Err(e))) => self.set_result(hwnd, &format!("Save failed: {e}")),
@@ -1591,6 +1610,7 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         cfg: Config::default(),
         init_error: None,
         config_loaded: false,
+        save_in_flight: false,
         busy: false,
         mode: String::new(),
         boosted: Vec::new(),
