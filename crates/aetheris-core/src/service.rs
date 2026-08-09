@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 
+use windows::Win32::Foundation::HANDLE;
+
 use crate::actions::OsBackend;
 use crate::config::Config;
 use crate::events::{ForegroundEvent, ProcessEvent};
@@ -305,10 +307,15 @@ impl Service {
         let state = self.state.clone();
         let ipc_tx = tx.clone();
         // Interactive Users DACL so a non-elevated aetheris-cli can reach the
-        // elevated service; SYSTEM retains full access.
+        // elevated service; SYSTEM retains full access. The DACL grants
+        // transport-level read+write only; the file-rewriting SaveConfig is
+        // separately gated below on the connected client's elevation.
         let ipc_server = IpcServer::new_with_dacl(DEFAULT_PIPE, DEFAULT_PIPE_DACL);
         std::thread::spawn(move || {
-            let mut handle_req = |req: &Request| -> Response {
+            // The handler receives the connected pipe HANDLE (IpcServer::run
+            // passes it through) so privileged requests can check the client's
+            // token before the connection is torn down.
+            let mut handle_req = |pipe: HANDLE, req: &Request| -> Response {
                 match req {
                     Request::GetState => {
                         let s = state.read().unwrap();
@@ -336,6 +343,13 @@ impl Service {
                         Response::Reload("queued".into())
                     }
                     Request::SaveConfig(cfg) => {
+                        // SaveConfig rewrites the admin-owned config file, so it
+                        // requires an elevated client. Fail closed: an Err from
+                        // the elevation check counts as not elevated, and the
+                        // file is never touched in that case.
+                        if !crate::ipc::is_client_elevated(pipe).unwrap_or(false) {
+                            return Response::SaveConfig(Err("requires elevation".into()));
+                        }
                         let (tx, rx) = channel();
                         let _ = ipc_tx.send(ServiceMsg::SaveConfig {
                             cfg: cfg.clone(),

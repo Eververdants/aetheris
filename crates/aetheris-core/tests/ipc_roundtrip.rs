@@ -4,9 +4,20 @@ use std::time::Duration;
 
 use aetheris_core::config::{Config, GameConfig};
 use aetheris_core::ipc::{client_call, IpcServer, ProcessInfo, Request, Response, StateSnapshot};
+use windows::Win32::Foundation::HANDLE;
 
 const TEST_PIPE: &str = r"\\.\pipe\aetheris_test";
 const TEST_PIPE_DACL: &str = r"\\.\pipe\aetheris_test_dacl";
+
+/// Unit: the DACL grants IU read+write but not WRITE_DAC/WRITE_OWNER.
+#[test]
+fn dacl_least_privilege_for_interactive_users() {
+    let d = aetheris_core::ipc::DEFAULT_PIPE_DACL;
+    assert!(d.contains("(A;;GA;;;SY)"), "SYSTEM must retain full access");
+    assert!(d.contains("(A;;GR;;;IU)"), "IU must get read");
+    assert!(d.contains("(A;;GW;;;IU)"), "IU must get write");
+    assert!(!d.contains("(A;;GA;;;IU)"), "IU must NOT get generic-all (WRITE_DAC/WRITE_OWNER)");
+}
 
 /// The one-shot server tears each connection down before recreating the next
 /// pipe instance, so a client call can fail transiently even though a previous
@@ -36,7 +47,7 @@ fn call_with_retry(pipe: &str, req: &Request) -> Result<Response, String> {
 fn roundtrip_get_state_and_query() {
     let server = IpcServer::new(TEST_PIPE);
     let t = thread::spawn(move || {
-        let mut handler = |req: &Request| -> Response {
+        let mut handler = |_pipe: HANDLE, req: &Request| -> Response {
             match req {
                 Request::GetState => Response::State(StateSnapshot {
                     mode: "Normal".into(),
@@ -95,7 +106,7 @@ fn roundtrip_get_state_and_query() {
 fn pipe_with_interactive_dacl_connectable_from_same_token() {
     let server = IpcServer::new_with_dacl(TEST_PIPE_DACL, aetheris_core::ipc::DEFAULT_PIPE_DACL);
     let t = thread::spawn(move || {
-        let mut h = |_req: &Request| Response::State(StateSnapshot::default());
+        let mut h = |_pipe: HANDLE, _req: &Request| Response::State(StateSnapshot::default());
         let _ = server.run(&mut h);
     });
 

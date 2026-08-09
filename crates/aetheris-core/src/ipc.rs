@@ -20,15 +20,19 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_ELEVATION,
+    TOKEN_QUERY, TokenElevation,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW, PIPE_READMODE_BYTE,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, ImpersonateNamedPipeClient,
+    WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 use crate::config::Config;
 
@@ -36,15 +40,18 @@ use crate::config::Config;
 pub const DEFAULT_PIPE: &str = r"\\.\pipe\aetheris";
 
 /// Default DACL for the service pipe: SYSTEM full access plus Interactive Users
-/// (`IU`, S-1-5-4) full access.
+/// (`IU`, S-1-5-4) generic read + generic write.
 ///
-/// `GA` (generic all) on a control pipe is acceptable: GetState/QueryProcess
-/// are read-only, ReloadConfig only re-reads the admin-owned config file, and
-/// SaveConfig (v2) writes the same file. Granting the interactive-user group
-/// access is the intended non-elevated-CLI support (an elevated service must be
-/// reachable from a normal `aetheris-cli`). SYSTEM retains full access, and no
-/// other SID is granted anything, so the DACL is no broader than needed.
-pub const DEFAULT_PIPE_DACL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;IU)";
+/// Least privilege: IU is deliberately *not* granted `GA` (generic all), which
+/// would map to WRITE_DAC / WRITE_OWNER and let any interactive client replace
+/// the pipe's security descriptor. `GR|GW` is exactly what the non-elevated
+/// `aetheris-cli` requests (`GENERIC_READ|GENERIC_WRITE` in [`client_call`]) and
+/// enough for the read-only surface (GetState/GetConfig/QueryProcess, harmless
+/// ReloadConfig re-read). Write access to the config file via SaveConfig is
+/// separately gated on client elevation ([`is_client_elevated`]), so this DACL
+/// grants the transport, not the privilege. SYSTEM retains full access, and no
+/// other SID is granted anything.
+pub const DEFAULT_PIPE_DACL: &str = "D:P(A;;GA;;;SY)(A;;GR;;;IU)(A;;GW;;;IU)";
 
 /// Largest message accepted in either direction.
 const MAX_MSG: usize = 1 << 20;
@@ -122,7 +129,13 @@ impl IpcServer {
 
     /// Blocking accept/serve loop. Runs forever; returns `Err` on a hard pipe
     /// error and `Ok(())` on graceful shutdown (v1 never exits except on error).
-    pub fn run<F: FnMut(&Request) -> Response>(&self, handler: &mut F) -> Result<(), String> {
+    ///
+    /// The handler receives the connected pipe `HANDLE` as its first argument
+    /// (added in v2.1) so request handlers can act on the client's identity —
+    /// e.g. [`is_client_elevated`] to gate privileged requests on the connected
+    /// client's token before any impersonated security context is torn down by
+    /// `cleanup`.
+    pub fn run<F: FnMut(HANDLE, &Request) -> Response>(&self, handler: &mut F) -> Result<(), String> {
         let name: Vec<u16> = self
             .pipe_name
             .encode_utf16()
@@ -195,7 +208,7 @@ impl IpcServer {
                 }
             };
 
-            let resp = handler(&req);
+            let resp = handler(pipe, &req);
             let resp_buf = match bincode::serialize(&resp) {
                 Ok(b) => b,
                 Err(e) => {
@@ -246,6 +259,55 @@ impl IpcServer {
         };
         Ok(Some((sa, SecurityDescriptorGuard(psd.0))))
     }
+}
+
+/// Determine whether the client connected to `pipe` holds an elevated token.
+///
+/// The check impersonates the named-pipe client (the calling thread's security
+/// context becomes the client's), opens the calling thread's *impersonation*
+/// token, and queries its `TokenElevation` level. [`OpenThreadToken`] — not
+/// [OpenProcessToken](windows::Win32::System::Threading::OpenProcessToken) — is
+/// used on purpose: impersonation swaps the calling
+/// thread's token while the process token is untouched, so
+/// `OpenProcessToken(GetCurrentProcess())` would report the *service's* own
+/// elevation, not the client's.
+///
+/// `RevertToSelf` runs on every path, including a token-open or token-read
+/// failure, so the thread is never left impersonating a client after the check
+/// (an impersonating thread would otherwise carry the client's identity into
+/// the next `CreateNamedPipeW`/handler, and into any accidental cross-thread
+/// access).
+///
+/// Fail closed: any API failure returns `Err`, which callers must treat as
+/// "not elevated" (the `SaveConfig` gate does exactly that via `unwrap_or`).
+pub fn is_client_elevated(pipe: HANDLE) -> Result<bool, String> {
+    unsafe {
+        ImpersonateNamedPipeClient(pipe).map_err(|e| format!("ImpersonateNamedPipeClient: {e}"))?;
+    }
+
+    // The thread's impersonation token after ImpersonateNamedPipeClient is the
+    // connected client's token. `false` for bOpenAsSelf: the impersonation
+    // token, not the process token, carries the client's identity.
+    let mut token: HANDLE = HANDLE(std::ptr::null_mut());
+    let open = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, false, &mut token) };
+    // Always revert, regardless of the token-open outcome.
+    let _ = unsafe { RevertToSelf() };
+    open.map_err(|e| format!("OpenThreadToken (client token): {e}"))?;
+
+    let mut elev = TOKEN_ELEVATION::default();
+    let mut sz = 0u32;
+    let r = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elev as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut sz,
+        )
+    };
+    let _ = unsafe { CloseHandle(token) };
+    r.map_err(|e| format!("GetTokenInformation: {e}"))?;
+    Ok(elev.TokenIsElevated != 0)
 }
 
 /// Owns a security descriptor allocated by
