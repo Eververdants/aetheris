@@ -1532,7 +1532,7 @@ impl UiState {
     unsafe fn on_save_elevation(&mut self, hwnd: HWND, msg: &str) {
         if needs_elevation(msg) && !aetheris_core::actions::is_elevated() {
             let wide = to_wide(
-                "Save requires administrator rights.\n\nRelaunch aetheris as administrator and try again?",
+                "Save requires administrator rights.\n\nRelaunching as administrator will close this editor and any unsaved changes will be lost.\n\nRelaunch aetheris as administrator and try again?",
             );
             let rc = MessageBoxW(
                 Some(hwnd),
