@@ -7,6 +7,7 @@ pub mod config;
 pub mod etw;
 pub mod events;
 pub mod foreground;
+pub mod hotkey;
 pub mod ipc;
 pub mod log;
 pub mod network;

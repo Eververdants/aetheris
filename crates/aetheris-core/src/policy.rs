@@ -430,6 +430,7 @@ mod tests {
             rule: vec![],
             protected_extra: vec![],
             network: crate::config::NetworkConfig::default(),
+            overlay: crate::config::OverlayConfig::default(),
         }
     }
 

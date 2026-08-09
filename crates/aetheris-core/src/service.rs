@@ -41,6 +41,9 @@ pub enum ServiceMsg {
         cfg: Config,
         reply: Sender<Result<String, String>>,
     },
+    /// Launch the overlay process (`aetheris-overlay.exe` next to the service).
+    /// Sent by the hotkey watcher thread on a configured hotkey press.
+    ToggleOverlay,
     Stop,
 }
 
@@ -144,6 +147,10 @@ impl Service {
                 // Ctrl-C mid-game never leaves processes suspended or
                 // down-prioritized.
                 self.engine.exit_game_mode();
+                Ok(())
+            }
+            ServiceMsg::ToggleOverlay => {
+                launch_overlay();
                 Ok(())
             }
         };
@@ -300,6 +307,34 @@ impl Service {
             }
         });
 
+        // Overlay hotkey: a configurable global hotkey launches the overlay on
+        // demand. The watcher runs on its own thread + message-only window, so
+        // it stays independent of the foreground watcher's pump. A hotkey that
+        // fails to parse is silently disabled (config default); one that fails
+        // to register is logged and the service keeps running without it.
+        if let Some(hk) = self
+            .engine
+            .cfg()
+            .overlay
+            .hotkey
+            .as_deref()
+            .and_then(crate::hotkey::parse_hotkey)
+        {
+            let hotkey_tx = tx.clone();
+            match crate::hotkey::HotkeyWatcher::start(hk) {
+                Ok(watcher) => {
+                    std::thread::spawn(move || {
+                        while watcher.recv().is_some() {
+                            if hotkey_tx.send(ServiceMsg::ToggleOverlay).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(e) => log::warn(format!("overlay hotkey could not start: {e}")),
+            }
+        }
+
         // IPC server: answers GetState/QueryProcess/GetConfig from the shared
         // snapshot (refreshed by the main loop, throttled to
         // SNAPSHOT_REFRESH_INTERVAL), forwards reloads to the main loop, and
@@ -408,9 +443,62 @@ impl Service {
                 ServiceMsg::Foreground(ev) => {
                     let _ = self.handle_message(&ServiceMsg::Foreground(ev));
                 }
+                ServiceMsg::ToggleOverlay => {
+                    let _ = self.handle_message(&ServiceMsg::ToggleOverlay);
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// Launch `aetheris-overlay.exe` next to the service binary, if present.
+///
+/// This is the overlay toggle: the hotkey watcher sends [`ServiceMsg::ToggleOverlay`]
+/// and the main loop calls this. A missing overlay binary or a failed
+/// `CreateProcessW` is non-fatal — the failure is logged and the service keeps
+/// running. The process handles are closed immediately after spawn: the overlay
+/// is a standalone window process expected to detach and outlive the service.
+fn launch_overlay() {
+    let overlay = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+        .map(|dir| dir.join("aetheris-overlay.exe"));
+    match overlay {
+        Some(p) if p.exists() => {
+            let w: Vec<u16> = p
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let si = windows::Win32::System::Threading::STARTUPINFOW {
+                cb: std::mem::size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
+                ..Default::default()
+            };
+            let mut pi = windows::Win32::System::Threading::PROCESS_INFORMATION::default();
+            let ok = unsafe {
+                windows::Win32::System::Threading::CreateProcessW(
+                    windows::core::PCWSTR(w.as_ptr()),
+                    None,
+                    None,
+                    None,
+                    false,
+                    windows::Win32::System::Threading::CREATE_NO_WINDOW,
+                    None,
+                    None,
+                    &si,
+                    &mut pi,
+                )
+            };
+            match ok {
+                Ok(()) => {
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(pi.hProcess) };
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(pi.hThread) };
+                }
+                Err(e) => log::warn(format!("overlay launch failed: {e}")),
+            }
+        }
+        _ => log::warn("aetheris-overlay.exe not found next to the service"),
     }
 }
 

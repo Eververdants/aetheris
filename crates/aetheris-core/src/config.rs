@@ -87,6 +87,15 @@ pub struct NetworkConfig {
     pub netbios: bool,
 }
 
+/// Overlay launcher settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OverlayConfig {
+    /// Global hotkey that opens the overlay, e.g. `"ctrl+alt+o"`. Absent or
+    /// empty disables the hotkey.
+    #[serde(default)]
+    pub hotkey: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -99,6 +108,8 @@ pub struct Config {
     pub protected_extra: Vec<String>,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub overlay: OverlayConfig,
 }
 
 #[derive(Debug)]
@@ -434,6 +445,15 @@ processes = []
         // the system standby list unless the user asked for it).
         let cfg = Config::from_str("[game]\nprocesses=[]\n").unwrap();
         assert!(!cfg.game.purge_standby_on_boost);
+    }
+
+    #[test]
+    fn overlay_hotkey_config_parse() {
+        // `[overlay] hotkey` present → parsed; absent → None (disabled).
+        let c = Config::from_str("[overlay]\nhotkey = \"ctrl+alt+o\"\n").unwrap();
+        assert_eq!(c.overlay.hotkey.as_deref(), Some("ctrl+alt+o"));
+        let c2 = Config::from_str("[game]\nprocesses=[]\n").unwrap();
+        assert!(c2.overlay.hotkey.is_none());
     }
 
     #[test]
