@@ -13,8 +13,9 @@ use std::sync::Mutex;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+    SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TokenElevation,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject,
@@ -111,6 +112,33 @@ pub fn mask_from_cores(cores: &[u8]) -> u64 {
 /// [`OsBackend::apply`] must take the group-aware CPU-Sets affinity path.
 pub fn logical_cpu_count() -> u32 {
     unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) }
+}
+
+/// Whether the current process holds an elevated (administrator) token.
+///
+/// Queries the process token's `TokenElevation` level via [`GetTokenInformation`].
+/// Used by the UI to decide whether a `SaveConfig` refusal that demands
+/// elevation should trigger the relaunch-as-admin path. Fail closed: an API
+/// failure (token open/read) reports `false` — treat as not elevated.
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut token: HANDLE = HANDLE(std::ptr::null_mut());
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut sz = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elev as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut sz,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elev.TokenIsElevated != 0
+    }
 }
 
 /// Builds the [`GROUP_AFFINITY`] entries for `SetProcessDefaultCpuSetMasks` from

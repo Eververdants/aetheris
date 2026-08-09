@@ -46,6 +46,7 @@
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -73,9 +74,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CreateIconIndirect, CreatePopupMenu,
     CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
-    GWLP_USERDATA, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, KillTimer, LoadCursorW,
-    LoadIconW, MB_ICONERROR, MB_OK, MESSAGEBOX_STYLE, MessageBoxW, MF_SEPARATOR, MF_STRING, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+    GWLP_USERDATA, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, IDYES, KillTimer,
+    LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MESSAGEBOX_STYLE,
+    MessageBoxW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SendMessageW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, SIZE_MINIMIZED, SW_HIDE, SW_SHOW,
     TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NOTIFY, WM_RBUTTONUP, WM_SIZE,
@@ -127,6 +129,15 @@ const WM_IPC_RESULT: u32 = WM_APP + 1;
 /// carries the mouse message — `WM_LBUTTONUP` / `WM_RBUTTONUP`). Registered via
 /// `NOTIFYICONDATAW.uCallbackMessage`.
 const WM_TRAYICON: u32 = WM_APP + 2;
+
+/// Posted by the startup probe worker once it has launched the service via UAC;
+/// the dialog shows "starting service…" in the result line.
+const WM_SERVICE_START: u32 = WM_APP + 3;
+
+/// Posted by the startup probe worker when a retry probe finds the service up
+/// after a UAC launch; the dialog re-runs its startup `GetConfig`/`GetState` so
+/// the config editor and Save path unblock without a manual "Reload cfg".
+const WM_SERVICE_UP: u32 = WM_APP + 4;
 
 /// Tray icon identifier (`NOTIFYICONDATAW.uID` / `NIM_MODIFY`).
 const TRAY_ICON_ID: u32 = 1;
@@ -755,14 +766,15 @@ unsafe fn show_and_foreground(hwnd: HWND) {
     let _ = SetForegroundWindow(hwnd);
 }
 
-/// Launch the service elevated via `ShellExecuteW(runas)`. The service is a
-/// separate elevated process, so a UAC prompt appears when the UI is not
-/// already elevated. Failures (unresolvable exe, refused launch) are logged;
-/// the UI keeps running.
-fn start_service() {
+/// Launch this exe's `service` subcommand elevated via `ShellExecuteW(runas)`.
+/// The service is a separate elevated process, so a UAC prompt appears when the
+/// caller is not already elevated. Returns `true` on success (ShellExecuteW
+/// returns a value > 32 on success; <= 32 is an error code, e.g. the consent
+/// prompt was cancelled).
+fn shell_launch_service() -> bool {
     let Some(exe) = std::env::current_exe().ok() else {
         log_err("start service: cannot resolve current exe");
-        return;
+        return false;
     };
     let exe_w = to_wide(&exe.to_string_lossy());
     let rc = unsafe {
@@ -775,10 +787,51 @@ fn start_service() {
             SW_SHOW,
         )
     };
-    // ShellExecuteW returns a value > 32 on success; <= 32 is an error code.
-    if (rc.0 as isize) <= 32 {
+    let ok = (rc.0 as isize) > 32;
+    if !ok {
         log_err("start service: ShellExecuteW(runas) failed");
     }
+    ok
+}
+
+/// Launch the service elevated (tray menu "Start service"). Failures
+/// (unresolvable exe, refused launch) are logged; the UI keeps running.
+fn start_service() {
+    let _ = shell_launch_service();
+}
+
+/// Startup probe: check once whether the service answers `GetState`; if it is
+/// down, launch the service elevated via UAC and retry a few times over ~5 s so
+/// the dialog's own startup `GetConfig`/`GetState` stand a chance of landing
+/// after the service comes up. Runs on a worker thread — the UI thread never
+/// blocks on the pipe (`client_call` against a down service fails fast, and
+/// `ShellExecuteW(runas)` blocks on the consent prompt off the UI thread).
+///
+/// Posts [`WM_SERVICE_START`] once the launch is underway and [`WM_SERVICE_UP`]
+/// once a retry succeeds, so the dialog can show "starting service…" and then
+/// re-run its config load (the original workers failed while the service was
+/// down, and the Refresh button only re-pulls status, not the config).
+fn startup_probe(hwnd: HWND, pipe: String) {
+    let raw_hwnd = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let probe = || client_call(&pipe, &Request::GetState).is_ok();
+        if probe() {
+            return; // service already up; the normal startup workers handle it
+        }
+        if !shell_launch_service() {
+            return; // launch refused/cancelled; the dialog reports the pipe error
+        }
+        let hwnd = HWND(raw_hwnd as *mut c_void);
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_SERVICE_START, WPARAM(0), LPARAM(0)) };
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(1000));
+            if probe() {
+                let _ =
+                    unsafe { PostMessageW(Some(hwnd), WM_SERVICE_UP, WPARAM(0), LPARAM(0)) };
+                return;
+            }
+        }
+    });
 }
 
 /// Show the tray popup menu at the cursor and dispatch the chosen command.
@@ -1415,10 +1468,58 @@ impl UiState {
         self.save_in_flight = false;
         match result {
             Ok(Response::SaveConfig(Ok(m))) => self.set_result(hwnd, &format!("Saved: {m}")),
-            Ok(Response::SaveConfig(Err(e))) => self.set_result(hwnd, &format!("Save failed: {e}")),
+            Ok(Response::SaveConfig(Err(e))) => self.on_save_elevation(hwnd, &e),
             Ok(_) => self.set_result(hwnd, "Save: unexpected response"),
             Err(e) => self.set_result(hwnd, &format!("Save failed: {e}")),
         }
+    }
+
+    /// A `SaveConfig` the service refused for lack of elevation. If this UI
+    /// process is not itself elevated, offer to relaunch as administrator: the
+    /// elevated instance connects to the (elevated) service and can save. On
+    /// accept, launch `aetheris ui` via `ShellExecuteW(runas)` and quit this
+    /// instance (exit 0, the new instance takes over). Declining just surfaces
+    /// the service's error.
+    unsafe fn on_save_elevation(&mut self, hwnd: HWND, msg: &str) {
+        let needs_elevation = msg.to_ascii_lowercase().contains("elevat");
+        if needs_elevation && !aetheris_core::actions::is_elevated() {
+            let wide = to_wide(
+                "Save requires administrator rights.\n\nRelaunch aetheris as administrator and try again?",
+            );
+            let rc = MessageBoxW(
+                Some(hwnd),
+                PCWSTR(wide.as_ptr()),
+                w!("aetheris"),
+                MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONQUESTION.0),
+            );
+            if rc == IDYES {
+                let exe_w = std::env::current_exe()
+                    .ok()
+                    .map(|e| to_wide(&e.to_string_lossy()));
+                let launched = match exe_w {
+                    Some(exe_w) => {
+                        let rc = unsafe {
+                            ShellExecuteW(
+                                None,
+                                w!("runas"),
+                                PCWSTR(exe_w.as_ptr()),
+                                w!("ui"),
+                                None,
+                                SW_SHOW,
+                            )
+                        };
+                        (rc.0 as isize) > 32
+                    }
+                    None => false,
+                };
+                if launched {
+                    // The new elevated instance takes over; quit this one.
+                    PostQuitMessage(0);
+                    return;
+                }
+            }
+        }
+        self.set_result(hwnd, &format!("Save failed: {msg}"));
     }
 
     /// Ask the service to re-read its config file from disk (worker thread).
@@ -1535,6 +1636,23 @@ unsafe extern "system" fn wndproc(
                 let s = state_mut(hwnd);
                 s.start_status_probe(hwnd);
             }
+            LRESULT(0)
+        }
+
+        WM_SERVICE_START => {
+            // The startup probe has launched the service via UAC.
+            let s = state_mut(hwnd);
+            s.set_result(hwnd, "starting service...");
+            LRESULT(0)
+        }
+
+        WM_SERVICE_UP => {
+            let s = state_mut(hwnd);
+            // The service came up after our UAC launch; re-run the startup
+            // config load and status pull (the original workers failed while it
+            // was down, and Refresh only re-pulls status, not the config).
+            s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
+            s.start_refresh(hwnd);
             LRESULT(0)
         }
 
@@ -2130,7 +2248,7 @@ fn run(args: Vec<String>) -> i32 {
             let win_h = rc.bottom - rc.top;
 
             // Hand the pipe to the dialog via lpParam (consumed in WM_CREATE).
-            let init = Box::into_raw(Box::new(InitData { pipe }));
+            let init = Box::into_raw(Box::new(InitData { pipe: pipe.clone() }));
 
             hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2169,6 +2287,10 @@ fn run(args: Vec<String>) -> i32 {
             s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
             s.spawn(hwnd, IpcCall::GetState, Request::GetState);
         }
+
+        // Startup probe: if the service is down, UAC-launch it and retry over
+        // ~5 s (worker thread; never blocks the UI thread or the dialog).
+        startup_probe(hwnd, pipe);
 
         // Standard message loop; returns when WM_QUIT arrives (window closed).
         let mut msg = MSG::default();

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +110,79 @@ pub struct Config {
     pub network: NetworkConfig,
     #[serde(default)]
     pub overlay: OverlayConfig,
+}
+
+/// Default config location for the single-app layout:
+/// `%PROGRAMDATA%\aetheris\aetheris.toml`. `PROGRAMDATA` is the machine-wide
+/// data root (e.g. `C:\ProgramData`) that the elevated service can write on
+/// first run even though the non-elevated UI process cannot.
+pub fn default_config_path() -> PathBuf {
+    let base = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    base.join("aetheris").join("aetheris.toml")
+}
+
+/// First-run template written before [`Config::load`]: the repo's example
+/// `aetheris.toml` content, fully commented so nothing is active until the
+/// user uncomments/edits. A no-op template parses to a valid (default) config.
+pub fn default_config_str() -> String {
+    r#"# aetheris default configuration - auto-generated on first run.
+# Edit via `aetheris ui` or this file; the service reads this at startup and on
+# `ReloadConfig`. Everything below is commented as a template: uncomment to
+# enable.
+
+# [game]
+# boost_on_start = true
+# processes = ["steam_app_*.exe", "game.exe"]
+
+# # Opt-in: purge the Windows standby memory list once on game-mode entry so the
+# # game's working set can grow from free pages. Off by default. Not reversible,
+# # but harmless (the OS rebuilds its standby list as needed).
+# purge_standby_on_boost = false
+
+# # Processes throttled while a game is running. Each entry is matched
+# # case-insensitively as a substring against the process image name.
+# [[background]]
+# name = "chrome.exe"
+# suspend = false
+# priority = "below_normal"
+# # Real cross-process CPU cap via a Job Object (hard cap). `qos_cpu_quota` is a
+# # percentage of the machine's total CPU capacity (0.01% units internally,
+# # CpuRate = quota * 100). Only applied to processes NOT already in a job; a
+# # process that is already job-bound degrades to no-cap with a warn (priority /
+# # affinity still apply). The cap clears when the game exits or the service
+# # stops. Note: browsers and many apps are already in a job, so QoS often won't
+# # bind on them - it works cleanly for processes aetheris launches fresh.
+# qos_cpu_quota = 50
+
+# [[background]]
+# name = "msedge.exe"
+# suspend = false
+# priority = "below_normal"
+
+# # Memory trim is explicit opt-in and only safe for non-critical apps.
+# [[background]]
+# name = "spotify.exe"
+# trim_memory = true
+
+# # Always-on rules (any mode).
+# [[rule]]
+# name = "updater.exe"
+# priority = "idle"
+
+# # Extra protected processes (defaults can never be removed).
+# protected_extra = []
+
+# # Network QoS tweaks are explicit opt-in (all flags default to false) and are
+# # applied on game-mode entry, then reverted on exit. They write registry values
+# # under HKLM, so the service must be elevated to use them.
+# [network]
+# enabled = true
+# nagle = true
+# netbios = false
+"#
+    .to_string()
 }
 
 #[derive(Debug)]
