@@ -17,10 +17,12 @@ use windows::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JobObjectCpuRateControlInformation, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
-    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0, JOB_OBJECT_CPU_RATE_CONTROL,
-    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+    AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject,
+    SetInformationJobObject, JobObjectBasicAccountingInformation,
+    JobObjectCpuRateControlInformation, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0,
+    JOB_OBJECT_CPU_RATE_CONTROL, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
 };
 use windows::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows::Win32::System::Threading::{
@@ -165,6 +167,25 @@ pub(crate) fn open_process(pid: u32) -> Result<HANDLE, ActionError> {
     let h = unsafe { OpenProcess(PROCESS_RIGHTS, false, pid) }
         .map_err(|e| ActionError::Open(e.code().0 as u32))?;
     Ok(h)
+}
+
+/// Query a Job Object's active-process count from its basic accounting
+/// information. Returns `None` when the query fails (invalid/closed handle,
+/// unsupported class) so callers can treat a failed probe as "assume occupied"
+/// rather than disturb a working cap.
+fn query_active_processes(job: HANDLE) -> Option<u32> {
+    let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    unsafe {
+        QueryInformationJobObject(
+            Some(job),
+            JobObjectBasicAccountingInformation,
+            (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            None,
+        )
+    }
+    .ok()?;
+    Some(info.ActiveProcesses)
 }
 
 /// Purge the Windows standby memory list, returning its pages to the free list
@@ -370,6 +391,17 @@ impl OsBackend {
         }
         .map_err(|e| ActionError::Job(format!("set rate control: {e}")))?;
 
+        // PID-reuse guard: if the process that previously occupied this entry
+        // died and its Stop event was missed (ETW drop), the job is empty but
+        // `assigned` is still true — a new process that reuses this pid would
+        // silently skip assignment below. Probe the job's active-process count;
+        // zero means the prior process is gone, so reset `assigned` to re-arm
+        // the entry and let the new process be assigned. A failed probe is
+        // treated as occupied: never disturb a working cap on uncertainty.
+        if entry.assigned && query_active_processes(entry.job) == Some(0) {
+            entry.assigned = false;
+        }
+
         if !entry.assigned {
             let h = open_process(pid)?;
             let assigned = unsafe { AssignProcessToJobObject(entry.job, h) };
@@ -387,6 +419,18 @@ impl OsBackend {
             entry.assigned = true;
         }
         Ok(())
+    }
+
+    /// Active-process count in the Job Object tracked for `pid` (from its basic
+    /// accounting information), or `None` when no job is tracked for `pid` or
+    /// the query fails. A returned `Some(0)` means the job is empty — the
+    /// process that was assigned to it has exited (e.g. its `Stop` event was
+    /// missed). `pub` (not `pub(crate)`, per the task brief) so the integration
+    /// test in `tests/actions_suspend_qos.rs` can observe the reset path.
+    pub fn job_active_processes(&self, pid: u32) -> Option<u32> {
+        let jobs = self.jobs.lock().unwrap();
+        let entry = jobs.get(&pid)?;
+        query_active_processes(entry.job)
     }
 
     /// Close + remove the Job Object for `pid`. Safe only after the process has

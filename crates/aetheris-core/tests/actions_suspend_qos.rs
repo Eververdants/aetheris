@@ -160,3 +160,93 @@ fn qos_clear_then_drop_does_not_kill() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn qos_reams_after_missed_stop_pid_reuse() {
+    // Reproduce the ETW-drop bug: a capped process dies and its Stop event is
+    // missed, leaving `jobs[pid] = { job, assigned: true }` behind. When a new
+    // process reuses that pid, `apply_qos` previously saw `assigned == true`
+    // and skipped assignment — the cap silently did nothing. Fix: probe the
+    // job's active-process count; an empty job (0) means the prior process is
+    // gone, so re-arm the entry and re-assign the new process.
+    let mut child = spawn_dummy();
+    let pid = child.id();
+    let backend = OsBackend::new();
+
+    backend
+        .apply(pid, &TargetAction::QosCpuQuota { percent: 50 })
+        .expect("assign qos");
+    assert!(
+        backend.jobs.lock().unwrap().get(&pid).unwrap().assigned,
+        "first assignment must arm the job"
+    );
+
+    // Kill WITHOUT on_process_exit (missed Stop): the entry survives armed but
+    // the job is now empty.
+    child.kill().expect("kill");
+    child.wait().expect("wait");
+    // wait() guarantees termination, but the job's active count can lag a
+    // scheduler tick; poll briefly for the empty-job signal.
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    while backend.job_active_processes(pid) != Some(0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job never reported empty after the process died"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        backend.jobs.lock().unwrap().get(&pid).unwrap().assigned,
+        "missed Stop must leave assigned == true (bug precondition)"
+    );
+
+    // Simulate pid reuse: a brand-new process takes over the stale empty job.
+    // Windows pid reuse cannot be forced deterministically, so seed the
+    // surviving entry under the new process's pid — the same occupied +
+    // assigned + empty state the real bug leaves behind.
+    let mut new_child = spawn_dummy();
+    let new_pid = new_child.id();
+    {
+        let mut jobs = backend.jobs.lock().unwrap();
+        let entry = jobs.remove(&pid).expect("stale entry present");
+        assert!(entry.assigned, "stale entry must be armed");
+        jobs.insert(new_pid, entry);
+    }
+
+    // Re-apply the cap: the fix must re-arm the occupied entry and RE-ASSIGN
+    // the new process, so the cap actually applies.
+    backend
+        .apply(new_pid, &TargetAction::QosCpuQuota { percent: 50 })
+        .expect("re-apply qos after pid reuse");
+
+    let jobs = backend.jobs.lock().unwrap();
+    let entry = jobs.get(&new_pid).expect("entry present after re-apply");
+    assert!(entry.assigned, "re-arm must re-assign the new process");
+
+    // Read back the cap to prove the new process is genuinely capped.
+    let mut info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+    unsafe {
+        QueryInformationJobObject(
+            Some(entry.job),
+            JobObjectCpuRateControlInformation,
+            (&mut info as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            None,
+        )
+    }
+    .expect("query job");
+    assert!(
+        info.ControlFlags.0 & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE.0 != 0,
+        "new process must be under the CPU cap"
+    );
+    assert_eq!(unsafe { info.Anonymous.CpuRate }, 5000, "cap is 50%");
+
+    // Cleanup.
+    drop(jobs);
+    backend
+        .apply(new_pid, &TargetAction::QosCpuQuota { percent: 0 })
+        .expect("clear qos");
+    backend.on_process_exit(new_pid);
+    let _ = new_child.kill();
+    let _ = new_child.wait();
+}
