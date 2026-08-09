@@ -3,47 +3,53 @@
 //! `eprintln!` output is invisible — startup/fatal errors are surfaced via
 //! [`report_error`] (message box + `%TEMP%\aetheris-ui.log`).
 //!
-//! aetheris-ui: status panel + rule editor + save flow.
+//! aetheris-ui: simplified bilingual checklist main view.
 //!
 //! A programmatic Win32 dialog (no `.rc`, no GUI framework) wired to the
 //! running aetheris service over the named pipe:
 //!
-//! * **Status panel** (top): live mode, boosted-process count/names and the
-//!   last-reload result, re-pulled on demand by the Refresh button
-//!   (`GetState`).
-//! * **Rule editor** (middle): three `SysListView32` lists — game processes,
-//!   `[[background]]` rules and `[[rule]]` always-rules. Selecting a background
-//!   or rule row loads its fields into the shared editor (name, priority combo,
-//!   affinity, qos_cpu_quota, suspend/trim checkboxes). Add/Delete/Apply
-//!   mutate a local `Config` copy; Apply writes the editor controls back to the
-//!   selected row; "Reload cfg" re-fetches `GetConfig` into the editor (and
-//!   clears the startup load error once a fetch succeeds).
-//! * **Save / Reload / Exit** (bottom): Save validates the local config and
-//!   pushes it to the service via `SaveConfig(local)` — refused while the
-//!   startup `GetConfig` failed, so the empty stub config can't overwrite the
-//!   real config on disk; Reload asks the service to re-read its config file;
-//!   Exit closes the window.
+//! * **Status area** (top): a status static (`正在优化中 / 未运行` per lang)
+//!   plus `[启动服务]` / `[停止服务]` buttons — the same actions the tray menu
+//!   exposes, now in-window.
+//! * **游戏 list** (middle-left): a single-column `SysListView32` with
+//!   `LVS_EX_CHECKBOXES`; rows = `cfg.game.processes`. A checked row means the
+//!   process enters GameBoost when it launches. `[从运行中选]` opens the
+//!   running-process picker; `[添加]` prompts for a process name (`*` wildcard
+//!   allowed).
+//! * **后台应用 list**: a single-column checkbox list; rows = `cfg.background`
+//!   (checkbox = rule enabled). Same add buttons.
+//! * **优化方式 group**: four global toggles — 挂起 (suspend), 降优先级
+//!   (below_normal), 限制CPU (with a 低/中/高 combo → 30/50/70) and 清理内存
+//!   (trim_memory). On Save these are the default fields applied to every
+//!   checked background row; Task 4's advanced editor can override per row.
+//! * **保存 / 高级设置** (bottom): Save builds a `Config` from the checklists +
+//!   toggles + any Task-4 per-row overrides and pushes it via `SaveConfig`;
+//!   高级设置 is stubbed (Task 4 wires the collapsible advanced panel).
 //!
-//! Every pipe call (the startup `GetConfig`/`GetState`, Refresh, Save, "Reload
-//! cfg", Reload) runs on a detached worker thread: the worker calls
-//! [`client_call`] and posts the outcome back as a custom `WM_IPC_RESULT`
-//! message whose `wparam` is the call id and whose `lparam` is a
-//! `*mut Result<Response, String>` the worker allocates and the wndproc
-//! frees. The UI thread never blocks on the pipe, so with the service down the
-//! dialog still opens instantly and stays responsive (the retry budget in
-//! `client_call` is spent off the UI thread).
+//! The running-process picker and the add-by-name prompt are small modal popups
+//! (separate top-level windows + a nested filtered message loop, with the main
+//! window disabled while they are open). They post their results back to the
+//! main window as the custom [`WM_PICK_RESULT`] / [`WM_PROMPT_RESULT`] messages.
 //!
-//! The dialog state (pipe name, working `Config`, list↔row index maps and
-//! control handles) lives in a `UiState` box stored on the window via
-//! `SetWindowLongPtrW(GWLP_USERDATA)` and freed on `WM_DESTROY`. Programmatic
-//! list mutations set a `busy` flag so the reentrant `LVN_ITEMCHANGED`
-//! notification (fired synchronously by `LVM_SETITEMSTATE`) is ignored — it
-//! would otherwise mint a second `&mut UiState` while the outer frame's `&mut`
-//! is live (two simultaneous `&mut` = UB).
+//! Every pipe call (the startup `GetConfig`/`GetState`, Save, tray/status
+//! probes) runs on a detached worker thread: the worker calls [`client_call`]
+//! and posts the outcome back as a custom `WM_IPC_RESULT` message whose `wparam`
+//! is the call id and whose `lparam` is a `*mut Result<Response, String>` the
+//! worker allocates and the wndproc frees. The UI thread never blocks on the
+//! pipe, so with the service down the dialog still opens instantly and stays
+//! responsive (the retry budget in `client_call` is spent off the UI thread).
 //!
-//! Config is loaded once with `GetConfig` on startup; Refresh re-pulls status
-//! only (it never overwrites the editor's working copy).
+//! The dialog state (pipe name, working `Config`, control handles) lives in a
+//! `UiState` box stored on the window via `SetWindowLongPtrW(GWLP_USERDATA)` and
+//! freed on `WM_DESTROY`. Programmatic list mutations set a `busy` flag so the
+//! reentrant `LVN_ITEMCHANGED` notification (fired synchronously by
+//! `LVM_SETITEMSTATE`) is ignored — it would otherwise touch the `UiState` while
+//! the outer frame's `&mut` is live (two simultaneous `&mut` = UB).
+//!
+//! Config is loaded once with `GetConfig` on startup; the tray-status timer
+//! re-pulls `GetState` every few seconds for the tray icon's green/gray color.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -51,19 +57,24 @@ use std::time::Duration;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, COLORREF, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
     DeleteObject, FillRect, GetDC, GetSysColorBrush, ReleaseDC, SelectObject, COLOR_BTNFACE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::ProcessStatus::EnumProcesses;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_LISTVIEW_CLASSES, BST_CHECKED,
-    LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVCOLUMNW,
-    LVCOLUMNW_MASK, LVITEMW, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVIF_TEXT, LVIS_FOCUSED,
-    LVIS_SELECTED, LVNI_SELECTED, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SINGLESEL, NMHDR,
+    LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
+    LVN_ITEMCHANGED, LVCOLUMNW, LVCOLUMNW_MASK, LVITEMW, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
+    LVIF_TEXT, LVIS_STATEIMAGEMASK, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT, LVS_REPORT, NMHDR,
+    LIST_VIEW_ITEM_STATE_FLAGS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::Shell::{
@@ -72,24 +83,23 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CreateIconIndirect, CreatePopupMenu,
-    CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
-    GWLP_USERDATA, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, IDYES, KillTimer,
-    LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MESSAGEBOX_STYLE,
-    MessageBoxW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, SIZE_MINIMIZED, SW_HIDE, SW_SHOW,
+    CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBS_DROPDOWNLIST, CreateIconIndirect,
+    CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, GetWindowTextW, GWLP_USERDATA, HICON, HMENU, ICONINFO, IDC_ARROW,
+    IDI_APPLICATION, IDYES, KillTimer, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONQUESTION,
+    MB_OK, MB_YESNO, MESSAGEBOX_STYLE, MessageBoxW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, SIZE_MINIMIZED, SW_HIDE, SW_SHOW,
     TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NOTIFY, WM_RBUTTONUP, WM_SIZE,
-    WM_TIMER,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
+    WM_TIMER, WNDCLASSW, WNDPROC, WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
 };
 
-use aetheris_core::config::{AffinitySpec, AlwaysRule, BackgroundRule, Config, PriorityClass};
+use aetheris_core::config::{BackgroundRule, Config, PriorityClass};
 use aetheris_core::i18n::Lang;
-use aetheris_core::ipc::{client_call, ProcessInfo, Request, Response, DEFAULT_PIPE};
+use aetheris_core::ipc::{client_call, Request, Response, DEFAULT_PIPE};
 
 // ---------------------------------------------------------------------------
 // Bilingual string table (zh/en)
@@ -102,11 +112,10 @@ use aetheris_core::ipc::{client_call, ProcessInfo, Request, Response, DEFAULT_PI
 /// drift).
 ///
 /// Keys cover every user-visible string the UI can render: window title,
-/// status lines, buttons, list column headers, global options, the language
-/// button, the running-process picker, save messages, the tray menu and the
-/// advanced editor's field labels. `apply_language` drives controls from this
-/// table; the current dialog body still uses its hardcoded English until Task
-/// 3 rewires the layout.
+/// status lines, buttons, list column headers, global options, the running-
+/// process picker, the add-by-name prompt, save messages, the tray menu and the
+/// advanced editor's field labels (Task 4). `apply_language` drives every
+/// control from this table.
 macro_rules! define_strings {
     ($( $key:literal => $zh:literal, $en:literal ),* $(,)?) => {
         fn tr(lang: Lang, key: &str) -> &'static str {
@@ -144,7 +153,7 @@ define_strings! {
     "status_stopped" => "未运行", "Not running",
     // Service lifecycle messages (startup probe).
     "service_starting" => "正在启动服务…", "Starting service…",
-    "service_giveup" => "无法启动服务 — 请手动（以管理员身份）运行 `aetheris service`",
+    "service_giveup" => "无法启动服务 — 请手动(以管理员身份)运行 `aetheris service`",
         "unable to start service — run `aetheris service` manually (elevated)",
     // Main-view buttons.
     "btn_start" => "启动服务", "Start service",
@@ -154,11 +163,13 @@ define_strings! {
     "btn_pick_running" => "从运行中的进程选择", "Pick from running",
     "btn_advanced" => "高级设置", "Advanced",
     "btn_reload" => "重载", "Reload",
-    // List column headers.
-    "list_games" => "游戏", "Games",
-    "list_background" => "后台应用", "Background apps",
+    // List group labels + column headers.
+    "list_games" => "游戏(启动时进入优化模式)", "Games (enter optimization on launch)",
+    "list_background" => "后台应用(游戏运行时优化)", "Background apps (optimized while a game runs)",
     "list_process_name" => "进程名", "Process name",
     // Global optimization options.
+    "opt_group" => "优化方式(应用于全部勾选的后台应用)",
+        "Optimization (applies to all checked background apps)",
     "opt_suspend" => "挂起", "Suspend",
     "opt_low_priority" => "降低优先级", "Lower priority",
     "opt_cpu" => "限制 CPU", "Limit CPU",
@@ -167,22 +178,39 @@ define_strings! {
     "cpu_low" => "低", "Low",
     "cpu_med" => "中", "Medium",
     "cpu_high" => "高", "High",
-    // Language toggle button.
+    // Language toggle button (Task 4).
     "lang" => "语言", "Language",
     // Running-process picker dialog.
     "pick_title" => "选择运行中的进程", "Pick running process",
-    "pick_hint" => "勾选要添加的进程，然后点击确定", "Check the processes to add, then OK",
+    "pick_hint" => "勾选要添加的进程,然后点击确定", "Check the processes to add, then OK",
     "pick_ok" => "确定", "OK",
-    // Save outcomes.
+    "pick_cancel" => "取消", "Cancel",
+    // Add-by-name prompt.
+    "add_prompt_title" => "添加进程", "Add process",
+    "add_prompt_hint" => "输入进程名(支持 * 通配)", "Enter a process name (* wildcard supported)",
+    // Loading / save outcomes.
+    "loading" => "正在从服务加载配置…", "Loading config from service…",
+    "cfg_loaded" => "已从服务加载配置", "Config loaded from service",
+    "cfg_load_failed" => "加载配置失败", "Config load failed",
+    "cfg_invalid" => "配置无效", "Config invalid",
+    "status_refreshed" => "状态已刷新", "Status refreshed",
+    "status_failed" => "状态刷新失败", "Status refresh failed",
     "save_ok" => "保存成功", "Saved",
+    "save_failed" => "保存失败", "Save failed",
+    "save_in_progress" => "保存正在进行中", "Save already in progress",
+    "save_blocked" => "配置尚未从服务加载,无法保存", "Config not loaded from service — cannot save",
     "save_requires_elevation" => "保存需要管理员权限", "Save requires administrator rights",
+    "save_relaunch_prompt" => "保存需要管理员权限。\n\n以管理员身份重新启动将关闭本窗口,未保存的更改将丢失。\n\n是否以管理员身份重新启动 aetheris 并重试?",
+        "Save requires administrator rights.\n\nRelaunching as administrator will close this editor and any unsaved changes will be lost.\n\nRelaunch aetheris as administrator and try again?",
+    "unexpected_response" => "意外的响应", "Unexpected response",
+    "added" => "已添加", "Added",
     // Tray popup menu.
     "tray_start" => "启动服务", "Start service",
     "tray_stop" => "停止服务", "Stop service",
     "tray_overlay" => "切换悬浮窗", "Toggle overlay",
     "tray_open" => "打开界面", "Open UI",
     "tray_exit" => "退出", "Exit",
-    // Advanced editor.
+    // Advanced editor (Task 4).
     "advanced_title" => "高级设置", "Advanced settings",
     "field_name" => "名称", "Name",
     "field_priority" => "优先级", "Priority",
@@ -192,15 +220,14 @@ define_strings! {
     "field_trim" => "清理内存", "Trim memory",
 }
 
-/// Re-render the window in `lang`: set the window title, record the active
-/// language (the tray popup, rebuilt fresh on each right-click, reads it) and —
-/// once the new layout lands in Task 3 — every control's text and list column
-/// headers. Guarded to be a safe no-op for controls that don't exist yet, so
-/// the mechanism can be called before the layout it re-renders is created.
+/// Re-render the window in `lang`: set the window title, every control's text,
+/// the list column headers, the CPU-limit combo items, and the status line, and
+/// record the active language (the tray popup, rebuilt fresh on each
+/// right-click, reads it).
 ///
-/// Called at startup (after the dialog is created) with the loaded language,
-/// and re-run by the language toggle (Task 4) whenever the user switches
-/// zh/en.
+/// Called at startup (after the dialog is created, before it is shown) with the
+/// loaded language, and re-run by the language toggle (Task 4) whenever the
+/// user switches zh/en.
 ///
 /// # Safety
 /// `hwnd` must be the dialog window with a live [`UiState`] in `GWLP_USERDATA`
@@ -210,42 +237,79 @@ unsafe fn apply_language(hwnd: HWND, lang: Lang) {
     // every right-click from this field, so the tray strings follow the toggle
     // without needing a persistent menu handle to rebuild here.
     state_mut(hwnd).lang = lang;
-    // Window title.
     set_text(hwnd, tr(lang, "title"));
-    // Task 3 wires the per-control texts (`GetDlgItemW(id)` -> `SetWindowTextW`)
-    // and list column headers (`LVM_SETCOLUMNW`) here, keyed to the new
-    // layout's control ids; until those controls exist this stays a no-op for
-    // them. Only the title and tray menu change language in this task.
+    let s = state_mut(hwnd);
+    set_text(s.h_btn_start, tr(lang, "btn_start"));
+    set_text(s.h_btn_stop, tr(lang, "btn_stop"));
+    set_text(s.h_btn_save, tr(lang, "btn_save"));
+    set_text(s.h_btn_advanced, tr(lang, "btn_advanced"));
+    set_text(s.h_btn_pick_game, tr(lang, "btn_pick_running"));
+    set_text(s.h_btn_add_game, tr(lang, "btn_add"));
+    set_text(s.h_btn_pick_bg, tr(lang, "btn_pick_running"));
+    set_text(s.h_btn_add_bg, tr(lang, "btn_add"));
+    set_text(s.h_label_game, tr(lang, "list_games"));
+    set_text(s.h_label_bg, tr(lang, "list_background"));
+    set_text(s.h_label_opt, tr(lang, "opt_group"));
+    set_text(s.h_opt_suspend, tr(lang, "opt_suspend"));
+    set_text(s.h_opt_low_prio, tr(lang, "opt_low_priority"));
+    set_text(s.h_opt_cpu, tr(lang, "opt_cpu"));
+    set_text(s.h_opt_mem, tr(lang, "opt_mem"));
+    // List column headers (both lists show the process-name column).
+    list_set_column(s.h_list_game, 0, tr(lang, "list_process_name"), 220);
+    list_set_column(s.h_list_bg, 0, tr(lang, "list_process_name"), 220);
+    // CPU-limit combo: rebuild the items in the current language and restore
+    // the selection.
+    let _ = SendMessageW(s.h_combo_cpu, CB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+    for key in ["cpu_low", "cpu_med", "cpu_high"] {
+        combo_add(s.h_combo_cpu, tr(lang, key));
+    }
+    combo_set_sel(s.h_combo_cpu, s.cpu_level as i32);
+    // Refresh the status line in the new language.
+    s.update_status(hwnd);
 }
 
 // ---------------------------------------------------------------------------
 // Control identifiers
 // ---------------------------------------------------------------------------
-const IDC_STATUS_MODE: isize = 100;
-const IDC_STATUS_BOOSTED: isize = 101;
-const IDC_STATUS_RELOAD: isize = 102;
-const IDC_BTN_REFRESH: isize = 103;
 
+// Status area (top).
+const IDC_STATUS: isize = 100;
+const IDC_BTN_START: isize = 101;
+const IDC_BTN_STOP: isize = 102;
+
+// Games + background-apps lists and their labels.
 const IDC_LIST_GAME: isize = 110;
 const IDC_LIST_BG: isize = 111;
-const IDC_LIST_RULE: isize = 112;
+const IDC_LABEL_GAME: isize = 112;
+const IDC_LABEL_BG: isize = 113;
+const IDC_BTN_PICK_GAME: isize = 120;
+const IDC_BTN_ADD_GAME: isize = 121;
+const IDC_BTN_PICK_BG: isize = 122;
+const IDC_BTN_ADD_BG: isize = 123;
 
-const IDC_EDIT_NAME: isize = 120;
-const IDC_COMBO_PRIORITY: isize = 121;
-const IDC_EDIT_AFFINITY: isize = 122;
-const IDC_EDIT_QOS: isize = 123;
-const IDC_CHK_SUSPEND: isize = 124;
-const IDC_CHK_TRIM: isize = 125;
+// Optimization group.
+const IDC_LABEL_OPT: isize = 130;
+const IDC_OPT_SUSPEND: isize = 131;
+const IDC_OPT_LOW_PRIO: isize = 132;
+const IDC_OPT_CPU: isize = 133;
+const IDC_COMBO_CPU: isize = 134;
+const IDC_OPT_MEM: isize = 135;
 
-const IDC_BTN_ADD: isize = 130;
-const IDC_BTN_RELOAD_CFG: isize = 131;
-const IDC_BTN_DELETE: isize = 132;
-const IDC_BTN_APPLY: isize = 133;
-
+// Result line + save/advanced.
 const IDC_STATUS_RESULT: isize = 140;
 const IDC_BTN_SAVE: isize = 141;
-const IDC_BTN_RELOAD: isize = 142;
-const IDC_BTN_EXIT: isize = 143;
+const IDC_BTN_ADVANCED: isize = 142;
+
+// Modal popup controls (child ids are per-window, so they don't clash with the
+// main window's ids).
+const IDC_PICK_HINT: isize = 1;
+const IDC_PICK_LIST: isize = 2;
+const IDC_PICK_OK: isize = 3;
+const IDC_PICK_CANCEL: isize = 4;
+const IDC_PROMPT_HINT: isize = 5;
+const IDC_PROMPT_EDIT: isize = 6;
+const IDC_PROMPT_OK: isize = 7;
+const IDC_PROMPT_CANCEL: isize = 8;
 
 /// Custom message: a worker thread posts a pipe-call outcome here. `wparam`
 /// carries the [`IpcCall`] id, `lparam` a `*mut Result<Response, String>`
@@ -272,6 +336,15 @@ const WM_SERVICE_UP: u32 = WM_APP + 4;
 /// the service still down; the dialog replaces the stale "starting service…"
 /// line with a manual-launch instruction instead of leaving it stuck.
 const WM_SERVICE_GIVEUP: u32 = WM_APP + 5;
+
+/// Posted by the running-process picker with the chosen process names (`lparam`
+/// = `*mut Vec<String>`, `wparam` = target [`ListKind`]); the main wndproc
+/// appends them to the focused list.
+const WM_PICK_RESULT: u32 = WM_APP + 6;
+
+/// Posted by the add-by-name prompt with the typed name (`lparam` = `*mut
+/// String`, `wparam` = target [`ListKind`]); the main wndproc appends it.
+const WM_PROMPT_RESULT: u32 = WM_APP + 7;
 
 /// One-shot guard so only a single elevated service launch is in flight at a
 /// time. Two UI instances, or a tray "Start service" click while the startup
@@ -306,12 +379,9 @@ const IDM_EXIT: isize = 1004;
 enum IpcCall {
     /// Startup `GetConfig` — loads the working config, clears `init_error`.
     GetConfig,
-    /// `GetState` — startup status pull and the Refresh button.
+    /// `GetState` — startup status pull, the tray/status probes and the
+    /// start/stop button refresh.
     GetState,
-    /// "Reload cfg" — re-fetch `GetConfig` into the editor.
-    ReloadCfg,
-    /// "Reload" — ask the service to re-read its config file.
-    Reload,
     /// "Save" — `SaveConfig`.
     Save,
 }
@@ -325,31 +395,35 @@ impl IpcCall {
         match w {
             0 => Some(IpcCall::GetConfig),
             1 => Some(IpcCall::GetState),
-            2 => Some(IpcCall::ReloadCfg),
-            3 => Some(IpcCall::Reload),
-            4 => Some(IpcCall::Save),
+            2 => Some(IpcCall::Save),
             _ => None,
         }
     }
 }
 
-/// Display order of the priority combo: index 0 is "(default)" = `None`, then
-/// the six `PriorityClass` variants in their serde snake_case spelling.
-const PRIORITIES: &[(PriorityClass, &str)] = &[
-    (PriorityClass::Idle, "idle"),
-    (PriorityClass::BelowNormal, "below_normal"),
-    (PriorityClass::Normal, "normal"),
-    (PriorityClass::AboveNormal, "above_normal"),
-    (PriorityClass::High, "high"),
-    (PriorityClass::Realtime, "realtime"),
-];
-
-/// Which of the three rule lists an editor action targets.
+/// Which of the two main lists an add/pick action targets. The value doubles as
+/// the `wparam` carried by the picker/prompt result messages.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ListKind {
     Game,
     Background,
-    Rule,
+}
+
+impl ListKind {
+    fn to_usize(self) -> usize {
+        match self {
+            ListKind::Game => 0,
+            ListKind::Background => 1,
+        }
+    }
+
+    fn from_usize(u: usize) -> Option<ListKind> {
+        match u {
+            0 => Some(ListKind::Game),
+            1 => Some(ListKind::Background),
+            _ => None,
+        }
+    }
 }
 
 /// Per-window dialog state, stashed in `GWLP_USERDATA` as a heap box.
@@ -380,32 +454,39 @@ struct UiState {
     save_in_flight: bool,
     /// True while a list is being mutated/rebuild from code. The `WM_NOTIFY`
     /// (`LVN_ITEMCHANGED`) handler returns immediately while this is set, so a
-    /// selection change triggered by `list_set_sel`/`LVM_SETITEMSTATE` cannot
-    /// re-enter `wndproc` and mint a second `&mut UiState` while the outer
-    /// frame's `&mut` is live (which would be two simultaneous `&mut` = UB).
+    /// checkbox toggle triggered by `LVM_SETITEMSTATE` during a rebuild cannot
+    /// touch the `UiState` while the outer frame's `&mut` is live.
     busy: bool,
+    /// Service mode from the last successful `GetState`. Empty means the
+    /// service has not answered — shown as "未运行".
     mode: String,
-    boosted: Vec<ProcessInfo>,
-    last_reload: Option<String>,
-    last_result: Option<String>,
-    game_row_to_idx: Vec<usize>,
-    bg_row_to_idx: Vec<usize>,
-    rule_row_to_idx: Vec<usize>,
-    active: ListKind,
-    cur_row: Option<usize>,
-    h_status_mode: HWND,
-    h_status_boosted: HWND,
-    h_status_reload: HWND,
+    /// CPU-limit combo selection (0 = low/30, 1 = medium/50, 2 = high/70).
+    /// Survives the `apply_language` rebuild of the combo items.
+    cpu_level: usize,
+    /// Task 4: per-row background overrides keyed by process name. Presently
+    /// never populated — the save mapping reads them if present (a row with an
+    /// override uses it wholesale instead of the global toggles).
+    bg_overrides: HashMap<String, BackgroundRule>,
+    h_status: HWND,
+    h_btn_start: HWND,
+    h_btn_stop: HWND,
     h_result: HWND,
     h_list_game: HWND,
     h_list_bg: HWND,
-    h_list_rule: HWND,
-    h_name: HWND,
-    h_prio: HWND,
-    h_aff: HWND,
-    h_qos: HWND,
-    h_suspend: HWND,
-    h_trim: HWND,
+    h_btn_pick_game: HWND,
+    h_btn_add_game: HWND,
+    h_btn_pick_bg: HWND,
+    h_btn_add_bg: HWND,
+    h_label_game: HWND,
+    h_label_bg: HWND,
+    h_label_opt: HWND,
+    h_opt_suspend: HWND,
+    h_opt_low_prio: HWND,
+    h_opt_cpu: HWND,
+    h_combo_cpu: HWND,
+    h_opt_mem: HWND,
+    h_btn_save: HWND,
+    h_btn_advanced: HWND,
     /// Tray status icons (owned, freed on `WM_DESTROY` via `DestroyIcon`):
     /// green when the service answers `GetState`, gray when it does not.
     h_icon_green: HICON,
@@ -627,6 +708,15 @@ unsafe fn state_mut(hwnd: HWND) -> &'static mut UiState {
     &mut *(p as *mut UiState)
 }
 
+/// Read `UiState::busy` without minting a `&mut`. A reentrant `LVN_ITEMCHANGED`
+/// can fire synchronously (via `LVM_SETITEMSTATE`) while the outer wndproc
+/// frame already holds `&mut UiState`; reading the flag through a raw pointer
+/// avoids creating a second `&mut` to the same memory.
+unsafe fn state_is_busy(hwnd: HWND) -> bool {
+    let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    p != 0 && (*(p as *const UiState)).busy
+}
+
 unsafe fn set_text(hwnd: HWND, text: &str) {
     let wide = to_wide(text);
     let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
@@ -670,6 +760,38 @@ unsafe fn btn_get(hwnd: HWND) -> bool {
     SendMessageW(hwnd, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 != 0
 }
 
+/// `INDEXTOSTATEIMAGEMASK(2)` — the listview checkbox column's "checked" state
+/// image index, shifted into the state-image bit field.
+const LVIS_CHECKED: u32 = 2 << 12;
+
+/// Check / uncheck a listview row's checkbox (`LVM_SETITEMSTATE` with the
+/// state-image mask). Setting an item state fires a reentrant `LVN_ITEMCHANGED`;
+/// callers run under the `busy` guard.
+unsafe fn list_set_checked(hwnd: HWND, row: i32, on: bool) {
+    let mut item: LVITEMW = std::mem::zeroed();
+    item.state = LIST_VIEW_ITEM_STATE_FLAGS(if on { LVIS_CHECKED } else { 1 << 12 });
+    item.stateMask = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_STATEIMAGEMASK.0);
+    let _ = SendMessageW(
+        hwnd,
+        LVM_SETITEMSTATE,
+        Some(WPARAM(row as usize)),
+        Some(LPARAM(&mut item as *mut _ as isize)),
+    );
+}
+
+/// Read a listview row's checkbox state (`LVM_GETITEMSTATE`): state-image index
+/// 2 = checked.
+unsafe fn list_checked(hwnd: HWND, row: i32) -> bool {
+    let state = SendMessageW(
+        hwnd,
+        LVM_GETITEMSTATE,
+        Some(WPARAM(row as usize)),
+        Some(LPARAM(LVIS_STATEIMAGEMASK.0 as isize)),
+    )
+    .0 as u32;
+    (state >> 12) == 2
+}
+
 unsafe fn list_add_column(hwnd: HWND, i: i32, title: &str, width: i32) {
     let mut wide = to_wide(title);
     let mut col: LVCOLUMNW = std::mem::zeroed();
@@ -680,6 +802,23 @@ unsafe fn list_add_column(hwnd: HWND, i: i32, title: &str, width: i32) {
     let _ = SendMessageW(
         hwnd,
         LVM_INSERTCOLUMNW,
+        Some(WPARAM(i as usize)),
+        Some(LPARAM(&mut col as *mut _ as isize)),
+    );
+}
+
+/// Re-label an existing listview column (`LVM_SETCOLUMNW`). Used by
+/// `apply_language` to re-render column headers on a language switch.
+unsafe fn list_set_column(hwnd: HWND, i: i32, title: &str, width: i32) {
+    let mut wide = to_wide(title);
+    let mut col: LVCOLUMNW = std::mem::zeroed();
+    col.mask = LVCOLUMNW_MASK(LVCF_TEXT.0 | LVCF_WIDTH.0 | LVCF_SUBITEM.0);
+    col.cx = width;
+    col.pszText = PWSTR(wide.as_mut_ptr());
+    col.iSubItem = i;
+    let _ = SendMessageW(
+        hwnd,
+        LVM_SETCOLUMNW,
         Some(WPARAM(i as usize)),
         Some(LPARAM(&mut col as *mut _ as isize)),
     );
@@ -728,41 +867,9 @@ unsafe fn list_clear(hwnd: HWND) {
     let _ = SendMessageW(hwnd, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
 }
 
-unsafe fn list_selected(hwnd: HWND) -> Option<i32> {
-    let r = SendMessageW(
-        hwnd,
-        LVM_GETNEXTITEM,
-        Some(WPARAM((-1i32) as isize as usize)),
-        Some(LPARAM(LVNI_SELECTED as isize)),
-    )
-    .0 as i32;
-    if r < 0 {
-        None
-    } else {
-        Some(r)
-    }
-}
-
 unsafe fn list_count(hwnd: HWND) -> i32 {
     SendMessageW(hwnd, LVM_GETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0 as i32
 }
-
-unsafe fn list_set_sel(hwnd: HWND, row: i32) {
-    let mut item: LVITEMW = std::mem::zeroed();
-    item.state = LVITEM_STATE_SEL_FOCUS;
-    item.stateMask = LVITEM_STATE_SEL_FOCUS;
-    let _ = SendMessageW(
-        hwnd,
-        LVM_SETITEMSTATE,
-        Some(WPARAM(row as usize)),
-        Some(LPARAM(&mut item as *mut _ as isize)),
-    );
-}
-
-/// `LVIS_SELECTED | LVIS_FOCUSED`, combined by hand (flag newtypes have no
-/// `BitOr` impl in the pinned windows crate).
-const LVITEM_STATE_SEL_FOCUS: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS =
-    windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
 
 /// Create a child control. `style` is the low-level `DWORD` style bitset
 /// (the crate's `WINDOW_STYLE` is a wrapper we build from it).
@@ -942,10 +1049,11 @@ fn shell_launch_service() -> bool {
     ok
 }
 
-/// Launch the service elevated (tray menu "Start service"). Failures
-/// (unresolvable exe, refused launch) are logged; the UI keeps running. While
-/// [`LAUNCH_PENDING`] is set (the startup probe's retry window, or another
-/// launch already underway), the click is skipped so UAC isn't double-prompted.
+/// Launch the service elevated (tray menu "Start service", or the in-window
+/// `[启动服务]` button). Failures (unresolvable exe, refused launch) are logged;
+/// the UI keeps running. While [`LAUNCH_PENDING`] is set (the startup probe's
+/// retry window, or another launch already underway), the click is skipped so
+/// UAC isn't double-prompted.
 fn start_service() {
     if LAUNCH_PENDING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -994,8 +1102,7 @@ fn startup_probe(hwnd: HWND, pipe: String) {
             std::thread::sleep(Duration::from_millis(1000));
             if probe() {
                 LAUNCH_PENDING.store(false, Ordering::Release); // launched successfully
-                let _ =
-                    unsafe { PostMessageW(Some(hwnd), WM_SERVICE_UP, WPARAM(0), LPARAM(0)) };
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_SERVICE_UP, WPARAM(0), LPARAM(0)) };
                 return;
             }
         }
@@ -1057,95 +1164,47 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 }
 
 // ---------------------------------------------------------------------------
-// Value formatting / parsing (config <-> editor strings)
+// Checklist <-> Config mapping
 // ---------------------------------------------------------------------------
 
-fn fmt_priority(p: &Option<PriorityClass>) -> String {
-    match p {
-        None => "-".to_string(),
-        Some(pc) => PRIORITIES
-            .iter()
-            .find(|(c, _)| c == pc)
-            .map(|(_, s)| s.to_string())
-            .unwrap_or_default(),
+/// Build the per-row `BackgroundRule` from the global optimization toggles.
+/// Task 4 merges per-row advanced overrides on top of these defaults (see
+/// `build_config_from_ui`).
+fn bg_rule_from_toggles(
+    name: String,
+    suspend: bool,
+    low_priority: bool,
+    cpu_limit: bool,
+    cpu_pct: u32,
+    trim_memory: bool,
+) -> BackgroundRule {
+    BackgroundRule {
+        name,
+        suspend,
+        priority: low_priority.then_some(PriorityClass::BelowNormal),
+        qos_cpu_quota: cpu_limit.then_some(cpu_pct),
+        trim_memory,
+        affinity: None,
     }
 }
 
-fn fmt_affinity(a: &Option<AffinitySpec>) -> String {
-    match a {
-        Some(spec) => spec
-            .cores
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        None => String::new(),
+/// CPU-limit combo level → `qos_cpu_quota` percentage (低/中/高 → 30/50/70).
+fn cpu_level_to_pct(level: usize) -> u32 {
+    match level {
+        0 => 30,
+        2 => 70,
+        _ => 50,
     }
 }
 
-/// Combo index -> priority; index 0 is "(default)" = `None`.
-fn combo_idx(p: &Option<PriorityClass>) -> i32 {
-    match p {
-        None => 0,
-        Some(prio) => PRIORITIES
-            .iter()
-            .position(|(pc, _)| pc == prio)
-            .map(|i| i as i32 + 1)
-            .unwrap_or(0),
+/// `qos_cpu_quota` percentage → CPU-limit combo level (30 → 低, 70 → 高,
+/// anything else → 中).
+fn pct_to_cpu_level(pct: u32) -> usize {
+    match pct {
+        30 => 0,
+        70 => 2,
+        _ => 1,
     }
-}
-
-fn combo_to_priority(idx: i32) -> Option<PriorityClass> {
-    if idx <= 0 {
-        return None;
-    }
-    PRIORITIES.get((idx - 1) as usize).map(|(pc, _)| *pc)
-}
-
-/// Parse "0,1" (or empty) into an affinity spec. Syntax only: a range
-/// check (e.g. core >= 64) is left to `Config::validate` at Save time.
-fn parse_affinity(s: &str) -> Result<Option<AffinitySpec>, String> {
-    let t = s.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
-    let mut cores: Vec<u8> = Vec::new();
-    for part in t.split(',') {
-        let p = part.trim();
-        if p.is_empty() {
-            return Err(format!("affinity: empty core entry in '{s}'"));
-        }
-        let c: u8 = p
-            .parse()
-            .map_err(|_| format!("affinity: '{p}' is not a valid core index"))?;
-        cores.push(c);
-    }
-    if cores.is_empty() {
-        return Err("affinity: no cores".into());
-    }
-    Ok(Some(AffinitySpec { cores }))
-}
-
-/// Parse the qos_cpu_quota edit as a number (or empty = unset). Range
-/// validation (1..=100) happens in `Config::validate`.
-fn parse_qos(s: &str) -> Result<Option<u32>, String> {
-    let t = s.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
-    let q: u32 = t
-        .parse()
-        .map_err(|_| format!("qos: '{t}' is not a number"))?;
-    Ok(Some(q))
-}
-
-/// True when the service's Save refusal means "run the UI elevated". The
-/// service refuses `SaveConfig` with different phrasings across builds, so the
-/// detection is a pure, unit-tested classifier rather than inline string
-/// sniffing that a message reword could silently break.
-fn needs_elevation(msg: &str) -> bool {
-    msg.to_ascii_lowercase().contains("elevat")
-        || msg.to_ascii_lowercase().contains("administrator")
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,21 +1216,11 @@ impl UiState {
         match kind {
             ListKind::Game => self.h_list_game,
             ListKind::Background => self.h_list_bg,
-            ListKind::Rule => self.h_list_rule,
-        }
-    }
-
-    fn rows_mut(&mut self, kind: ListKind) -> &mut Vec<usize> {
-        match kind {
-            ListKind::Game => &mut self.game_row_to_idx,
-            ListKind::Background => &mut self.bg_row_to_idx,
-            ListKind::Rule => &mut self.rule_row_to_idx,
         }
     }
 
     /// Show the last operation outcome in the bottom status line.
     unsafe fn set_result(&mut self, hwnd: HWND, msg: &str) {
-        self.last_result = Some(msg.to_string());
         set_text(self.h_result, msg);
         let _ = hwnd;
     }
@@ -1185,24 +1234,17 @@ impl UiState {
         }
     }
 
+    /// Render the status static: "正在优化中" once the service has answered a
+    /// `GetState` (mode non-empty), "未运行" otherwise.
     unsafe fn update_status(&self, hwnd: HWND) {
         let _ = hwnd;
-        set_text(self.h_status_mode, &format!("Mode: {}", self.mode));
-        let names = if self.boosted.is_empty() {
-            "(none)".to_string()
+        let lang = self.lang;
+        let text = if self.mode.is_empty() {
+            tr(lang, "status_stopped").to_string()
         } else {
-            self.boosted
-                .iter()
-                .map(|p| format!("{} (pid {})", p.name, p.pid))
-                .collect::<Vec<_>>()
-                .join(", ")
+            tr(lang, "status_running").to_string()
         };
-        set_text(
-            self.h_status_boosted,
-            &format!("Boosted ({}): {}", self.boosted.len(), names),
-        );
-        let rel = self.last_reload.as_deref().unwrap_or("(none)");
-        set_text(self.h_status_reload, &format!("Last reload: {rel}"));
+        set_text(self.h_status, &text);
     }
 
     /// Kick off an IPC call on a worker thread; the outcome is applied on the
@@ -1211,7 +1253,7 @@ impl UiState {
         spawn_worker(hwnd, call.as_wparam(), self.pipe.clone(), req);
     }
 
-    /// Start a Refresh: re-pull `GetState` on a worker thread.
+    /// Start a refresh: re-pull `GetState` on a worker thread.
     unsafe fn start_refresh(&self, hwnd: HWND) {
         self.spawn(hwnd, IpcCall::GetState, Request::GetState);
     }
@@ -1263,13 +1305,14 @@ impl UiState {
         });
     }
 
-    /// Apply a completed `GetState` to the status panel. Never touches the
-    /// editor's local config copy, and while `init_error` is set it leaves the
-    /// result line untouched so the "config failed to load" warning persists.
+    /// Apply a completed `GetState` to the status line and tray icon. Never
+    /// touches the editor's local config copy, and while `init_error` is set it
+    /// leaves the result line untouched so the "config failed to load" warning
+    /// persists.
     ///
-    /// Every `GetState` outcome (startup pull, Refresh button, tray-status
-    /// timer) also drives the tray icon: green when the service answered, gray
-    /// when it did not.
+    /// Every `GetState` outcome (startup pull, Refresh, tray-status timer, the
+    /// start/stop buttons' refresh) also drives the tray icon: green when the
+    /// service answered, gray when it did not.
     unsafe fn on_get_state_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
         // The in-flight tray-status probe (if any) has landed — allow the next
         // WM_TIMER tick to start a fresh one.
@@ -1277,376 +1320,168 @@ impl UiState {
         match result {
             Ok(Response::State(s)) => {
                 self.mode = s.mode;
-                self.boosted = s.boosted;
-                self.last_reload = s.last_reload;
                 self.update_tray_status(hwnd, true);
-                self.set_result_if_loaded(hwnd, "Status refreshed");
+                self.set_result_if_loaded(hwnd, tr(self.lang, "status_refreshed"));
             }
             Ok(_) => {
+                self.mode.clear();
                 self.update_tray_status(hwnd, false);
-                self.set_result_if_loaded(hwnd, "Refresh: unexpected response");
+                self.set_result_if_loaded(hwnd, tr(self.lang, "unexpected_response"));
             }
             Err(e) => {
+                self.mode.clear();
                 self.update_tray_status(hwnd, false);
-                self.set_result_if_loaded(hwnd, &format!("Refresh failed: {e}"));
+                self.set_result_if_loaded(
+                    hwnd,
+                    &format!("{}: {e}", tr(self.lang, "status_failed")),
+                );
             }
         }
         self.update_status(hwnd);
     }
 
-    /// Rebuild one list from the local config and refresh its row->index map.
+    /// Rebuild one list from the local config. Rows map 1:1 to the config
+    /// vectors (row *i* of the game list = `cfg.game.processes[i]`, etc.), so a
+    /// Save can read the checkboxes straight from the list. Every row starts
+    /// checked — a row present in the list is an enabled entry.
     unsafe fn rebuild_list(&mut self, hwnd: HWND, kind: ListKind) {
         let _ = hwnd;
         let list = self.list_hwnd(kind);
         list_clear(list);
-        let mut map: Vec<usize> = Vec::new();
         match kind {
             ListKind::Game => {
-                for (i, p) in self.cfg.game.processes.iter().enumerate() {
-                    list_add_row(list, &[p.clone()]);
-                    map.push(i);
+                for p in &self.cfg.game.processes {
+                    let row = list_add_row(list, std::slice::from_ref(p));
+                    list_set_checked(list, row, true);
                 }
             }
             ListKind::Background => {
-                for (i, b) in self.cfg.background.iter().enumerate() {
-                    let cols = vec![
-                        b.name.clone(),
-                        fmt_priority(&b.priority),
-                        fmt_affinity(&b.affinity),
-                        b.qos_cpu_quota.map(|q| q.to_string()).unwrap_or_default(),
-                    ];
-                    list_add_row(list, &cols);
-                    map.push(i);
-                }
-            }
-            ListKind::Rule => {
-                for (i, r) in self.cfg.rule.iter().enumerate() {
-                    let cols = vec![
-                        r.name.clone(),
-                        fmt_priority(&r.priority),
-                        fmt_affinity(&r.affinity),
-                    ];
-                    list_add_row(list, &cols);
-                    map.push(i);
+                for b in &self.cfg.background {
+                    let row = list_add_row(list, std::slice::from_ref(&b.name));
+                    list_set_checked(list, row, true);
                 }
             }
         }
-        *self.rows_mut(kind) = map;
     }
 
-    /// Rebuild all three lists, then restore the previous selection (or pick
-    /// the first background row on first load).
-    unsafe fn rebuild_all(&mut self, hwnd: HWND) {
-        let _busy = BusyGuard::acquire(&mut *self);
-        let (prev_active, prev_row) = (self.active, self.cur_row);
-        self.rebuild_list(hwnd, ListKind::Game);
-        self.rebuild_list(hwnd, ListKind::Background);
-        self.rebuild_list(hwnd, ListKind::Rule);
-        let count = list_count(self.list_hwnd(prev_active));
-        match prev_row {
-            Some(r) if r < count as usize => {
-                list_set_sel(self.list_hwnd(prev_active), r as i32);
-                self.cur_row = Some(r);
-            }
-            Some(_) if count > 0 => {
-                list_set_sel(self.list_hwnd(prev_active), count - 1);
-                self.cur_row = Some((count - 1) as usize);
-            }
-            Some(_) | None if count > 0 && prev_active == ListKind::Background => {
-                list_set_sel(self.list_hwnd(prev_active), 0);
-                self.cur_row = Some(0);
-            }
-            _ => self.cur_row = None,
-        }
-        self.active = prev_active;
-        self.load_fields(hwnd);
-    }
-
-    /// Enable/disable the editor controls for the current row kind.
-    unsafe fn enable_editor(&self, on: bool) {
-        let bg = on && self.active == ListKind::Background;
-        let non_game = on && self.active != ListKind::Game;
-        let _ = EnableWindow(self.h_name, on.into());
-        let _ = EnableWindow(self.h_prio, non_game.into());
-        let _ = EnableWindow(self.h_aff, non_game.into());
-        let _ = EnableWindow(self.h_qos, bg.into());
-        let _ = EnableWindow(self.h_suspend, bg.into());
-        let _ = EnableWindow(self.h_trim, bg.into());
-    }
-
-    /// Load the currently selected row's fields into the editor controls.
-    unsafe fn load_fields(&self, hwnd: HWND) {
-        let _ = hwnd;
-        let Some(row) = self.cur_row else {
-            set_text(self.h_name, "");
-            combo_set_sel(self.h_prio, 0);
-            set_text(self.h_aff, "");
-            set_text(self.h_qos, "");
-            btn_set(self.h_suspend, false);
-            btn_set(self.h_trim, false);
-            self.enable_editor(false);
+    /// Append a process `name` to the given list and its local config (no
+    /// duplicates), then rebuild that list. Called for both the add-by-name
+    /// prompt (`WM_PROMPT_RESULT`) and the running-process picker
+    /// (`WM_PICK_RESULT`).
+    unsafe fn append_name(&mut self, hwnd: HWND, kind: ListKind, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
             return;
-        };
-        self.enable_editor(true);
-        match self.active {
-            ListKind::Game => {
-                if let Some(p) = self.cfg.game.processes.get(row) {
-                    set_text(self.h_name, p);
-                }
-                // Game rows have no rule fields: clear the disabled controls so
-                // stale values from a previously selected background/rule row
-                // don't linger in the greyed-out editor.
-                combo_set_sel(self.h_prio, 0);
-                set_text(self.h_aff, "");
-                set_text(self.h_qos, "");
-                btn_set(self.h_suspend, false);
-                btn_set(self.h_trim, false);
-            }
-            ListKind::Background => {
-                if let Some(&idx) = self.bg_row_to_idx.get(row) {
-                    if let Some(b) = self.cfg.background.get(idx) {
-                        set_text(self.h_name, &b.name);
-                        combo_set_sel(self.h_prio, combo_idx(&b.priority));
-                        set_text(self.h_aff, &fmt_affinity(&b.affinity));
-                        set_text(
-                            self.h_qos,
-                            &b.qos_cpu_quota.map(|q| q.to_string()).unwrap_or_default(),
-                        );
-                        btn_set(self.h_suspend, b.suspend);
-                        btn_set(self.h_trim, b.trim_memory);
-                    }
-                }
-            }
-            ListKind::Rule => {
-                if let Some(&idx) = self.rule_row_to_idx.get(row) {
-                    if let Some(r) = self.cfg.rule.get(idx) {
-                        set_text(self.h_name, &r.name);
-                        combo_set_sel(self.h_prio, combo_idx(&r.priority));
-                        set_text(self.h_aff, &fmt_affinity(&r.affinity));
-                        set_text(self.h_qos, "");
-                        btn_set(self.h_suspend, false);
-                        btn_set(self.h_trim, false);
-                    }
-                }
-            }
         }
-    }
-
-    /// Write the editor controls back into the selected row's local config and
-    /// repaint that list. Returns `false` (with a message) if nothing is
-    /// selected or a field fails to parse.
-    unsafe fn apply_fields(&mut self, hwnd: HWND) -> bool {
         let _busy = BusyGuard::acquire(&mut *self);
-        let Some(row) = self.cur_row else {
-            self.set_result(hwnd, "No row selected to apply");
-            return false;
-        };
-        let name = get_text(self.h_name).trim().to_string();
-        match self.active {
+        match kind {
             ListKind::Game => {
-                let Some(&idx) = self.game_row_to_idx.get(row) else {
-                    return false;
-                };
-                if let Some(p) = self.cfg.game.processes.get_mut(idx) {
-                    *p = name;
+                if !self.cfg.game.processes.iter().any(|p| p == name) {
+                    self.cfg.game.processes.push(name.to_string());
                 }
             }
             ListKind::Background => {
-                let Some(&idx) = self.bg_row_to_idx.get(row) else {
-                    return false;
-                };
-                let affinity = match parse_affinity(&get_text(self.h_aff)) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        self.set_result(hwnd, &e);
-                        return false;
-                    }
-                };
-                let qos = match parse_qos(&get_text(self.h_qos)) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        self.set_result(hwnd, &e);
-                        return false;
-                    }
-                };
-                if let Some(b) = self.cfg.background.get_mut(idx) {
-                    b.name = name;
-                    b.priority = combo_to_priority(combo_get_sel(self.h_prio));
-                    b.affinity = affinity;
-                    b.qos_cpu_quota = qos;
-                    b.suspend = btn_get(self.h_suspend);
-                    b.trim_memory = btn_get(self.h_trim);
-                }
-            }
-            ListKind::Rule => {
-                let Some(&idx) = self.rule_row_to_idx.get(row) else {
-                    return false;
-                };
-                let affinity = match parse_affinity(&get_text(self.h_aff)) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        self.set_result(hwnd, &e);
-                        return false;
-                    }
-                };
-                if let Some(r) = self.cfg.rule.get_mut(idx) {
-                    r.name = name;
-                    r.priority = combo_to_priority(combo_get_sel(self.h_prio));
-                    r.affinity = affinity;
+                if !self.cfg.background.iter().any(|b| b.name == name) {
+                    self.cfg.background.push(BackgroundRule {
+                        name: name.to_string(),
+                        ..Default::default()
+                    });
                 }
             }
         }
-        // Repaint the active list and restore the selection so the new values
-        // are visible. The busy guard suppresses the reentrant LVN_ITEMCHANGED,
-        // so reload the fields explicitly below.
-        self.rebuild_list(hwnd, self.active);
-        let n = list_count(self.list_hwnd(self.active));
-        if row < n as usize {
-            list_set_sel(self.list_hwnd(self.active), row as i32);
-        }
-        self.load_fields(hwnd);
-        self.set_result(hwnd, "Applied");
-        true
+        self.rebuild_list(hwnd, kind);
+        self.set_result(hwnd, &format!("{}: {name}", tr(self.lang, "added")));
     }
 
-    /// Add a blank row of the active list's type to the local config.
-    unsafe fn add_row(&mut self, hwnd: HWND) {
-        let _busy = BusyGuard::acquire(&mut *self);
-        let target = self.active;
-        match target {
-            ListKind::Game => self.cfg.game.processes.push(String::new()),
-            ListKind::Background => self.cfg.background.push(BackgroundRule::default()),
-            ListKind::Rule => self.cfg.rule.push(AlwaysRule::default()),
-        }
-        self.rebuild_list(hwnd, target);
-        let n = list_count(self.list_hwnd(target));
-        if n > 0 {
-            let new_row = n - 1;
-            list_set_sel(self.list_hwnd(target), new_row);
-            self.cur_row = Some(new_row as usize);
-        }
-        self.active = target;
-        self.load_fields(hwnd);
-        self.set_result(hwnd, "Added a new row");
+    /// Open the modal running-process picker for `kind`.
+    unsafe fn open_picker(&mut self, hwnd: HWND, kind: ListKind) {
+        let hinst: HINSTANCE = GetModuleHandleW(None)
+            .expect("module handle")
+            .into();
+        show_process_picker(hwnd, kind.to_usize() as isize, hinst);
     }
 
-    /// Re-fetch the service's config into the editor on a worker thread
-    /// ("Reload cfg"). On success the working copy is replaced, any startup
-    /// `init_error` is cleared (re-enabling Save), and the lists are rebuilt.
-    unsafe fn start_reload_cfg(&self, hwnd: HWND) {
-        self.spawn(hwnd, IpcCall::ReloadCfg, Request::GetConfig);
+    /// Open the modal add-by-name prompt for `kind`.
+    unsafe fn open_prompt(&mut self, hwnd: HWND, kind: ListKind) {
+        let hinst: HINSTANCE = GetModuleHandleW(None)
+            .expect("module handle")
+            .into();
+        show_name_prompt(hwnd, kind.to_usize() as isize, hinst);
     }
 
-    unsafe fn on_reload_cfg_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
-        match result {
-            Ok(Response::Config(c)) => self.apply_config(hwnd, c, "Config reloaded from service"),
-            Ok(_) => self.set_result(hwnd, "Reload config: unexpected response"),
-            Err(e) => self.set_result(hwnd, &format!("Reload config failed: {e}")),
-        }
-    }
+    /// Build a fresh `Config` from the current UI state: games = checked game
+    /// rows; background = checked background rows with the global toggles
+    /// applied (merged with any Task-4 per-row override); `rule` /
+    /// `protected_extra` / `network` / `overlay` carried over unchanged.
+    unsafe fn build_config_from_ui(&mut self) -> Config {
+        let mut cfg = self.cfg.clone();
 
-    /// Startup `GetConfig` outcome: swap in the real config, or (on failure)
-    /// arm the save-blocked guard and surface the error.
-    unsafe fn on_get_config_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
-        match result {
-            Ok(Response::Config(c)) => {
-                self.apply_config(hwnd, c, "Config loaded. Click Refresh for live status.");
-            }
-            Ok(_) => self.fail_init(hwnd, "GetConfig: unexpected response"),
-            Err(e) => self.fail_init(hwnd, &format!("GetConfig failed: {e}")),
-        }
-    }
-
-    /// Swap in a config fetched from the service: replace the working copy,
-    /// mark the config loaded (unblocking Save), clear any startup `init_error`
-    /// and rebuild the lists.
-    unsafe fn apply_config(&mut self, hwnd: HWND, c: Config, msg: &str) {
-        self.config_loaded = true;
-        self.cfg = c;
-        self.init_error = None;
-        self.rebuild_all(hwnd);
-        self.set_result(hwnd, msg);
-    }
-
-    /// Record a failed config load: arm the save-blocked guard and show the
-    /// error (kept visible until a `GetConfig` succeeds).
-    unsafe fn fail_init(&mut self, hwnd: HWND, msg: &str) {
-        self.init_error = Some(msg.to_string());
-        self.set_result(hwnd, msg);
-    }
-
-    /// Remove the selected row from the local config.
-    unsafe fn delete_row(&mut self, hwnd: HWND) {
-        let _busy = BusyGuard::acquire(&mut *self);
-        let Some(row) = self.cur_row else {
-            self.set_result(hwnd, "No row selected to delete");
-            return;
-        };
-        let idx = match self.active {
-            ListKind::Game => self.game_row_to_idx.get(row).copied(),
-            ListKind::Background => self.bg_row_to_idx.get(row).copied(),
-            ListKind::Rule => self.rule_row_to_idx.get(row).copied(),
-        };
-        let Some(idx) = idx else { return };
-        match self.active {
-            ListKind::Game => {
-                if idx < self.cfg.game.processes.len() {
-                    self.cfg.game.processes.remove(idx);
-                }
-            }
-            ListKind::Background => {
-                if idx < self.cfg.background.len() {
-                    self.cfg.background.remove(idx);
-                }
-            }
-            ListKind::Rule => {
-                if idx < self.cfg.rule.len() {
-                    self.cfg.rule.remove(idx);
+        // Games: checked rows only (unchecked game rows are dropped on save).
+        let mut processes = Vec::new();
+        for row in 0..list_count(self.h_list_game) {
+            if list_checked(self.h_list_game, row) {
+                if let Some(name) = self.cfg.game.processes.get(row as usize) {
+                    processes.push(name.clone());
                 }
             }
         }
-        self.rebuild_list(hwnd, self.active);
-        let n = list_count(self.list_hwnd(self.active));
-        self.cur_row = if n > 0 {
-            let next = (row as i32).min(n - 1).max(0);
-            list_set_sel(self.list_hwnd(self.active), next);
-            Some(next as usize)
-        } else {
-            None
-        };
-        self.load_fields(hwnd);
-        self.set_result(hwnd, "Deleted");
+        cfg.game.processes = processes;
+
+        // Background apps: checked rows become rules built from the global
+        // toggles. A row with a Task-4 advanced override (presently none) uses
+        // the override wholesale instead of the global defaults.
+        let suspend = btn_get(self.h_opt_suspend);
+        let low_prio = btn_get(self.h_opt_low_prio);
+        let cpu = btn_get(self.h_opt_cpu);
+        let cpu_pct = cpu_level_to_pct(combo_get_sel(self.h_combo_cpu).max(0) as usize);
+        let trim = btn_get(self.h_opt_mem);
+        let mut rules = Vec::new();
+        for row in 0..list_count(self.h_list_bg) {
+            if !list_checked(self.h_list_bg, row) {
+                continue;
+            }
+            let Some(name) = self.cfg.background.get(row as usize).map(|b| b.name.clone())
+            else {
+                continue;
+            };
+            let rule = if let Some(ov) = self.bg_overrides.get(&name) {
+                ov.clone()
+            } else {
+                bg_rule_from_toggles(name, suspend, low_prio, cpu, cpu_pct, trim)
+            };
+            rules.push(rule);
+        }
+        cfg.background = rules;
+        cfg
     }
 
-    /// Save: commit the editor fields to the selected row, validate the whole
-    /// local config, then push it to the service on a worker thread. Invalid
-    /// configs are rejected locally *before* any round-trip (the service
-    /// validates again on its side, so an invalid config can never reach the
-    /// file).
+    /// Save: build the `Config` from the checklists + toggles, validate it,
+    /// then push it to the service on a worker thread. Invalid configs are
+    /// rejected locally *before* any round-trip (the service validates again on
+    /// its side, so an invalid config can never reach the file).
     ///
     /// If no `GetConfig` has succeeded yet, the local config is a
     /// `Config::default()` stub; saving that stub would overwrite the real
-    /// config on disk, so Save is refused until a successful load (startup or
-    /// "Reload cfg") — tracked by `init_error`/`config_loaded`.
+    /// config on disk, so Save is refused until a successful load — tracked by
+    /// `init_error`/`config_loaded`.
     unsafe fn do_save(&mut self, hwnd: HWND) {
         if self.save_in_flight {
-            self.set_result(hwnd, "Save already in progress");
+            self.set_result(hwnd, tr(self.lang, "save_in_progress"));
             return;
         }
         if self.init_error.is_some() || !self.config_loaded {
-            self.set_result(
-                hwnd,
-                "Save blocked: config not loaded from service — click 'Reload cfg' first",
-            );
+            self.set_result(hwnd, tr(self.lang, "save_blocked"));
             return;
         }
-        if !self.apply_fields(hwnd) {
-            return;
-        }
-        match self.cfg.validate() {
-            Err(e) => self.set_result(hwnd, &format!("Config invalid: {e}")),
+        let cfg = self.build_config_from_ui();
+        match cfg.validate() {
+            Err(e) => {
+                self.set_result(hwnd, &format!("{}: {e}", tr(self.lang, "cfg_invalid")));
+            }
             Ok(_) => {
-                let cfg = self.cfg.clone();
+                // Keep the working copy in sync with what is about to be saved
+                // so the lists/toggles stay consistent after the round-trip.
+                self.cfg = cfg.clone();
                 self.save_in_flight = true;
                 self.spawn(hwnd, IpcCall::Save, Request::SaveConfig(cfg));
             }
@@ -1658,10 +1493,14 @@ impl UiState {
         // the next click starts a fresh save.
         self.save_in_flight = false;
         match result {
-            Ok(Response::SaveConfig(Ok(m))) => self.set_result(hwnd, &format!("Saved: {m}")),
+            Ok(Response::SaveConfig(Ok(m))) => {
+                self.set_result(hwnd, &format!("{}: {m}", tr(self.lang, "save_ok")));
+            }
             Ok(Response::SaveConfig(Err(e))) => self.on_save_elevation(hwnd, &e),
-            Ok(_) => self.set_result(hwnd, "Save: unexpected response"),
-            Err(e) => self.set_result(hwnd, &format!("Save failed: {e}")),
+            Ok(_) => self.set_result(hwnd, tr(self.lang, "unexpected_response")),
+            Err(e) => {
+                self.set_result(hwnd, &format!("{}: {e}", tr(self.lang, "save_failed")));
+            }
         }
     }
 
@@ -1673,9 +1512,7 @@ impl UiState {
     /// the service's error.
     unsafe fn on_save_elevation(&mut self, hwnd: HWND, msg: &str) {
         if needs_elevation(msg) && !aetheris_core::actions::is_elevated() {
-            let wide = to_wide(
-                "Save requires administrator rights.\n\nRelaunching as administrator will close this editor and any unsaved changes will be lost.\n\nRelaunch aetheris as administrator and try again?",
-            );
+            let wide = to_wide(tr(self.lang, "save_relaunch_prompt"));
             let rc = MessageBoxW(
                 Some(hwnd),
                 PCWSTR(wide.as_ptr()),
@@ -1709,51 +1546,556 @@ impl UiState {
                 }
             }
         }
-        self.set_result(hwnd, &format!("Save failed: {msg}"));
+        self.set_result(
+            hwnd,
+            &format!("{}: {msg}", tr(self.lang, "save_failed")),
+        );
     }
 
-    /// Ask the service to re-read its config file from disk (worker thread).
-    unsafe fn do_reload(&self, hwnd: HWND) {
-        self.spawn(hwnd, IpcCall::Reload, Request::ReloadConfig);
+    /// Initialize the global optimization toggles from the loaded config so an
+    /// existing config is not silently rewritten on the first Save. Uses the
+    /// first background rule as the representative; falls back to defaults (all
+    /// off, CPU = medium) when there are no rules. Task 4's advanced editor is
+    /// where per-row precision lives.
+    unsafe fn sync_toggles_from_cfg(&mut self) {
+        let default = BackgroundRule::default();
+        let b = self.cfg.background.first().unwrap_or(&default);
+        btn_set(self.h_opt_suspend, b.suspend);
+        btn_set(self.h_opt_low_prio, b.priority.is_some());
+        let cpu_on = b.qos_cpu_quota.is_some();
+        btn_set(self.h_opt_cpu, cpu_on);
+        self.cpu_level = b.qos_cpu_quota.map(pct_to_cpu_level).unwrap_or(1);
+        combo_set_sel(self.h_combo_cpu, self.cpu_level as i32);
+        btn_set(self.h_opt_mem, b.trim_memory);
     }
 
-    unsafe fn on_reload_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
-        match result {
-            Ok(Response::Reload(m)) => {
-                self.set_result(hwnd, &format!("Reload queued: {m}"));
-                // Pull the fresh snapshot so last_reload reflects the outcome.
-                self.start_refresh(hwnd);
-            }
-            Ok(_) => self.set_result(hwnd, "Reload: unexpected response"),
-            Err(e) => self.set_result(hwnd, &format!("Reload failed: {e}")),
-        }
-    }
-
-    /// Set up listview columns and the priority combo items (called once from
-    /// `WM_CREATE` after the controls exist).
+    /// Set up listview columns and the CPU-limit combo items (called once from
+    /// `WM_CREATE` after the controls exist; `apply_language` re-renders them
+    /// with the loaded language before the window is shown).
     unsafe fn setup_columns(&self) {
-        list_add_column(self.h_list_game, 0, "Process", 180);
-        list_add_column(self.h_list_bg, 0, "Name", 110);
-        list_add_column(self.h_list_bg, 1, "Priority", 85);
-        list_add_column(self.h_list_bg, 2, "Affinity", 70);
-        list_add_column(self.h_list_bg, 3, "QoS", 45);
-        list_add_column(self.h_list_rule, 0, "Name", 110);
-        list_add_column(self.h_list_rule, 1, "Priority", 85);
-        list_add_column(self.h_list_rule, 2, "Affinity", 70);
-        combo_add(self.h_prio, "(default)");
-        for &(_, s) in PRIORITIES {
-            combo_add(self.h_prio, s);
+        list_add_column(self.h_list_game, 0, tr(self.lang, "list_process_name"), 220);
+        list_add_column(self.h_list_bg, 0, tr(self.lang, "list_process_name"), 220);
+        for key in ["cpu_low", "cpu_med", "cpu_high"] {
+            combo_add(self.h_combo_cpu, tr(self.lang, key));
+        }
+        combo_set_sel(self.h_combo_cpu, 1);
+    }
+
+    /// First paint: rebuild the lists, initialize the toggles from the (stub)
+    /// config and show a loading placeholder. The startup `GetConfig`/`GetState`
+    /// are in flight on worker threads and replace it (with the real config, or
+    /// the load error) when they land.
+    unsafe fn init_widgets(&mut self, hwnd: HWND) {
+        self.rebuild_list(hwnd, ListKind::Game);
+        self.rebuild_list(hwnd, ListKind::Background);
+        self.sync_toggles_from_cfg();
+        self.update_status(hwnd);
+        self.set_result(hwnd, tr(self.lang, "loading"));
+    }
+
+    /// Startup `GetConfig` outcome: swap in the real config, or (on failure)
+    /// arm the save-blocked guard and surface the error.
+    unsafe fn on_get_config_result(&mut self, hwnd: HWND, result: Result<Response, String>) {
+        match result {
+            Ok(Response::Config(c)) => self.apply_config(hwnd, c, tr(self.lang, "cfg_loaded")),
+            Ok(_) => self.fail_init(hwnd, tr(self.lang, "unexpected_response")),
+            Err(e) => {
+                self.fail_init(hwnd, &format!("{}: {e}", tr(self.lang, "cfg_load_failed")));
+            }
         }
     }
 
-    /// First paint: rebuild the lists and show a loading placeholder. The
-    /// startup `GetConfig`/`GetState` are in flight on worker threads and
-    /// replace it (with the real config, or the load error) when they land.
-    unsafe fn init_widgets(&mut self, hwnd: HWND) {
-        self.rebuild_all(hwnd);
-        self.update_status(hwnd);
-        self.set_result(hwnd, "Loading config from service...");
+    /// Swap in a config fetched from the service: replace the working copy,
+    /// mark the config loaded (unblocking Save), clear any startup `init_error`
+    /// and rebuild the lists + toggles.
+    unsafe fn apply_config(&mut self, hwnd: HWND, c: Config, msg: &str) {
+        self.config_loaded = true;
+        self.cfg = c;
+        self.init_error = None;
+        let _busy = BusyGuard::acquire(&mut *self);
+        self.rebuild_list(hwnd, ListKind::Game);
+        self.rebuild_list(hwnd, ListKind::Background);
+        self.sync_toggles_from_cfg();
+        self.set_result(hwnd, msg);
     }
+
+    /// Record a failed config load: arm the save-blocked guard and show the
+    /// error (kept visible until a `GetConfig` succeeds).
+    unsafe fn fail_init(&mut self, hwnd: HWND, msg: &str) {
+        self.init_error = Some(msg.to_string());
+        self.set_result(hwnd, msg);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Running-process picker + add-by-name prompt (modal popups)
+// ---------------------------------------------------------------------------
+
+/// List distinct running process image names via `EnumProcesses` +
+/// `QueryFullProcessImageNameW`, sorted and deduplicated. On any failure
+/// returns an empty list.
+unsafe fn enumerate_processes() -> Vec<String> {
+    let mut pids = vec![0u32; 4096];
+    let mut needed = 0u32;
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if EnumProcesses(
+        pids.as_mut_ptr(),
+        (pids.len() * std::mem::size_of::<u32>()) as u32,
+        &mut needed,
+    )
+    .is_err()
+    {
+        return Vec::new();
+    }
+    let count = ((needed as usize) / std::mem::size_of::<u32>()).min(pids.len());
+    for &pid in &pids[..count] {
+        if pid == 0 {
+            continue;
+        }
+        // PROCESS_QUERY_LIMITED_INFORMATION is enough for the image name and is
+        // available to non-elevated callers for other users' processes.
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            continue;
+        };
+        let mut buf = vec![0u16; 260];
+        let mut sz = buf.len() as u32;
+        let ok =
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut sz);
+        let _ = CloseHandle(h);
+        if ok.is_err() {
+            continue;
+        }
+        let full = String::from_utf16_lossy(&buf[..sz as usize]);
+        let name = std::path::Path::new(&full)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| full.clone());
+        if !name.is_empty() {
+            set.insert(name);
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Register a top-level class for one of the modal popups. `RegisterClassW`
+/// returns 0 for an already-registered class (1410 = `ERROR_CLASS_ALREADY_EXISTS`),
+/// which is expected when a popup is opened more than once — treat it as a
+/// success.
+///
+/// # Safety
+/// `name` must be a static null-terminated wide string; `wndproc` must be a
+/// valid window-procedure entry point.
+unsafe fn register_popup_class(name: PCWSTR, wndproc: WNDPROC, hinst: HINSTANCE) {
+    let wc = WNDCLASSW {
+        style: Default::default(),
+        lpfnWndProc: wndproc,
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinst,
+        hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+        hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+        lpszMenuName: PCWSTR::null(),
+        lpszClassName: name,
+    };
+    let rc = RegisterClassW(&wc);
+    if rc == 0 && GetLastError().0 != 1410 {
+        log_err(&format!("register popup class: last error {}", GetLastError().0));
+    }
+}
+
+/// State of the running-process picker popup, stashed in its `GWLP_USERDATA`.
+struct PickerState {
+    list: HWND,
+    /// The main window (owner); receives `WM_PICK_RESULT`.
+    parent: HWND,
+    /// `ListKind` of the list to append to (`wparam` of `WM_PICK_RESULT`).
+    target: isize,
+    /// The enumerated names in list-row order (rows map 1:1 to this vector).
+    names: Vec<String>,
+    /// Set in `WM_DESTROY`; the nested modal loop polls it to know when to
+    /// return.
+    done: bool,
+}
+
+unsafe fn pick_state_mut(hwnd: HWND) -> &'static mut PickerState {
+    let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    assert!(p != 0, "aetheris-ui: picker state missing");
+    &mut *(p as *mut PickerState)
+}
+
+/// Collect the names of the picker rows whose checkbox is checked.
+unsafe fn pick_collect_checked(st: &PickerState) -> Vec<String> {
+    let mut chosen = Vec::new();
+    for row in 0..list_count(st.list) {
+        if list_checked(st.list, row) {
+            if let Some(name) = st.names.get(row as usize) {
+                chosen.push(name.clone());
+            }
+        }
+    }
+    chosen
+}
+
+/// State of the add-by-name prompt popup, stashed in its `GWLP_USERDATA`.
+struct PromptState {
+    edit: HWND,
+    /// The main window (owner); receives `WM_PROMPT_RESULT`.
+    parent: HWND,
+    /// `ListKind` of the list to append to (`wparam` of `WM_PROMPT_RESULT`).
+    target: isize,
+    /// Set in `WM_DESTROY`; the nested modal loop polls it.
+    done: bool,
+}
+
+unsafe fn prompt_state_mut(hwnd: HWND) -> &'static mut PromptState {
+    let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    assert!(p != 0, "aetheris-ui: prompt state missing");
+    &mut *(p as *mut PromptState)
+}
+
+unsafe extern "system" fn pick_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
+        // WM_CREATE does nothing here: the children and state are created by
+        // `show_process_picker` after the window exists (no lpParam box).
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xffff) as isize;
+            let code = ((wparam.0 >> 16) & 0xffff) as u32;
+            match id {
+                IDC_PICK_OK if code == 0 => {
+                    // Scope the state borrow so it is dropped before the
+                    // reentrant WM_DESTROY from DestroyWindow runs.
+                    let (parent, target, chosen) = {
+                        let st = pick_state_mut(hwnd);
+                        (st.parent, st.target, pick_collect_checked(st))
+                    };
+                    if !chosen.is_empty() {
+                        let boxed = Box::into_raw(Box::new(chosen));
+                        let _ = PostMessageW(
+                            Some(parent),
+                            WM_PICK_RESULT,
+                            WPARAM(target as usize),
+                            LPARAM(boxed as isize),
+                        );
+                    }
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                IDC_PICK_CANCEL if code == 0 => {
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                _ => LRESULT(0),
+            }
+        }
+        WM_DESTROY => {
+            let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if p != 0 {
+                (*(p as *mut PickerState)).done = true;
+                drop(Box::from_raw(p as *mut PickerState));
+                let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }));
+    match out {
+        Ok(r) => r,
+        Err(payload) => {
+            let text = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| format!("{payload:?}"));
+            report_error(&format!("panic in picker wndproc (msg {msg:#010x}): {text}"));
+            LRESULT(0)
+        }
+    }
+}
+
+unsafe extern "system" fn prompt_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xffff) as isize;
+            let code = ((wparam.0 >> 16) & 0xffff) as u32;
+            match id {
+                IDC_PROMPT_OK if code == 0 => {
+                    let (parent, target, text) = {
+                        let st = prompt_state_mut(hwnd);
+                        (st.parent, st.target, get_text(st.edit))
+                    };
+                    let text = text.trim().to_string();
+                    if !text.is_empty() {
+                        let boxed = Box::into_raw(Box::new(text));
+                        let _ = PostMessageW(
+                            Some(parent),
+                            WM_PROMPT_RESULT,
+                            WPARAM(target as usize),
+                            LPARAM(boxed as isize),
+                        );
+                    }
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                IDC_PROMPT_CANCEL if code == 0 => {
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                _ => LRESULT(0),
+            }
+        }
+        WM_DESTROY => {
+            let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if p != 0 {
+                (*(p as *mut PromptState)).done = true;
+                drop(Box::from_raw(p as *mut PromptState));
+                let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }));
+    match out {
+        Ok(r) => r,
+        Err(payload) => {
+            let text = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| format!("{payload:?}"));
+            report_error(&format!("panic in prompt wndproc (msg {msg:#010x}): {text}"));
+            LRESULT(0)
+        }
+    }
+}
+
+/// Run a modal nested message loop for `popup`, disabling the owner `parent`
+/// while it is open and re-enabling it on return. `done` points at the popup
+/// state's `done` flag (and — after `WM_DESTROY` zeroes `GWLP_USERDATA` — the
+/// loop exits via the `p == 0` short-circuit before ever dereferencing the
+/// freed state).
+///
+/// # Safety
+/// `done` must be a pointer into the popup's live `GWLP_USERDATA` state.
+unsafe fn run_modal(popup: HWND, parent: HWND, done: *const bool) {
+    let _ = EnableWindow(parent, false);
+    let _ = ShowWindow(popup, SW_SHOW);
+    let _ = SetForegroundWindow(popup);
+    let mut msg = MSG::default();
+    loop {
+        let r = GetMessageW(&mut msg, Some(popup), 0, 0);
+        if r.0 == 0 || r.0 == -1 {
+            break;
+        }
+        let _ = TranslateMessage(&msg);
+        let _ = DispatchMessageW(&msg);
+        let p = GetWindowLongPtrW(popup, GWLP_USERDATA);
+        if p == 0 || *done {
+            break;
+        }
+    }
+    let _ = EnableWindow(parent, true);
+    let _ = SetForegroundWindow(parent);
+}
+
+/// Create the running-process picker modal popup and run it. On OK it posts
+/// `WM_PICK_RESULT` to `parent` with the checked process names.
+unsafe fn show_process_picker(parent: HWND, target: isize, hinst: HINSTANCE) {
+    register_popup_class(w!("aetheris_pick"), Some(pick_wndproc), hinst);
+    let lang = state_mut(parent).lang;
+    let names = enumerate_processes();
+    let title = to_wide(tr(lang, "pick_title"));
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 480,
+        bottom: 520,
+    };
+    let _ = AdjustWindowRectEx(&mut rc, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE::default());
+    let Ok(popup) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        w!("aetheris_pick"),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        rc.right - rc.left,
+        rc.bottom - rc.top,
+        Some(parent),
+        None,
+        Some(hinst),
+        None,
+    ) else {
+        return;
+    };
+
+    // Children (created after the popup exists, before it is shown).
+    let hint_w = to_wide(tr(lang, "pick_hint"));
+    let _ = mk_child(
+        popup,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        PCWSTR(hint_w.as_ptr()),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        10,
+        10,
+        460,
+        16,
+        IDC_PICK_HINT,
+        hinst,
+    );
+    let list = mk_list(popup, IDC_PICK_LIST, 10, 32, 460, 420, hinst);
+    list_add_column(list, 0, tr(lang, "list_process_name"), 300);
+    for name in &names {
+        list_add_row(list, std::slice::from_ref(name));
+        // New rows start unchecked: the hint says to check what to add.
+    }
+    let ok_w = to_wide(tr(lang, "pick_ok"));
+    let _ = mk_child(
+        popup,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        PCWSTR(ok_w.as_ptr()),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        280,
+        472,
+        90,
+        30,
+        IDC_PICK_OK,
+        hinst,
+    );
+    let cancel_w = to_wide(tr(lang, "pick_cancel"));
+    let _ = mk_child(
+        popup,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        PCWSTR(cancel_w.as_ptr()),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        380,
+        472,
+        90,
+        30,
+        IDC_PICK_CANCEL,
+        hinst,
+    );
+
+    let st = Box::new(PickerState {
+        list,
+        parent,
+        target,
+        names,
+        done: false,
+    });
+    let done: *const bool = &st.done;
+    SetWindowLongPtrW(popup, GWLP_USERDATA, Box::into_raw(st) as isize);
+    run_modal(popup, parent, done);
+}
+
+/// Create the add-by-name prompt modal popup and run it. On OK it posts
+/// `WM_PROMPT_RESULT` to `parent` with the typed name.
+unsafe fn show_name_prompt(parent: HWND, target: isize, hinst: HINSTANCE) {
+    register_popup_class(w!("aetheris_prompt"), Some(prompt_wndproc), hinst);
+    let lang = state_mut(parent).lang;
+    let title = to_wide(tr(lang, "add_prompt_title"));
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 380,
+        bottom: 200,
+    };
+    let _ = AdjustWindowRectEx(&mut rc, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE::default());
+    let Ok(popup) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        w!("aetheris_prompt"),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        rc.right - rc.left,
+        rc.bottom - rc.top,
+        Some(parent),
+        None,
+        Some(hinst),
+        None,
+    ) else {
+        return;
+    };
+
+    let hint_w = to_wide(tr(lang, "add_prompt_hint"));
+    let _ = mk_child(
+        popup,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        PCWSTR(hint_w.as_ptr()),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        10,
+        14,
+        360,
+        16,
+        IDC_PROMPT_HINT,
+        hinst,
+    );
+    let edit = mk_child(
+        popup,
+        WS_EX_CLIENTEDGE,
+        w!("Edit"),
+        PCWSTR::null(),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+        10,
+        38,
+        360,
+        24,
+        IDC_PROMPT_EDIT,
+        hinst,
+    );
+    let ok_w = to_wide(tr(lang, "pick_ok"));
+    let _ = mk_child(
+        popup,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        PCWSTR(ok_w.as_ptr()),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        170,
+        140,
+        90,
+        30,
+        IDC_PROMPT_OK,
+        hinst,
+    );
+    let cancel_w = to_wide(tr(lang, "pick_cancel"));
+    let _ = mk_child(
+        popup,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        PCWSTR(cancel_w.as_ptr()),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        270,
+        140,
+        90,
+        30,
+        IDC_PROMPT_CANCEL,
+        hinst,
+    );
+
+    let st = Box::new(PromptState {
+        edit,
+        parent,
+        target,
+        done: false,
+    });
+    let done: *const bool = &st.done;
+    SetWindowLongPtrW(popup, GWLP_USERDATA, Box::into_raw(st) as isize);
+    run_modal(popup, parent, done);
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,8 +2133,8 @@ unsafe extern "system" fn wndproc(
         WM_CLOSE => {
             // Title-bar close: hide to the tray instead of destroying the
             // window. Destroying would run WM_DESTROY -> PostQuitMessage and
-            // quit the UI; only the tray Exit item (IDM_EXIT) and the Exit
-            // button (IDC_BTN_EXIT) call DestroyWindow and are the quit path.
+            // quit the UI; only the tray Exit item (IDM_EXIT) calls
+            // DestroyWindow and is the quit path.
             let _ = ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
         }
@@ -1832,7 +2174,7 @@ unsafe extern "system" fn wndproc(
         WM_SERVICE_START => {
             // The startup probe has launched the service via UAC.
             let s = state_mut(hwnd);
-            s.set_result(hwnd, "starting service...");
+            s.set_result(hwnd, tr(s.lang, "service_starting"));
             LRESULT(0)
         }
 
@@ -1840,7 +2182,7 @@ unsafe extern "system" fn wndproc(
             let s = state_mut(hwnd);
             // The service came up after our UAC launch; re-run the startup
             // config load and status pull (the original workers failed while it
-            // was down, and Refresh only re-pulls status, not the config).
+            // was down).
             s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
             s.start_refresh(hwnd);
             LRESULT(0)
@@ -1851,10 +2193,31 @@ unsafe extern "system" fn wndproc(
             // service still down. Drop the stale "starting service…" line for an
             // explicit manual-launch instruction.
             let s = state_mut(hwnd);
-            s.set_result(
-                hwnd,
-                "unable to start service — run `aetheris service` manually (elevated)",
-            );
+            s.set_result(hwnd, tr(s.lang, "service_giveup"));
+            LRESULT(0)
+        }
+
+        WM_PICK_RESULT => {
+            // The running-process picker posted the checked process names
+            // (`lparam` = `*mut Vec<String>`, `wparam` = target ListKind).
+            let names = Box::from_raw(lparam.0 as *mut Vec<String>);
+            if let Some(kind) = ListKind::from_usize(wparam.0) {
+                let s = state_mut(hwnd);
+                for name in names.iter() {
+                    s.append_name(hwnd, kind, name);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_PROMPT_RESULT => {
+            // The add-by-name prompt posted the typed name (`lparam` = `*mut
+            // String`, `wparam` = target ListKind).
+            let name = Box::from_raw(lparam.0 as *mut String);
+            if let Some(kind) = ListKind::from_usize(wparam.0) {
+                let s = state_mut(hwnd);
+                s.append_name(hwnd, kind, name.as_str());
+            }
             LRESULT(0)
         }
 
@@ -1867,18 +2230,25 @@ unsafe extern "system" fn wndproc(
                 // thread and return; the result is applied when the posted
                 // WM_IPC_RESULT is dispatched, so the dialog never blocks on a
                 // down service.
-                IDC_BTN_REFRESH if code == 0 => s.start_refresh(hwnd),
+                IDC_BTN_START if code == 0 => {
+                    start_service();
+                    // Refresh promptly so the status line follows the launch.
+                    s.start_refresh(hwnd);
+                }
+                IDC_BTN_STOP if code == 0 => {
+                    s.stop_service();
+                    // The service may already be down; a refresh shows 未运行.
+                    s.start_refresh(hwnd);
+                }
                 IDC_BTN_SAVE if code == 0 => s.do_save(hwnd),
-                IDC_BTN_RELOAD if code == 0 => s.do_reload(hwnd),
-                IDC_BTN_EXIT if code == 0 => {
-                    let _ = DestroyWindow(hwnd);
-                }
-                IDC_BTN_ADD if code == 0 => s.add_row(hwnd),
-                IDC_BTN_RELOAD_CFG if code == 0 => s.start_reload_cfg(hwnd),
-                IDC_BTN_DELETE if code == 0 => s.delete_row(hwnd),
-                IDC_BTN_APPLY if code == 0 => {
-                    s.apply_fields(hwnd);
-                }
+                // Task 4: `btn_advanced` toggles the collapsible advanced
+                // panel. Stubbed for now — the button exists and is labeled via
+                // `tr`, but does nothing.
+                IDC_BTN_ADVANCED if code == 0 => {}
+                IDC_BTN_PICK_GAME if code == 0 => s.open_picker(hwnd, ListKind::Game),
+                IDC_BTN_ADD_GAME if code == 0 => s.open_prompt(hwnd, ListKind::Game),
+                IDC_BTN_PICK_BG if code == 0 => s.open_picker(hwnd, ListKind::Background),
+                IDC_BTN_ADD_BG if code == 0 => s.open_prompt(hwnd, ListKind::Background),
                 _ => {}
             }
             LRESULT(0)
@@ -1886,27 +2256,18 @@ unsafe extern "system" fn wndproc(
 
         WM_NOTIFY => {
             let nm = &*(lparam.0 as *const NMHDR);
-            if nm.code == LVN_ITEMCHANGED {
-                let kind = match nm.idFrom as isize {
-                    IDC_LIST_GAME => Some(ListKind::Game),
-                    IDC_LIST_BG => Some(ListKind::Background),
-                    IDC_LIST_RULE => Some(ListKind::Rule),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    let s = state_mut(hwnd);
-                    // A selection change driven by our own list mutation
-                    // (apply/add/delete/rebuild) arrives re-entrantly while the
-                    // outer frame already holds `&mut self`. Refuse to handle it
-                    // so we don't mint a second `&mut UiState` mid-mutation;
-                    // the mutating method loads the fields itself afterwards.
-                    if s.busy {
-                        return LRESULT(0);
-                    }
-                    s.active = kind;
-                    let list = s.list_hwnd(kind);
-                    s.cur_row = list_selected(list).map(|r| r as usize);
-                    s.load_fields(hwnd);
+            if nm.code == LVN_ITEMCHANGED
+                && (nm.idFrom as isize == IDC_LIST_GAME || nm.idFrom as isize == IDC_LIST_BG)
+            {
+                // A checkbox toggle / selection change fires this reentrantly
+                // (e.g. `LVM_SETITEMSTATE` during a rebuild). When busy, the
+                // outer frame holds `&mut UiState`, so back out without
+                // touching state. Otherwise the simplified view has no per-row
+                // editor to update — checkbox state is read straight from the
+                // list at Save time. (Task 4 wires row selection into the
+                // advanced panel here.)
+                if state_is_busy(hwnd) {
+                    return LRESULT(0);
                 }
             }
             LRESULT(0)
@@ -1926,8 +2287,6 @@ unsafe extern "system" fn wndproc(
             match IpcCall::from_wparam(wparam.0) {
                 Some(IpcCall::GetConfig) => s.on_get_config_result(hwnd, result),
                 Some(IpcCall::GetState) => s.on_get_state_result(hwnd, result),
-                Some(IpcCall::ReloadCfg) => s.on_reload_cfg_result(hwnd, result),
-                Some(IpcCall::Reload) => s.on_reload_result(hwnd, result),
                 Some(IpcCall::Save) => s.on_save_result(hwnd, result),
                 // Unknown call id: the box was freed above; nothing to apply.
                 None => {}
@@ -1981,269 +2340,212 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         .expect("module handle")
         .into();
 
-    let h_status_mode = mk_child(
+    // --- Status area (top) ---
+    let h_status = mk_child(
         hwnd,
         WINDOW_EX_STYLE::default(),
         w!("Static"),
-        w!("Mode: -"),
+        w!("Not running"),
         WS_CHILD.0 | WS_VISIBLE.0,
         10,
-        10,
-        460,
-        20,
-        IDC_STATUS_MODE,
-        hinst,
-    );
-    let h_status_boosted = mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Static"),
-        w!("Boosted: -"),
-        WS_CHILD.0 | WS_VISIBLE.0,
-        10,
-        32,
-        760,
-        20,
-        IDC_STATUS_BOOSTED,
-        hinst,
-    );
-    let h_status_reload = mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Static"),
-        w!("Last reload: -"),
-        WS_CHILD.0 | WS_VISIBLE.0,
-        10,
-        54,
-        760,
-        16,
-        IDC_STATUS_RELOAD,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Button"),
-        w!("Refresh"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-        790,
         12,
-        96,
-        26,
-        IDC_BTN_REFRESH,
-        hinst,
-    );
-
-    let h_list_game = mk_list(
-        hwnd,
-        IDC_LIST_GAME,
-        10,
-        82,
-        200,
-        228,
-        hinst,
-    );
-    let h_list_bg = mk_list(hwnd, IDC_LIST_BG, 220, 82, 320, 228, hinst);
-    let h_list_rule = mk_list(hwnd, IDC_LIST_RULE, 550, 82, 330, 228, hinst);
-
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Static"),
-        w!("Selected rule:"),
-        WS_CHILD.0 | WS_VISIBLE.0,
-        10,
-        318,
-        160,
-        16,
-        0,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Static"),
-        w!("Name"),
-        WS_CHILD.0 | WS_VISIBLE.0,
-        10,
-        340,
-        48,
-        18,
-        0,
-        hinst,
-    );
-    let h_name = mk_child(
-        hwnd,
-        WS_EX_CLIENTEDGE,
-        w!("Edit"),
-        PCWSTR::null(),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
-        60,
-        338,
-        180,
-        24,
-        IDC_EDIT_NAME,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Static"),
-        w!("Priority"),
-        WS_CHILD.0 | WS_VISIBLE.0,
-        250,
-        340,
-        56,
-        18,
-        0,
-        hinst,
-    );
-    let h_prio = mk_child(
-        hwnd,
-        WS_EX_CLIENTEDGE,
-        w!("ComboBox"),
-        PCWSTR::null(),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0,
-        306,
-        336,
-        140,
-        200,
-        IDC_COMBO_PRIORITY,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Static"),
-        w!("Affinity"),
-        WS_CHILD.0 | WS_VISIBLE.0,
-        456,
-        340,
-        54,
-        18,
-        0,
-        hinst,
-    );
-    let h_aff = mk_child(
-        hwnd,
-        WS_EX_CLIENTEDGE,
-        w!("Edit"),
-        PCWSTR::null(),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
-        510,
-        338,
-        92,
-        24,
-        IDC_EDIT_AFFINITY,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Static"),
-        w!("QoS"),
-        WS_CHILD.0 | WS_VISIBLE.0,
-        612,
-        340,
-        42,
-        18,
-        0,
-        hinst,
-    );
-    let h_qos = mk_child(
-        hwnd,
-        WS_EX_CLIENTEDGE,
-        w!("Edit"),
-        PCWSTR::null(),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
-        654,
-        338,
-        64,
-        24,
-        IDC_EDIT_QOS,
-        hinst,
-    );
-
-    let h_suspend = mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Button"),
-        w!("Suspend"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
-        10,
-        368,
-        110,
+        440,
         20,
-        IDC_CHK_SUSPEND,
+        IDC_STATUS,
         hinst,
     );
-    let h_trim = mk_child(
+    let h_btn_start = mk_child(
         hwnd,
         WINDOW_EX_STYLE::default(),
         w!("Button"),
-        w!("Trim"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+        w!("Start service"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        470,
+        8,
         130,
-        368,
-        110,
-        20,
-        IDC_CHK_TRIM,
+        28,
+        IDC_BTN_START,
+        hinst,
+    );
+    let h_btn_stop = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Stop service"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        610,
+        8,
+        130,
+        28,
+        IDC_BTN_STOP,
         hinst,
     );
 
-    mk_child(
+    // --- Games list + buttons ---
+    let h_label_game = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("Games"),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        10,
+        44,
+        420,
+        16,
+        IDC_LABEL_GAME,
+        hinst,
+    );
+    let h_list_game = mk_list(hwnd, IDC_LIST_GAME, 10, 62, 420, 180, hinst);
+    let h_btn_pick_game = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Pick from running"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        440,
+        62,
+        140,
+        28,
+        IDC_BTN_PICK_GAME,
+        hinst,
+    );
+    let h_btn_add_game = mk_child(
         hwnd,
         WINDOW_EX_STYLE::default(),
         w!("Button"),
         w!("Add"),
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-        280,
-        366,
-        74,
-        28,
-        IDC_BTN_ADD,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Button"),
-        w!("Reload cfg"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-        360,
-        366,
-        74,
-        28,
-        IDC_BTN_RELOAD_CFG,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Button"),
-        w!("Delete"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
         440,
-        366,
-        74,
+        96,
+        140,
         28,
-        IDC_BTN_DELETE,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Button"),
-        w!("Apply"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-        520,
-        366,
-        74,
-        28,
-        IDC_BTN_APPLY,
+        IDC_BTN_ADD_GAME,
         hinst,
     );
 
+    // --- Background-apps list + buttons ---
+    let h_label_bg = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("Background apps"),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        10,
+        250,
+        420,
+        16,
+        IDC_LABEL_BG,
+        hinst,
+    );
+    let h_list_bg = mk_list(hwnd, IDC_LIST_BG, 10, 268, 420, 140, hinst);
+    let h_btn_pick_bg = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Pick from running"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        440,
+        268,
+        140,
+        28,
+        IDC_BTN_PICK_BG,
+        hinst,
+    );
+    let h_btn_add_bg = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Add"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        440,
+        302,
+        140,
+        28,
+        IDC_BTN_ADD_BG,
+        hinst,
+    );
+
+    // --- Optimization group ---
+    let h_label_opt = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("Optimization"),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        10,
+        416,
+        540,
+        16,
+        IDC_LABEL_OPT,
+        hinst,
+    );
+    let h_opt_suspend = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Suspend"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+        16,
+        436,
+        90,
+        20,
+        IDC_OPT_SUSPEND,
+        hinst,
+    );
+    let h_opt_low_prio = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Lower priority"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+        112,
+        436,
+        120,
+        20,
+        IDC_OPT_LOW_PRIO,
+        hinst,
+    );
+    let h_opt_cpu = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Limit CPU"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+        240,
+        436,
+        90,
+        20,
+        IDC_OPT_CPU,
+        hinst,
+    );
+    let h_combo_cpu = mk_child(
+        hwnd,
+        WS_EX_CLIENTEDGE,
+        w!("ComboBox"),
+        PCWSTR::null(),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0,
+        334,
+        434,
+        96,
+        120,
+        IDC_COMBO_CPU,
+        hinst,
+    );
+    let h_opt_mem = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Trim memory"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+        436,
+        436,
+        110,
+        20,
+        IDC_OPT_MEM,
+        hinst,
+    );
+
+    // --- Result line + save/advanced ---
     let h_result = mk_child(
         hwnd,
         WS_EX_STATICEDGE,
@@ -2251,49 +2553,36 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         w!(""),
         WS_CHILD.0 | WS_VISIBLE.0,
         10,
-        444,
-        560,
+        474,
+        470,
         16,
         IDC_STATUS_RESULT,
         hinst,
     );
-    mk_child(
+    let h_btn_save = mk_child(
         hwnd,
         WINDOW_EX_STYLE::default(),
         w!("Button"),
         w!("Save"),
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-        620,
-        440,
-        92,
+        600,
+        470,
+        120,
         30,
         IDC_BTN_SAVE,
         hinst,
     );
-    mk_child(
+    let h_btn_advanced = mk_child(
         hwnd,
         WINDOW_EX_STYLE::default(),
         w!("Button"),
-        w!("Reload"),
+        w!("Advanced"),
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-        718,
-        440,
-        92,
+        730,
+        470,
+        160,
         30,
-        IDC_BTN_RELOAD,
-        hinst,
-    );
-    mk_child(
-        hwnd,
-        WINDOW_EX_STYLE::default(),
-        w!("Button"),
-        w!("Exit"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-        816,
-        440,
-        84,
-        30,
-        IDC_BTN_EXIT,
+        IDC_BTN_ADVANCED,
         hinst,
     );
 
@@ -2313,42 +2602,43 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         save_in_flight: false,
         busy: false,
         mode: String::new(),
-        boosted: Vec::new(),
-        last_reload: None,
-        last_result: None,
-        game_row_to_idx: Vec::new(),
-        bg_row_to_idx: Vec::new(),
-        rule_row_to_idx: Vec::new(),
-        active: ListKind::Background,
-        cur_row: None,
-        h_status_mode,
-        h_status_boosted,
-        h_status_reload,
+        cpu_level: 1,
+        bg_overrides: HashMap::new(),
+        h_status,
+        h_btn_start,
+        h_btn_stop,
         h_result,
         h_list_game,
         h_list_bg,
-        h_list_rule,
-        h_name,
-        h_prio,
-        h_aff,
-        h_qos,
-        h_suspend,
-        h_trim,
+        h_btn_pick_game,
+        h_btn_add_game,
+        h_btn_pick_bg,
+        h_btn_add_bg,
+        h_label_game,
+        h_label_bg,
+        h_label_opt,
+        h_opt_suspend,
+        h_opt_low_prio,
+        h_opt_cpu,
+        h_combo_cpu,
+        h_opt_mem,
+        h_btn_save,
+        h_btn_advanced,
         h_icon_green,
         h_icon_gray,
         status_probe_in_flight: false,
     }
 }
 
-/// Create a report-view `SysListView32` child with full-row selection.
+/// Create a report-view `SysListView32` child with full-row selection and
+/// checkboxes (`LVS_EX_CHECKBOXES` — used by both main lists and the picker).
 unsafe fn mk_list(parent: HWND, id: isize, x: i32, y: i32, w: i32, h: i32, hinst: HINSTANCE) -> HWND {
     let list = mk_child(
         parent,
         WS_EX_CLIENTEDGE,
         w!("SysListView32"),
         PCWSTR::null(),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | WS_VSCROLL.0 | LVS_REPORT
-            | LVS_SINGLESEL,
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | WS_VSCROLL.0 | LVS_REPORT,
         x,
         y,
         w,
@@ -2359,8 +2649,8 @@ unsafe fn mk_list(parent: HWND, id: isize, x: i32, y: i32, w: i32, h: i32, hinst
     let _ = SendMessageW(
         list,
         LVM_SETEXTENDEDLISTVIEWSTYLE,
-        Some(WPARAM(LVS_EX_FULLROWSELECT as usize)),
-        Some(LPARAM(LVS_EX_FULLROWSELECT as isize)),
+        Some(WPARAM((LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES) as usize)),
+        Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES) as isize)),
     );
     list
 }
@@ -2470,15 +2760,14 @@ fn run(args: Vec<String>) -> i32 {
                 Some(init as *mut c_void),
             )?;
 
-            let _ = ShowWindow(hwnd, SW_SHOW);
-
             // Apply the loaded language (ui.toml, defaulting to the detected
-            // system language): sets the window title and the language the tray
-            // menu is built in. Control texts / column headers join here once
-            // the new layout exists (Task 3); until then the dialog body keeps
-            // its current strings.
+            // system language) BEFORE the window is shown, so every control
+            // (labels, buttons, list headers, CPU combo, status line) paints in
+            // the right language on first paint.
             let lang = aetheris_core::i18n::load_ui_settings().lang;
             apply_language(hwnd, lang);
+
+            let _ = ShowWindow(hwnd, SW_SHOW);
 
             // Tray status probe: every TRAY_STATUS_INTERVAL_MS the WM_TIMER
             // handler re-pulls GetState on a worker thread and flips the tray
@@ -2494,7 +2783,7 @@ fn run(args: Vec<String>) -> i32 {
 
         // Kick off the startup config load and status pull on worker threads;
         // the outcomes are applied on the UI thread when the posted
-        // WM_IPC_RESULT messages arrive (the Refresh button re-pulls later).
+        // WM_IPC_RESULT messages arrive.
         unsafe {
             let s = state_mut(hwnd);
             s.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
@@ -2532,9 +2821,23 @@ fn run(args: Vec<String>) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Value formatting / parsing helpers (Task 4 reuses these)
+// ---------------------------------------------------------------------------
+
+/// True when the service's Save refusal means "run the UI elevated". The
+/// service refuses `SaveConfig` with different phrasings across builds, so the
+/// detection is a pure, unit-tested classifier rather than inline string
+/// sniffing that a message reword could silently break.
+fn needs_elevation(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("elevat")
+        || msg.to_ascii_lowercase().contains("administrator")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{keys, needs_elevation, tr};
+    use super::{bg_rule_from_toggles, cpu_level_to_pct, keys, needs_elevation, pct_to_cpu_level, tr};
+    use aetheris_core::config::PriorityClass;
     use aetheris_core::i18n::Lang;
 
     /// Every key in the string table resolves to a non-empty, non-placeholder
@@ -2574,5 +2877,38 @@ mod tests {
     #[test]
     fn unrelated_pipe_error_is_not_elevation() {
         assert!(!needs_elevation("pipe unavailable after retries"));
+    }
+
+    #[test]
+    fn cpu_level_maps_to_quota() {
+        // 低/中/高 combo -> qos_cpu_quota 30/50/70.
+        assert_eq!(cpu_level_to_pct(0), 30);
+        assert_eq!(cpu_level_to_pct(1), 50);
+        assert_eq!(cpu_level_to_pct(2), 70);
+        // And back.
+        assert_eq!(pct_to_cpu_level(30), 0);
+        assert_eq!(pct_to_cpu_level(70), 2);
+        assert_eq!(pct_to_cpu_level(50), 1);
+    }
+
+    #[test]
+    fn bg_rule_from_toggles_applies_global_fields() {
+        // All toggles on: every field is set from the global defaults.
+        let r = bg_rule_from_toggles("x.exe".to_string(), true, true, true, 50, true);
+        assert_eq!(r.name, "x.exe");
+        assert!(r.suspend);
+        assert_eq!(r.priority, Some(PriorityClass::BelowNormal));
+        assert_eq!(r.qos_cpu_quota, Some(50));
+        assert!(r.trim_memory);
+        assert!(r.affinity.is_none());
+
+        // All toggles off: a name-only rule.
+        let r2 = bg_rule_from_toggles("y.exe".to_string(), false, false, false, 30, false);
+        assert_eq!(r2.name, "y.exe");
+        assert!(!r2.suspend);
+        assert_eq!(r2.priority, None);
+        assert_eq!(r2.qos_cpu_quota, None);
+        assert!(!r2.trim_memory);
+        assert!(r2.affinity.is_none());
     }
 }
