@@ -1,4 +1,5 @@
-# Measures aetheris-service idle footprint (WorkingSet + CPU) over 60s.
+# Measures the aetheris service (single `aetheris.exe` binary) idle footprint
+# (WorkingSet + CPU) over 60s. Runs the engine via the `service` subcommand.
 # Run elevated:  powershell -ExecutionPolicy Bypass -File scripts/measure-footprint.ps1
 param([int]$Seconds = 60, [string]$Config = "aetheris.toml")
 
@@ -10,10 +11,10 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit 1
 }
 
-$release = Join-Path (Get-Location) "target\release\aetheris-service.exe"
+$release = Join-Path (Get-Location) "target\release\aetheris.exe"
 if (-not (Test-Path $release)) { Write-Error "build release first: cargo build --release"; exit 1 }
 
-$p = Start-Process -FilePath $release -ArgumentList "--config", $Config -PassThru
+$p = Start-Process -FilePath $release -ArgumentList "service", "--config", $Config -PassThru
 Start-Sleep -Seconds 2
 if ($p.HasExited) { Write-Error "service exited early: $($p.ExitCode)"; exit 1 }
 

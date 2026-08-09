@@ -1,5 +1,10 @@
-# aetheris example configuration.
-# Copy and edit; the service reads this at startup and on `ReloadConfig`.
+# aetheris configuration TEMPLATE.
+#
+# The default config aetheris actually uses is AUTO-GENERATED on first run at
+# `%PROGRAMDATA%\aetheris\aetheris.toml` (the elevated service writes this
+# template there, fully commented). Edit the generated file, or copy this one
+# over it, or run `aetheris service --config <path>` for a custom location.
+# The service reads the config at startup and on `ReloadConfig`.
 
 [game]
 boost_on_start = true

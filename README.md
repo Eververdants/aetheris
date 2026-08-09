@@ -14,8 +14,10 @@ itself — then restores everything when the game exits.
   rules compiled into an Aho-Corasick automaton, with an always-on protected
   list (`csrss.exe`, `services.exe`, `dwm.exe`, itself, ...) that no rule can
   override.
-- **Named-pipe IPC + CLI.** `aetheris-cli get-state | reload | query <name>`
-  over `\\.\pipe\aetheris`.
+- **One binary, four faces.** `aetheris` is a single executable: `aetheris`
+  (no args) opens the UI + tray, `aetheris service` is the headless engine,
+  `aetheris overlay` is the telemetry panel, and `aetheris cli ...` is the
+  command line — all talking over `\\.\pipe\aetheris`.
 - **Fail-safe.** No kernel trace session is required to be present: if ETW is
   unavailable the service does **no** optimization and **exits** with a clear
   error. It never silently degrades to polling.
@@ -43,30 +45,92 @@ tokens the actions need. Run it elevated or it will fail closed — by design.
 cargo build --release
 ```
 
-The release profile uses thin LTO + strip + abort-on-panic (`Cargo.toml`).
-`Cargo.lock` is committed; this is a binary workspace.
+This produces a **single** binary, `target\release\aetheris.exe`, that carries
+every face of the app (UI + tray, service, overlay, CLI — see Usage below).
+The release profile uses thin LTO + strip + abort-on-panic (`Cargo.toml`);
+`Cargo.lock` is committed; this is a binary workspace. Validate with
+`cargo test --workspace` and `cargo deny check licenses bans sources` (the
+cargo-deny gate is described under License & compliance).
 
-## Run (elevated)
+## Usage
+
+aetheris is **one executable**, `aetheris.exe`. The same binary is the UI + tray,
+the headless engine, the telemetry panel, and the command line:
 
 ```sh
-# In an elevated (admin) terminal:
-aetheris-service --config aetheris.toml
+aetheris                 # open the configuration UI + tray icon (also: double-click)
+aetheris service         # headless engine (elevated process)
+aetheris overlay         # DirectComposition telemetry panel (hotkey / tray-launched)
+aetheris cli ...         # one-shot pipe commands, see below
+aetheris --version       # print aetheris <version>
 ```
 
-The service prints a startup banner, then runs until you press Ctrl-C. When it
-stops, boosted processes are restored. If `EtwMonitor::start()` fails — e.g.
-not elevated, or the kernel trace session cannot be opened — the service
-prints `service error: StartTraceW failed: status ...` and exits with code 1.
-That is the intended fail-safe.
+### `aetheris` — UI + tray (no arguments)
+
+Double-clicking `aetheris.exe` (or running `aetheris` with no arguments) opens
+the configuration dialog and installs a resident tray icon. On the **first run**
+it notices that no service is running, prompts once via UAC to start
+`aetheris service` elevated, and auto-opens the dialog once the service answers
+(see First run below).
+
+The UI is **resident**: closing the dialog minimizes it to the tray instead of
+exiting, so the tray keeps controlling the service. Right-click the tray icon
+for the menu:
+
+- **Start service** — UAC-launch `aetheris service` if it is not running.
+- **Stop service** — ask the service to stop (it restores every boosted process
+  and the elevated process exits).
+- **Toggle overlay** — launch, or close, the telemetry panel.
+- **Open UI** — restore the dialog window.
+- **Exit** — quit the UI *only*; the service keeps running.
+
+The tray icon shows the service status — green when it answers `get-state`,
+gray when it is down (probed every 5 s).
+
+### `aetheris service` — the headless engine
+
+The engine must run **elevated** to open the kernel ETW session and to take the
+`SeDebugPrivilege` / `SeIncreaseBasePriorityPrivilege` tokens the actions need.
+Run it elevated or it fails closed — by design:
+
+```sh
+aetheris service                          # default config: %PROGRAMDATA%\aetheris\aetheris.toml
+aetheris service --config path\to.toml    # custom config location
+```
+
+The service prints a startup banner, then runs until stopped (Ctrl-C, `aetheris cli stop`,
+or the tray's "Stop service"). When it stops, boosted processes are restored. If
+`EtwMonitor::start()` fails — e.g. not elevated, or the kernel trace session cannot
+be opened — the service prints `service error: StartTraceW failed: status ...` and
+exits with code 1. That is the intended fail-safe.
+
+### First run
+
+On the first run the service auto-creates the machine-wide config at
+`%PROGRAMDATA%\aetheris\aetheris.toml` — a fully commented template, so nothing
+is active until you edit it. The repo's committed `aetheris.toml` is exactly that
+template. The service is elevated, so it can write the admin-owned `ProgramData`
+file; the non-elevated UI and CLI cannot.
+
+Saving the config writes to that admin-owned file, so **Save requires an
+elevated UI**. If the UI is not elevated and the service refuses a save for lack
+of elevation, the UI prompts once to relaunch `aetheris ui` as administrator
+(UAC); the elevated instance takes over and completes the save. The old instance
+quits (exit 0).
 
 ## CLI usage
 
+All one-shot, against `\\.\pipe\aetheris`. The CLI reaches the elevated service
+through a pipe DACL that grants Interactive Users access, so it does **not**
+need to be elevated itself:
+
 ```sh
-# All against \\.\pipe\aetheris
-aetheris-cli get-state            # print current mode + boosted list
-aetheris-cli reload               # reload aetheris.toml from disk
-aetheris-cli query <name>         # query one process (name / pid / is_game)
-aetheris-cli --pipe <NAME> ...    # override the pipe name
+aetheris cli get-state            # print current mode + boosted list
+aetheris cli reload               # reload the config file from disk
+aetheris cli query <name>         # query one process (name / pid / is_game)
+aetheris cli stop                 # stop the service (restores boosted processes)
+aetheris cli toggle-overlay       # launch / close the telemetry panel
+aetheris cli --pipe <NAME> ...    # override the pipe name
 ```
 
 Example output:
@@ -79,15 +143,16 @@ boosted:
 
 ## Configuration UI
 
-`aetheris-ui` is a small on-demand Win32 dialog (no `.rc`, no GUI framework — the
-window, controls, and lists are all built programmatically) that reads and edits
-the running service's config over the same named pipe as the CLI. It is
-**non-resident**: launch it when you want to look at or change something, and it
-exits as soon as the window is closed — it never stays running in the background.
+The dialog is the `aetheris` / `aetheris ui` mode — a programmatic Win32 dialog
+(no `.rc`, no GUI framework — the window, controls, and lists are all built
+programmatically) that reads and edits the running service's config over the
+same named pipe as the CLI. It is **resident**: launch it (`aetheris`, or
+`aetheris ui`), and closing the dialog minimizes it to the tray — the UI and its
+tray icon stay running to control the service (see Usage above).
 
 ```sh
-aetheris-ui                # against the default pipe \\.\pipe\aetheris
-aetheris-ui --pipe <NAME>  # against a specific pipe (match the service's --pipe)
+aetheris                # same as no-argument; against the default pipe \\.\pipe\aetheris
+aetheris ui --pipe <NAME>  # against a specific pipe (match the service's --pipe)
 ```
 
 The dialog is three parts:
@@ -103,9 +168,11 @@ The dialog is three parts:
   the service's config back into the editor.
 - **Save / Reload / Exit** (bottom): **Save** commits the editor and pushes the
   config to the service; **Reload** asks the service to re-read its config file
-  from disk; **Exit** closes the window, which quits the process.
-  **Save requires an elevated `aetheris-ui`** (the service only accepts config
-  writes from an elevated client) — run the dialog as administrator to save.
+  from disk; **Exit** closes the dialog (minimize-to-tray is the other close
+  path — use the tray **Exit** to quit the UI). **Save requires elevation**: the
+  service only accepts config writes from an elevated client, so a non-elevated
+  UI is prompted once to relaunch `aetheris ui` as administrator (UAC) when a
+  save is refused.
 
 Save runs the same validate-then-persist path the service uses internally: the
 UI validates its working copy before anything leaves the process, then
@@ -119,15 +186,15 @@ config on disk.)
 
 ## Overlay
 
-`aetheris-overlay` is a small click-through telemetry panel pinned to the
+`aetheris overlay` is a small click-through telemetry panel pinned to the
 top-left of the screen, showing live service state over the game. It is an
 external DirectComposition window composited by DWM — **zero injection**: no DLL,
 no hook, no game-process handle — so it is safe alongside anti-cheat. It reads
 the service over the same named pipe as the CLI and never writes.
 
 ```sh
-aetheris-overlay                # against the default pipe \\.\pipe\aetheris
-aetheris-overlay --pipe <NAME>  # match the service's --pipe
+aetheris overlay                # against the default pipe \\.\pipe\aetheris
+aetheris overlay --pipe <NAME>  # match the service's --pipe
 ```
 
 The panel shows, refreshed at ~1 Hz:
@@ -146,14 +213,19 @@ it polls the service once per second and draws one text frame per tick
 Known edge: the telemetry read blocks while waiting for the service's reply, so
 a wedged-but-connected service could stall the panel for that read (rare — the
 service is one-shot respond-then-disconnect, and a down service fails fast).
-Activation is either **manual** (launch `aetheris-overlay` yourself) or via the
-service-side hotkey: with `[overlay] hotkey = "ctrl+alt+o"` in the config, the
-service launches the overlay when the hotkey is pressed. Close it with a
-right-click on the panel or the window close path.
+Activation is either **manual** (launch `aetheris overlay` yourself, or the
+tray's "Toggle overlay") or via the service-side hotkey: with
+`[overlay] hotkey = "ctrl+alt+o"` in the config, the service launches the
+overlay when the hotkey is pressed. Close it with a right-click on the panel or
+the window close path.
 
 ## Config reference
 
-See the committed `aetheris.toml` at the repo root. Sections:
+The default config is **auto-generated on first run** at
+`%PROGRAMDATA%\aetheris\aetheris.toml` (the elevated service writes the template
+below there). The committed `aetheris.toml` at the repo root is that template —
+copy it over the generated file (or pass `--config <path>` to the service) to
+customize. Sections:
 
 - `[game]` — `boost_on_start` (activate GameBoost on process start, not just
   foreground), `processes` (Aho-Corasick patterns matched against image names),
@@ -230,10 +302,6 @@ Genuine remaining debt, documented so it is not mistaken for a bug:
 - **Snapshot refresh is throttled to 250 ms.** The integrated message path rebuilds
   the IPC snapshot at most every 250 ms (immediately on `reload` / stop), so
   `get-state` may lag live state by up to that window under event churn.
-- **Config reload re-enters GameBoost for a single game.** The re-entry path
-  (`reenter_if_game_running`) picks the first process matching the game matcher and
-  boosts around it; if several processes match at once (multiple games, or a broad
-  pattern), only the first is boosted — there is no multi-game re-entry.
 - **The overlay's private memory is not measured** and will exceed the v2 spec's
   aspirational <2 MB figure. The actual guarantee holds: the overlay is
   non-resident with zero idle cost — the process exits when the window closes.
@@ -245,11 +313,11 @@ Previously documented as v1 gaps, **closed in v1.1**:
   the graceful-degradation hook (defer actions above 85 % load) self-throttles
   correctly.
 - **`get-state` empty snapshot** — the shared IPC snapshot is now live, so
-  `aetheris-cli get-state` prints the current mode and boosted list.
+  `aetheris cli get-state` prints the current mode and boosted list.
 - **`query` always "not found"** — `QueryProcess` now searches live process
   state.
 - **CLI must run elevated** — the service pipe now carries an Interactive Users
-  DACL, so a non-elevated `aetheris-cli` can reach the elevated service.
+  DACL, so a non-elevated `aetheris cli` can reach the elevated service.
 - **Affinity skips >64-logical-CPU hosts** — best-effort CPU-sets path via
   `SetProcessDefaultCpuSetMasks` / group-affinity.
 
@@ -281,12 +349,19 @@ Previously documented as v1 gaps, **closed in v1.1**:
 - **v2-A (engine features, shipped):** real Job Object CPU QoS (`qos_cpu_quota`),
   opt-in reversible network QoS (Nagle / NetBIOS), opt-in standby memory purge.
 - **v2-B (configuration UI, shipped):** `GetConfig` / `SaveConfig` IPC with
-  validation + atomic persist, and the `aetheris-ui` config dialog.
-- **v2-C (overlay, shipped):** `aetheris-overlay` — DirectComposition telemetry
+  validation + atomic persist, and the `aetheris ui` config dialog.
+- **v2-C (overlay, shipped):** `aetheris overlay` — DirectComposition telemetry
   panel, manual launch, zero injection (see "Overlay" above).
 - **v2.1 (hardening, shipped):** least-privilege pipe DACL + elevated-only
   SaveConfig, hotkey-launched overlay, overlay DPI awareness + right-click
   close, non-blocking UI IPC, GameBoost re-entry after config save/reload,
   network-QoS crash reconciliation via marker, QoS PID-reuse protection, GUI
   window-subsystem polish.
-- **v2.2 (planned):** kernel driver (monitor-only).
+- **v2.2 (shipped):** single `aetheris.exe` — the four binaries
+  (service / cli / ui / overlay) folded into one binary with subcommands, a
+  resident tray UI (start / stop service, toggle overlay, open UI, exit),
+  UAC auto-elevation + first-run config auto-created at
+  `%PROGRAMDATA%\aetheris\aetheris.toml`, save-as-admin relaunch, multi-game
+  re-entry after config reload/save, and the network-QoS crash-reconciliation
+  hardening (marker kept on partial revert).
+- **v2.3 (planned):** kernel driver (monitor-only).
