@@ -399,27 +399,35 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         self.boosted.insert(pid, state);
     }
 
-    /// Re-enter GameBoost for a still-running game after a config reload or
+    /// Re-enter GameBoost for every still-running game after a config reload or
     /// save. `set_config` exits GameBoost (restore + revert) to swap in the new
     /// config, but a game already running produces no new Start/foreground
     /// event, so without re-entry the optimization stays OFF until the game
-    /// restarts. Scans the process table for a process matching the CURRENT
-    /// game matcher; if one is found, `enter_game_mode` re-applies the
-    /// background rules to running processes (and re-applies the network QoS
-    /// tweaks / standby purge when enabled). No-op when already GameBoost.
+    /// restarts. Scans the process table for every process matching the CURRENT
+    /// game matcher; `enter_game_mode` boosts the first (and applies the network
+    /// QoS tweaks / standby purge once on the Normal -> GameBoost transition),
+    /// then the remaining matching pids are appended to `game_pids` so any of
+    /// them exiting later ends GameBoost. No-op when already GameBoost.
     pub fn reenter_if_game_running(&mut self) {
         if self.mode == Mode::GameBoost {
             return;
         }
-        // Collect the first matching game (owned) so the table borrow is
-        // released before `enter_game_mode` takes `&mut self`.
-        let game = self
+        // Collect every matching game (owned) so the table borrow is released
+        // before `enter_game_mode` takes `&mut self`.
+        let games: Vec<(u32, String)> = self
             .table
             .iter()
-            .find(|(_, name, _)| self.is_game(name))
-            .map(|(pid, name, _)| (pid, name.to_string()));
-        if let Some((pid, name)) = game {
-            self.enter_game_mode(pid, &name);
+            .filter(|(_, name, _)| self.is_game(name))
+            .map(|(pid, name, _)| (pid, name.to_string()))
+            .collect();
+        let Some((first_pid, first_name)) = games.first().cloned() else {
+            return;
+        };
+        self.enter_game_mode(first_pid, &first_name);
+        for (pid, _) in games.into_iter().skip(1) {
+            if !self.game_pids.contains(&pid) {
+                self.game_pids.push(pid);
+            }
         }
     }
 
@@ -621,6 +629,30 @@ mod tests {
         assert!(calls
             .iter()
             .any(|c| c.pid == 100 && c.action == Some(TargetAction::Suspend)));
+    }
+
+    #[test]
+    fn set_config_reenters_gameboost_for_all_running_games() {
+        // Two games running simultaneously: a config reload exits GameBoost and
+        // must re-enter for BOTH, so stopping either one (here the second)
+        // ends GameBoost cleanly rather than leaving it wedged on because the
+        // second pid was never tracked.
+        let mut c = cfg();
+        c.game.processes = vec!["game.exe".into(), "game2.exe".into()];
+        let backend = RecordingBackend::default();
+        let mut eng = PolicyEngine::new(c.clone(), backend.clone());
+        eng.on_process_event(&start(100, "browser.exe"));
+        eng.on_process_event(&start(200, "game.exe"));
+        eng.on_process_event(&start(201, "game2.exe"));
+        assert_eq!(eng.mode(), Mode::GameBoost);
+
+        eng.set_config(c.clone()); // both games still match the new matcher
+        assert_eq!(eng.mode(), Mode::GameBoost, "running games must re-enter after reload");
+
+        // Stopping the SECOND tracked game exits GameBoost (both pids tracked).
+        eng.on_process_event(&stop(201, "game2.exe"));
+        assert_eq!(eng.mode(), Mode::Normal, "stopping a tracked game ends GameBoost");
+        assert!(eng.boosted().is_empty(), "boosted map cleared when GameBoost ends");
     }
 
     #[test]

@@ -310,16 +310,27 @@ pub fn remove_marker(path: &Path) {
 }
 
 /// Reconcile stale network-QoS tweaks after a service death mid-GameBoost: if
-/// the crash marker exists, revert every entry it lists, then remove the marker.
+/// the crash marker exists, revert every entry it lists. The marker is removed
+/// only when every entry was fully reverted; a partial revert leaves it in
+/// place so the next startup reconcile retries the remaining values (clearing
+/// it would strand them with no reconcile path — the exact failure mode the
+/// marker exists to recover). Same keep-on-partial rule as `exit_game_mode`.
 ///
 /// Safe by construction: it never guesses what was applied — it reverts only the
 /// entries the marker says the service set, and only when the marker exists.
 pub fn reconcile(path: &Path) {
+    reconcile_with(&revert, path);
+}
+
+/// [`reconcile`] parameterized over the revert step so the keep-marker-on-
+/// partial-revert rule is unit-testable without touching the real registry.
+fn reconcile_with(revert: &dyn Fn(&[BackupEntry]) -> usize, path: &Path) {
     let Some(entries) = read_marker(path) else {
         return;
     };
-    revert(&entries);
-    remove_marker(path);
+    if revert(&entries) == entries.len() {
+        remove_marker(path);
+    }
 }
 
 #[cfg(test)]
@@ -460,23 +471,22 @@ mod tests {
         assert!(backup.is_empty(), "nothing applied when all flags off");
     }
 
-    /// Marker persistence + crash reconciliation against a temp path:
+    /// Marker-file mechanics against a temp path — deliberately scoped OFF the
+    /// real registry: this test drives only the marker write/read/remove APIs
+    /// and never calls [`reconcile`] (which reverts real HKLM entries via
+    /// [`revert`]). The reconcile behavior itself is covered by
+    /// `reconcile_removes_marker_only_on_full_revert` with a stubbed revert.
     ///
     /// - `write_marker`/`read_marker` roundtrip the backup byte-for-byte, so a
     ///   startup `reconcile` reverts exactly the values `apply` actually
     ///   modified (and nothing else).
     /// - `remove_marker` (normal game exit) clears it, so the next startup
-    ///   reconciles nothing.
-    /// - `reconcile` consumes the marker: it reads back the listed entries,
-    ///   reverts them (`revert` — covered end-to-end at the registry level by
-    ///   `apply_continues_past_per_adapter_failure_and_reverts_what_applied`),
-    ///   and removes the marker, so a second reconcile is a no-op. It only ever
-    ///   acts on the entries the marker lists — never reverts on a guess.
+    ///   reconciles nothing; removing an absent marker is a no-op.
     /// - The empty guard: a marker is only meaningful when it lists ≥1 entry,
     ///   so `write_marker` refuses an empty backup (the policy wires the same
     ///   guard before calling it).
     #[test]
-    fn marker_roundtrip_and_reconcile() {
+    fn marker_roundtrip() {
         let dir = std::env::temp_dir().join(format!("aetheris_net_{}", std::process::id()));
         let path = dir.join("marker.bin");
         let entries = vec![
@@ -497,23 +507,41 @@ mod tests {
         assert_eq!(read_marker(&path).expect("read marker"), entries);
 
         // Normal exit removes the marker: the next startup reconciles nothing.
+        // Removing an already-absent marker is a no-op.
         remove_marker(&path);
         assert!(read_marker(&path).is_none(), "removed marker must not be read");
-
-        // A leftover crash marker is reconciled away: entries reverted and the
-        // marker removed. A second reconcile sees no marker and is a no-op
-        // (never reverts unless the marker exists).
-        write_marker(&entries, &path).expect("write marker again");
-        reconcile(&path);
-        assert!(
-            read_marker(&path).is_none(),
-            "reconcile must remove the marker it consumed"
-        );
-        reconcile(&path); // no marker -> nothing to revert, no panic
+        remove_marker(&path);
 
         // Empty guard: never persist a marker that lists nothing to revert.
         let err = write_marker(&[], &path);
         assert!(err.is_err(), "write_marker must reject an empty backup");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reconcile marker-removal rule, tested without the registry: the
+    /// marker is removed only when the revert step reports every entry reverted.
+    /// A partial revert keeps it so the next startup reconcile retries the
+    /// remaining values — clearing it would strand them with no revert path.
+    #[test]
+    fn reconcile_removes_marker_only_on_full_revert() {
+        let dir = std::env::temp_dir()
+            .join(format!("aetheris_net_reconcile_{}", std::process::id()));
+        let path = dir.join("marker.bin");
+        let entries = vec![BackupEntry {
+            path: "Software\\AetherisTests\\MarkerA".into(),
+            value_name: "V1".into(),
+            old: Some(5),
+        }];
+
+        // Partial revert (0 of 1 reverted): the marker must be KEPT.
+        write_marker(&entries, &path).expect("write marker");
+        reconcile_with(&|_| 0, &path);
+        assert!(read_marker(&path).is_some(), "partial revert must keep the marker");
+
+        // Full revert: the marker is consumed (a second reconcile sees none).
+        reconcile_with(&|_| entries.len(), &path);
+        assert!(read_marker(&path).is_none(), "full revert must remove the marker");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -168,9 +168,14 @@ impl Service {
                 Ok(())
             }
         };
-        // SaveConfig already refreshed above (before its reply); every other
+        // SaveConfig already refreshed above (before its reply); ToggleOverlay
+        // changes no engine state (the overlay panel is orthogonal to the
+        // policy snapshot), so neither should rebuild the snapshot — every other
         // message refreshes on the way out.
-        if !matches!(msg, ServiceMsg::SaveConfig { .. }) {
+        if !matches!(
+            msg,
+            ServiceMsg::SaveConfig { .. } | ServiceMsg::ToggleOverlay
+        ) {
             self.maybe_refresh_state(msg);
         }
         res
@@ -324,28 +329,29 @@ impl Service {
         // Overlay hotkey: a configurable global hotkey launches the overlay on
         // demand. The watcher runs on its own thread + message-only window, so
         // it stays independent of the foreground watcher's pump. A hotkey that
-        // fails to parse is silently disabled (config default); one that fails
-        // to register is logged and the service keeps running without it.
-        if let Some(hk) = self
-            .engine
-            .cfg()
-            .overlay
-            .hotkey
-            .as_deref()
-            .and_then(crate::hotkey::parse_hotkey)
-        {
-            let hotkey_tx = tx.clone();
-            match crate::hotkey::HotkeyWatcher::start(hk) {
-                Ok(watcher) => {
-                    std::thread::spawn(move || {
-                        while watcher.recv().is_some() {
-                            if hotkey_tx.send(ServiceMsg::ToggleOverlay).is_err() {
-                                break;
-                            }
+        // fails to parse is logged and disabled (a bad `[overlay] hotkey` must
+        // never be silent); one that fails to register is logged and the
+        // service keeps running without it.
+        if let Some(hotkey_str) = self.engine.cfg().overlay.hotkey.as_deref() {
+            match crate::hotkey::parse_hotkey(hotkey_str) {
+                Some(hk) => {
+                    let hotkey_tx = tx.clone();
+                    match crate::hotkey::HotkeyWatcher::start(hk) {
+                        Ok(watcher) => {
+                            std::thread::spawn(move || {
+                                while watcher.recv().is_some() {
+                                    if hotkey_tx.send(ServiceMsg::ToggleOverlay).is_err() {
+                                        break;
+                                    }
+                                }
+                            });
                         }
-                    });
+                        Err(e) => log::warn(format!("overlay hotkey could not start: {e}")),
+                    }
                 }
-                Err(e) => log::warn(format!("overlay hotkey could not start: {e}")),
+                None => log::warn(format!(
+                    "overlay hotkey parse failed: {hotkey_str:?} (expected e.g. \"Ctrl+Alt+O\")"
+                )),
             }
         }
 
@@ -445,6 +451,14 @@ impl Service {
                     // A malformed config keeps the previous config active; log
                     // it so the failure is at least visible (the IPC handler
                     // still answers "queued" — the warning is the feedback).
+                    //
+                    // ReloadConfig is unprivileged (the pipe DACL lets any
+                    // Interactive User call it), and a reload that re-enters
+                    // GameBoost re-applies the network QoS tweaks + standby
+                    // purge via `reenter_if_game_running`. That churn is
+                    // harmless (apply is idempotent, standby purge is one-shot
+                    // per entry) but a non-elevated caller could spam it;
+                    // consider rate-limiting ReloadConfig in a later version.
                     if let Err(e) = self.handle_message(&ServiceMsg::Reload) {
                         log::warn(format!("reload failed (keeping previous config): {e}"));
                     }
