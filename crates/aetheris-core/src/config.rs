@@ -15,7 +15,7 @@ pub const DEFAULT_PROTECTED: &[&str] = &[
     "lsass.exe",
     "explorer.exe",
     "system",
-    "aetheris-service.exe",
+    "aetheris.exe",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

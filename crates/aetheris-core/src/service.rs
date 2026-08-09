@@ -42,9 +42,9 @@ pub enum ServiceMsg {
         reply: Sender<Result<String, String>>,
     },
     /// Toggle the overlay: close the running overlay window if one exists
-    /// (graceful `WM_CLOSE`), otherwise launch `aetheris-overlay.exe` next to
-    /// the service. Sent by the hotkey watcher thread on a configured hotkey
-    /// press.
+    /// (graceful `WM_CLOSE`), otherwise launch `current_exe()` itself with the
+    /// `overlay` subcommand. Sent by the hotkey watcher thread on a configured
+    /// hotkey press.
     ToggleOverlay,
     Stop,
 }
@@ -361,7 +361,7 @@ impl Service {
         // routes SaveConfig through the main loop, blocking for the outcome.
         let state = self.state.clone();
         let ipc_tx = tx.clone();
-        // Interactive Users DACL so a non-elevated aetheris-cli can reach the
+        // Interactive Users DACL so a non-elevated `aetheris cli` can reach the
         // elevated service; SYSTEM retains full access. The DACL grants
         // transport-level read+write only; the file-rewriting SaveConfig is
         // separately gated below on the connected client's elevation.
@@ -417,7 +417,7 @@ impl Service {
                         // file is never touched in that case.
                         if !crate::ipc::is_client_elevated(pipe).unwrap_or(false) {
                             return Response::SaveConfig(Err(
-                                "SaveConfig requires an elevated client — run aetheris-ui as administrator".into(),
+                                "SaveConfig requires an elevated client — run `aetheris ui` as administrator".into(),
                             ));
                         }
                         let (tx, rx) = channel();
@@ -496,17 +496,17 @@ impl Service {
 }
 
 /// Toggle the overlay: close the running overlay window if one exists,
-/// otherwise launch `aetheris-overlay.exe` next to the service binary.
+/// otherwise launch `current_exe()` itself with the `overlay` subcommand.
 ///
 /// This is the overlay toggle: the hotkey watcher sends [`ServiceMsg::ToggleOverlay`]
 /// and the main loop calls this. Pressing the hotkey again finds the running
 /// overlay window (class `aetheris_overlay`) and posts `WM_CLOSE` to it — the
 /// overlay exits on `WM_CLOSE` (`WM_DESTROY` → `PostQuitMessage` → exit 0), so
 /// a second press can never stack a duplicate panel. If no window exists the
-/// overlay is launched. A missing overlay binary or a failed `CreateProcessW`
-/// is non-fatal — the failure is logged and the service keeps running. The
-/// process handles are closed immediately after spawn: the overlay is a
-/// standalone window process expected to detach and outlive the service.
+/// overlay is launched. A failed `CreateProcessW` is non-fatal — the failure is
+/// logged and the service keeps running. The process handles are closed
+/// immediately after spawn: the overlay is a standalone window process expected
+/// to detach and outlive the service.
 fn launch_overlay() {
     // Close the running overlay window (class `aetheris_overlay`) instead of
     // launching a duplicate. FindWindowW returns Err when no such window
@@ -528,45 +528,55 @@ fn launch_overlay() {
         };
         return;
     }
-    let overlay = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
-        .map(|dir| dir.join("aetheris-overlay.exe"));
-    match overlay {
-        Some(p) if p.exists() => {
-            let w: Vec<u16> = p
-                .to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let si = windows::Win32::System::Threading::STARTUPINFOW {
-                cb: std::mem::size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
-                ..Default::default()
-            };
-            let mut pi = windows::Win32::System::Threading::PROCESS_INFORMATION::default();
-            let ok = unsafe {
-                windows::Win32::System::Threading::CreateProcessW(
-                    windows::core::PCWSTR(w.as_ptr()),
-                    None,
-                    None,
-                    None,
-                    false,
-                    windows::Win32::System::Threading::CREATE_NO_WINDOW,
-                    None,
-                    None,
-                    &si,
-                    &mut pi,
-                )
-            };
-            match ok {
-                Ok(()) => {
-                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(pi.hProcess) };
-                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(pi.hThread) };
-                }
-                Err(e) => log::warn(format!("overlay launch failed: {e}")),
-            }
+    // Launch `current_exe()` itself with the `overlay` subcommand: the v2.2-1
+    // single-exe merge removed the separate `aetheris-overlay.exe`, so the exe
+    // path is resolved via `lpApplicationName` and the command line carries the
+    // quoted exe path + the `overlay` word. The quoted exe path is argv[0] of
+    // the new process — `lpCommandLine` becomes its exact `GetCommandLineW()`,
+    // so without it the dispatcher would see no subcommand token (and no-arg
+    // defaults to `ui`, not `overlay`).
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn(format!("overlay launch failed (current_exe): {e}"));
+            return;
         }
-        _ => log::warn("aetheris-overlay.exe not found next to the service"),
+    };
+    let cmdline = format!("\"{}\" overlay", exe.to_string_lossy());
+    let exe_w: Vec<u16> = exe
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut cmdline_w: Vec<u16> = cmdline
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let si = windows::Win32::System::Threading::STARTUPINFOW {
+        cb: std::mem::size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = windows::Win32::System::Threading::PROCESS_INFORMATION::default();
+    let ok = unsafe {
+        windows::Win32::System::Threading::CreateProcessW(
+            windows::core::PCWSTR(exe_w.as_ptr()),
+            Some(windows::core::PWSTR(cmdline_w.as_mut_ptr())),
+            None,
+            None,
+            false,
+            windows::Win32::System::Threading::CREATE_NO_WINDOW,
+            None,
+            None,
+            &si,
+            &mut pi,
+        )
+    };
+    match ok {
+        Ok(()) => {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(pi.hProcess) };
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(pi.hThread) };
+        }
+        Err(e) => log::warn(format!("overlay launch failed: {e}")),
     }
 }
 

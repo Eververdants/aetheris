@@ -45,7 +45,7 @@ pub const DEFAULT_PIPE: &str = r"\\.\pipe\aetheris";
 /// Least privilege: IU is deliberately *not* granted `GA` (generic all), which
 /// would map to WRITE_DAC / WRITE_OWNER and let any interactive client replace
 /// the pipe's security descriptor. `GR|GW` is exactly what the non-elevated
-/// `aetheris-cli` requests (`GENERIC_READ|GENERIC_WRITE` in [`client_call`]) and
+/// `aetheris cli` requests (`GENERIC_READ|GENERIC_WRITE` in [`client_call`]) and
 /// enough for the read-only surface (GetState/GetConfig/QueryProcess, harmless
 /// ReloadConfig re-read). Write access to the config file via SaveConfig is
 /// separately gated on client elevation ([`is_client_elevated`]), so this DACL
@@ -129,7 +129,7 @@ impl IpcServer {
     /// Create a server whose pipe instances carry `sddl` as their security
     /// descriptor (converted via `ConvertStringSecurityDescriptorToSecurityDescriptorW`
     /// in [`IpcServer::run`]). Used to grant Interactive Users access so a
-    /// non-elevated `aetheris-cli` can talk to the elevated service.
+    /// non-elevated `aetheris cli` can talk to the elevated service.
     pub fn new_with_dacl(pipe_name: &str, sddl: &str) -> Self {
         Self {
             pipe_name: pipe_name.to_string(),
