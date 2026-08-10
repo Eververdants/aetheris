@@ -879,6 +879,21 @@ unsafe fn list_set_checked(hwnd: HWND, row: i32, on: bool) {
     );
 }
 
+/// Select / deselect a listview row (`LVM_SETITEMSTATE` with the selection
+/// mask). Setting the selection fires a reentrant `LVN_ITEMCHANGED`; callers
+/// run under the `busy` guard.
+unsafe fn list_set_selected(hwnd: HWND, row: i32, on: bool) {
+    let mut item: LVITEMW = std::mem::zeroed();
+    item.state = LIST_VIEW_ITEM_STATE_FLAGS(if on { LVIS_SELECTED.0 } else { 0 });
+    item.stateMask = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0);
+    let _ = SendMessageW(
+        hwnd,
+        LVM_SETITEMSTATE,
+        Some(WPARAM(row as usize)),
+        Some(LPARAM(&mut item as *mut _ as isize)),
+    );
+}
+
 /// Read a listview row's checkbox state (`LVM_GETITEMSTATE`): state-image index
 /// 2 = checked.
 unsafe fn list_checked(hwnd: HWND, row: i32) -> bool {
@@ -1968,15 +1983,35 @@ impl UiState {
             qos_cpu_quota: qos,
             trim_memory: btn_get(self.h_adv_trim),
         };
-        if name != old_name {
+        let renamed = name != old_name;
+        if renamed {
             self.cfg.background[row as usize].name = name.clone();
             self.bg_overrides.remove(&old_name);
         }
         self.bg_overrides.insert(name.clone(), rule);
-        // Rebuild the list so a rename is reflected; the override persists in
-        // `bg_overrides`, so Save (which gives overrides precedence) keeps it.
-        let _busy = BusyGuard::acquire(&mut *self);
-        self.rebuild_list(hwnd, ListKind::Background);
+        // Rebuild the list only when the row's NAME changed — the override
+        // values live in `bg_overrides`, which Save reads, so they never need a
+        // list rebuild. A rebuild clears the selection and re-checks every row,
+        // so snapshot both BEFORE it and restore them after: the edited row
+        // stays selected (a second Apply targets the same row, not row 0) and
+        // rows the user unchecked stay unchecked (instead of being silently
+        // re-added on the rebuild).
+        if renamed {
+            let _busy = BusyGuard::acquire(&mut *self);
+            let sel = list_selected_row(self.h_list_bg);
+            let mut checked = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                checked.push(list_checked(self.h_list_bg, i));
+            }
+            self.rebuild_list(hwnd, ListKind::Background);
+            for (i, &on) in checked.iter().enumerate() {
+                list_set_checked(self.h_list_bg, i as i32, on);
+            }
+            // Restore the pre-rebuild selection; when nothing was selected (the
+            // apply fell back to row 0) select the edited row so it stays the
+            // target of a subsequent Apply.
+            list_set_selected(self.h_list_bg, sel.unwrap_or(row), true);
+        }
         self.set_result(hwnd, tr(self.lang, "adv_applied"));
     }
 
@@ -2689,6 +2724,15 @@ unsafe extern "system" fn wndproc(
         WM_COMMAND => {
             let id = (wparam.0 & 0xffff) as isize;
             let code = ((wparam.0 >> 16) & 0xffff) as u32;
+            // A synchronous re-entry — e.g. CBN_SELCHANGE from a `combo_set_sel`
+            // (CB_SETCURSEL) inside a guarded `load_selected_row_into_editor`, or
+            // EN_CHANGE from a programmatic `set_text` — arrives while the outer
+            // frame already holds `&mut UiState`. Back out without minting a
+            // second reference (matching the `state_is_busy` discipline used by
+            // the LVN_ITEMCHANGED handler).
+            if state_is_busy(hwnd) {
+                return LRESULT(0);
+            }
             let s = state_mut(hwnd);
             match id {
                 // The pipe-touching buttons just hand the request to a worker
@@ -2744,6 +2788,14 @@ unsafe extern "system" fn wndproc(
                     if sel_changed {
                         let s = state_mut(hwnd);
                         if s.advanced_expanded {
+                            // Guard the load: `load_selected_row_into_editor`
+                            // programs the priority combo (`combo_set_sel` /
+                            // CB_SETCURSEL), which synchronously re-enters
+                            // WM_COMMAND while this frame's `&mut UiState` is
+                            // live. Holding the busy flag suppresses the
+                            // re-entrant state access (the same `state_is_busy`
+                            // discipline the LVN_ITEMCHANGED rebuild path uses).
+                            let _busy = BusyGuard::acquire(&mut *s);
                             s.load_selected_row_into_editor();
                         }
                     }
