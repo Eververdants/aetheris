@@ -35,6 +35,11 @@ pub struct PolicyEngine<B: ProcessBackend + QosLifecycle> {
     mode: Mode,
     boosted: HashMap<u32, ProcState>,
     game_pids: Vec<u32>,
+    // "Smart suspend": boosted-and-suspended pids that the user brought to the
+    // foreground get resumed (so the app is never frozen while in use) and are
+    // tracked here; they are re-suspended when they leave the foreground.
+    foreground_resumed: HashSet<u32>,
+    last_foreground: Option<u32>,
     // Precompiled matchers, rebuilt once at `new()` / `set_config()` instead of
     // per lookup. Pattern indices align with `cfg.background` / `cfg.rule`.
     background_matcher: PatternMatcher,
@@ -65,6 +70,8 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
             mode: Mode::Normal,
             boosted: HashMap::new(),
             game_pids: Vec::new(),
+            foreground_resumed: HashSet::new(),
+            last_foreground: None,
             background_matcher: PatternMatcher::new(Vec::new()),
             always_matcher: PatternMatcher::new(Vec::new()),
             background_names: Vec::new(),
@@ -248,14 +255,35 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
     }
 
     pub fn on_foreground(&mut self, ev: &ForegroundEvent) {
+        // Smart suspend: a boosted-and-suspended process the user brings to the
+        // foreground is resumed immediately (never frozen while in use), and
+        // re-suspended when it leaves the foreground. Runs in every mode.
+        if let Some(prev) = self.last_foreground.take() {
+            if prev != ev.pid && self.foreground_resumed.remove(&prev) {
+                if self.boosted.get(&prev).map(|s| s.suspended).unwrap_or(false) {
+                    // Left the foreground: re-suspend it (back to zero usage).
+                    let _ = self.backend.apply(prev, &TargetAction::Suspend);
+                }
+            }
+        }
+        self.last_foreground = Some(ev.pid);
+        if !self.foreground_resumed.contains(&ev.pid)
+            && self.boosted.get(&ev.pid).map(|s| s.suspended).unwrap_or(false)
+        {
+            let _ = self.backend.apply(ev.pid, &TargetAction::Resume);
+            self.foreground_resumed.insert(ev.pid);
+        }
+
+        // boost_on_start=false: foreground matching a game enters GameBoost;
+        // leaving a game exits it.
+        if self.cfg.game.boost_on_start {
+            return;
+        }
         let name = self
             .table
             .name(ev.pid)
             .map(|s| s.to_string())
             .unwrap_or_default();
-        if self.cfg.game.boost_on_start {
-            return;
-        }
         if self.is_game(&name) {
             if self.mode != Mode::GameBoost {
                 self.enter_game_mode(ev.pid, &name);
@@ -337,6 +365,8 @@ impl<B: ProcessBackend + QosLifecycle> PolicyEngine<B> {
         }
         self.mode = Mode::Normal;
         self.game_pids.clear();
+        self.foreground_resumed.clear();
+        self.last_foreground = None;
         // Revert any network QoS registry tweaks applied on entry. `revert`
         // logs and swallows per-entry failures — never fail the game flow —
         // and returns how many entries were actually reverted.
@@ -543,6 +573,37 @@ mod tests {
         eng.on_process_event(&stop(200, "game.exe"));
         assert_eq!(eng.mode(), Mode::Normal);
         assert!(eng.boosted().is_empty());
+        let calls = backend.calls();
+        assert!(calls.iter().any(|c| c.pid == 100 && c.restore.is_some()));
+    }
+
+    #[test]
+    fn smart_suspend_resumes_on_foreground_and_reesuspends_on_leave() {
+        let backend = RecordingBackend::default();
+        let mut eng = PolicyEngine::new(cfg(), backend.clone());
+        eng.on_process_event(&start(100, "browser.exe"));
+        eng.on_process_event(&start(200, "game.exe")); // GameBoost; browser suspended
+        assert!(eng.boosted().get(&100).map(|s| s.suspended).unwrap_or(false));
+
+        // User brings the suspended browser to the foreground -> resumed, not frozen.
+        eng.on_foreground(&ForegroundEvent { pid: 100 });
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c.pid == 100 && c.action == Some(TargetAction::Resume)),
+            "foreground process must be resumed"
+        );
+
+        // Foreground moves elsewhere -> the browser is re-suspended (back to zero).
+        let mark = backend.calls().len();
+        eng.on_foreground(&ForegroundEvent { pid: 300 });
+        let calls = backend.calls();
+        assert!(
+            calls.iter().skip(mark).any(|c| c.pid == 100 && c.action == Some(TargetAction::Suspend)),
+            "leaving foreground must re-suspend"
+        );
+
+        // Game exits -> everything restored.
+        eng.on_process_event(&stop(200, "game.exe"));
         let calls = backend.calls();
         assert!(calls.iter().any(|c| c.pid == 100 && c.restore.is_some()));
     }
