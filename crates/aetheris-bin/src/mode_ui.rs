@@ -1649,6 +1649,12 @@ impl UiState {
                 }
             }
         }
+        // A checked game means "enter GameBoost when it launches" — the UI's
+        // own list label. Force boost_on_start so the ETW Start event triggers
+        // the boost regardless of foreground state (exclusive-fullscreen games
+        // often miss the foreground watcher). Foreground still works as an
+        // additional trigger when boost_on_start is left off.
+        cfg.game.boost_on_start = true;
         cfg.game.processes = processes;
 
         // Background apps: checked rows become rules built from the global

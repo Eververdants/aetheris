@@ -3,9 +3,9 @@
 # `ReloadConfig`. Everything below is commented as a template: uncomment to
 # enable.
 
-# [game]
-# boost_on_start = true
-# processes = ["steam_app_*.exe", "game.exe"]
+[game]
+boost_on_start = true
+# processes = ["steam_app_*.exe", "game.exe"]   # add your game's process name(s) here
 
 # # Opt-in: purge the Windows standby memory list once on game-mode entry so the
 # # game's working set can grow from free pages. Off by default. Not reversible,

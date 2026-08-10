@@ -132,9 +132,9 @@ const EN_TEMPLATE: &str = r#"# aetheris default configuration - auto-generated o
 # `ReloadConfig`. Everything below is commented as a template: uncomment to
 # enable.
 
-# [game]
-# boost_on_start = true
-# processes = ["steam_app_*.exe", "game.exe"]
+[game]
+boost_on_start = true
+# processes = ["steam_app_*.exe", "game.exe"]   # add your game's process name(s) here
 
 # # Opt-in: purge the Windows standby memory list once on game-mode entry so the
 # # game's working set can grow from free pages. Off by default. Not reversible,
@@ -190,9 +190,9 @@ const ZH_TEMPLATE: &str = r#"# aetheris 默认配置 - 首次运行时自动生�
 # 可通过 `aetheris ui` 或本文件编辑;服务在启动及收到
 # `ReloadConfig` 时读取。以下全部以注释形式作为模板:取消注释以启用。
 
-# [game]
-# boost_on_start = true
-# processes = ["steam_app_*.exe", "game.exe"]
+[game]
+boost_on_start = true
+# processes = ["steam_app_*.exe", "game.exe"]   # add your game's process name(s) here
 
 # # 可选:进入游戏模式时清理一次 Windows 待机内存列表,以便游戏的
 # # 工作集可以使用空闲内存页。默认关闭。不可逆,但无害
