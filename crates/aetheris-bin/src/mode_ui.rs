@@ -1304,28 +1304,32 @@ fn bg_rule_from_toggles(
     BackgroundRule {
         name,
         suspend,
-        priority: low_priority.then_some(PriorityClass::BelowNormal),
+        // Idle priority: the background process only runs when the CPU is
+        // otherwise idle, so while a game is using the machine it effectively
+        // consumes ~nothing. BelowNormal had almost no visible effect on a
+        // modern many-core box (spare capacity still runs it at full speed).
+        priority: low_priority.then_some(PriorityClass::Idle),
         qos_cpu_quota: cpu_limit.then_some(cpu_pct),
         trim_memory,
         affinity: None,
     }
 }
 
-/// CPU-limit combo level → `qos_cpu_quota` percentage (低/中/高 → 30/50/70).
+/// CPU-limit combo level → `qos_cpu_quota` percentage (低/中/高 → 10/20/30).
 fn cpu_level_to_pct(level: usize) -> u32 {
     match level {
-        0 => 30,
-        2 => 70,
-        _ => 50,
+        0 => 10,
+        2 => 30,
+        _ => 20,
     }
 }
 
-/// `qos_cpu_quota` percentage → CPU-limit combo level (30 → 低, 70 → 高,
+/// `qos_cpu_quota` percentage → CPU-limit combo level (10 → 低, 30 → 高,
 /// anything else → 中).
 fn pct_to_cpu_level(pct: u32) -> usize {
     match pct {
-        30 => 0,
-        70 => 2,
+        10 => 0,
+        30 => 2,
         _ => 1,
     }
 }
@@ -3638,14 +3642,14 @@ mod tests {
 
     #[test]
     fn cpu_level_maps_to_quota() {
-        // 低/中/高 combo -> qos_cpu_quota 30/50/70.
-        assert_eq!(cpu_level_to_pct(0), 30);
-        assert_eq!(cpu_level_to_pct(1), 50);
-        assert_eq!(cpu_level_to_pct(2), 70);
+        // 低/中/高 combo -> qos_cpu_quota 10/20/30 (aggressive background cap).
+        assert_eq!(cpu_level_to_pct(0), 10);
+        assert_eq!(cpu_level_to_pct(1), 20);
+        assert_eq!(cpu_level_to_pct(2), 30);
         // And back.
-        assert_eq!(pct_to_cpu_level(30), 0);
-        assert_eq!(pct_to_cpu_level(70), 2);
-        assert_eq!(pct_to_cpu_level(50), 1);
+        assert_eq!(pct_to_cpu_level(10), 0);
+        assert_eq!(pct_to_cpu_level(30), 2);
+        assert_eq!(pct_to_cpu_level(20), 1);
     }
 
     #[test]
@@ -3654,7 +3658,7 @@ mod tests {
         let r = bg_rule_from_toggles("x.exe".to_string(), true, true, true, 50, true);
         assert_eq!(r.name, "x.exe");
         assert!(r.suspend);
-        assert_eq!(r.priority, Some(PriorityClass::BelowNormal));
+        assert_eq!(r.priority, Some(PriorityClass::Idle));
         assert_eq!(r.qos_cpu_quota, Some(50));
         assert!(r.trim_memory);
         assert!(r.affinity.is_none());
