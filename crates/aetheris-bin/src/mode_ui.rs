@@ -157,7 +157,8 @@ define_strings! {
     "title" => "aetheris", "aetheris",
     // Status area: service mode.
     "status_running" => "正在优化中", "Optimizing",
-    "status_stopped" => "未运行", "Not running",
+    "status_idle" => "运行中(空闲)", "Running (idle)",
+    "status_stopped" => "服务未运行", "Service not running",
     // Service lifecycle messages (startup probe).
     "service_starting" => "正在启动服务…", "Starting service…",
     "service_giveup" => "无法启动服务 — 请手动(以管理员身份)运行 `aetheris service`",
@@ -1447,8 +1448,13 @@ impl UiState {
     unsafe fn update_status(&self, hwnd: HWND) {
         let _ = hwnd;
         let lang = self.lang;
+        // Three honest states: boosting, running-but-idle, or service unreachable
+        // (GetState failed -> mode is cleared). "未运行/Not running" must only
+        // mean the service is down, never a running-but-idle service.
         let text = if self.mode == "GameBoost" {
             tr(lang, "status_running").to_string()
+        } else if self.mode == "Normal" {
+            tr(lang, "status_idle").to_string()
         } else {
             tr(lang, "status_stopped").to_string()
         };
