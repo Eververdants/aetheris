@@ -23,8 +23,14 @@
 //!   (trim_memory). On Save these are the default fields applied to every
 //!   checked background row; Task 4's advanced editor can override per row.
 //! * **保存 / 高级设置** (bottom): Save builds a `Config` from the checklists +
-//!   toggles + any Task-4 per-row overrides and pushes it via `SaveConfig`;
-//!   高级设置 is stubbed (Task 4 wires the collapsible advanced panel).
+//!   toggles + any per-row overrides in `UiState.bg_overrides` and pushes it via
+//!   `SaveConfig`. `[高级设置 ▸]` (collapsed by default) expands the advanced
+//!   panel: the per-row editor (name / priority / affinity / QoS / suspend /
+//!   trim for the selected background row, plus `Reload 配置` and `Apply`),
+//!   writing into `bg_overrides` so per-row divergence survives a Save.
+//! * **语言 / Language** button (top-right): cycles `Zh ↔ En`, re-renders every
+//!   control via `apply_language` and persists the choice to `ui.toml`
+//!   (`aetheris_core::i18n::save_ui_settings`).
 //!
 //! The running-process picker and the add-by-name prompt are small modal popups
 //! (separate top-level windows + a nested filtered message loop, with the main
@@ -70,10 +76,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_LISTVIEW_CLASSES, BST_CHECKED,
-    LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
-    LVN_ITEMCHANGED, LVCOLUMNW, LVCOLUMNW_MASK, LVITEMW, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
-    LVIF_TEXT, LVIS_STATEIMAGEMASK, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT, LVS_REPORT, NMHDR,
+    LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE,
+    LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVCOLUMNW, LVCOLUMNW_MASK, LVITEMW, LVCF_SUBITEM,
+    LVCF_TEXT, LVCF_WIDTH, LVIF_TEXT, LVIS_SELECTED, LVIS_STATEIMAGEMASK, LVNI_SELECTED,
+    LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT, LVS_REPORT, NMHDR, NMLISTVIEW,
     LIST_VIEW_ITEM_STATE_FLAGS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
@@ -97,8 +104,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE,
 };
 
-use aetheris_core::config::{BackgroundRule, Config, PriorityClass};
-use aetheris_core::i18n::Lang;
+use aetheris_core::config::{AffinitySpec, BackgroundRule, Config, PriorityClass};
+use aetheris_core::i18n::{Lang, UiSettings};
 use aetheris_core::ipc::{client_call, Request, Response, DEFAULT_PIPE};
 
 // ---------------------------------------------------------------------------
@@ -220,31 +227,46 @@ define_strings! {
     "field_qos" => "QoS", "QoS",
     "field_suspend" => "挂起", "Suspend",
     "field_trim" => "清理内存", "Trim memory",
+    "btn_apply" => "应用", "Apply",
+    "adv_no_selection" => "请先在后台应用列表中选择一行", "Select a background-app row first",
+    "adv_applied" => "已应用到该行", "Applied to the row",
+    "adv_no_name" => "名称不能为空", "Name must not be empty",
+    "adv_invalid_affinity" => "亲和性无效", "Invalid affinity",
+    "adv_invalid_qos" => "QoS 无效", "Invalid QoS",
+    "adv_reloading" => "正在重新加载配置…", "Reloading config…",
+    // Priority-class combo labels (PriorityClass -> index 0..=5).
+    "prio_idle" => "空闲", "Idle",
+    "prio_below_normal" => "低于正常", "Below normal",
+    "prio_normal" => "正常", "Normal",
+    "prio_above_normal" => "高于正常", "Above normal",
+    "prio_high" => "高", "High",
+    "prio_realtime" => "实时", "Realtime",
 }
 
 /// Re-render the window in `lang`: set the window title, every control's text,
-/// the list column headers, the CPU-limit combo items, and the status line, and
-/// record the active language (the tray popup, rebuilt fresh on each
-/// right-click, reads it).
+/// the list column headers, the CPU-limit + priority combos, the advanced-panel
+/// labels, and the status line, and record the active language (the tray popup,
+/// rebuilt fresh on each right-click, reads it).
 ///
 /// Called at startup (after the dialog is created, before it is shown) with the
-/// loaded language, and re-run by the language toggle (Task 4) whenever the
-/// user switches zh/en.
+/// loaded language, and re-run by the language toggle whenever the user
+/// switches zh/en. Takes the live `&mut UiState` so callers never mint a second
+/// borrow through `state_mut` while one is already on the stack.
 ///
 /// # Safety
 /// `hwnd` must be the dialog window with a live [`UiState`] in `GWLP_USERDATA`
-/// (i.e. after `WM_CREATE` has run inside `CreateWindowExW`).
-unsafe fn apply_language(hwnd: HWND, lang: Lang) {
+/// (i.e. after `WM_CREATE` has run inside `CreateWindowExW`), and `s` must be
+/// that state.
+unsafe fn apply_language(s: &mut UiState, hwnd: HWND, lang: Lang) {
     // Record the active language first: `show_tray_menu` rebuilds the popup on
     // every right-click from this field, so the tray strings follow the toggle
     // without needing a persistent menu handle to rebuild here.
-    state_mut(hwnd).lang = lang;
+    s.lang = lang;
     set_text(hwnd, tr(lang, "title"));
-    let s = state_mut(hwnd);
     set_text(s.h_btn_start, tr(lang, "btn_start"));
     set_text(s.h_btn_stop, tr(lang, "btn_stop"));
+    set_text(s.h_btn_lang, tr(lang, "lang"));
     set_text(s.h_btn_save, tr(lang, "btn_save"));
-    set_text(s.h_btn_advanced, tr(lang, "btn_advanced"));
     set_text(s.h_btn_pick_game, tr(lang, "btn_pick_running"));
     set_text(s.h_btn_add_game, tr(lang, "btn_add"));
     set_text(s.h_btn_pick_bg, tr(lang, "btn_pick_running"));
@@ -266,6 +288,44 @@ unsafe fn apply_language(hwnd: HWND, lang: Lang) {
         combo_add(s.h_combo_cpu, tr(lang, key));
     }
     combo_set_sel(s.h_combo_cpu, s.cpu_level as i32);
+    // Advanced panel: labels, buttons and the priority combo. The priority
+    // selection is restored by index — the combo order is fixed, so a loaded
+    // row's priority survives a language switch.
+    set_text(s.h_adv_title, tr(lang, "advanced_title"));
+    set_text(s.h_adv_lbl_name, tr(lang, "field_name"));
+    set_text(s.h_adv_lbl_prio, tr(lang, "field_priority"));
+    set_text(s.h_adv_lbl_affinity, tr(lang, "field_affinity"));
+    set_text(s.h_adv_lbl_qos, tr(lang, "field_qos"));
+    set_text(s.h_adv_suspend, tr(lang, "field_suspend"));
+    set_text(s.h_adv_trim, tr(lang, "field_trim"));
+    set_text(s.h_adv_reload, tr(lang, "btn_reload"));
+    set_text(s.h_adv_apply, tr(lang, "btn_apply"));
+    let prio_sel = combo_get_sel(s.h_adv_combo_prio).max(0) as usize;
+    let _ = SendMessageW(
+        s.h_adv_combo_prio,
+        CB_RESETCONTENT,
+        Some(WPARAM(0)),
+        Some(LPARAM(0)),
+    );
+    for key in [
+        "prio_idle",
+        "prio_below_normal",
+        "prio_normal",
+        "prio_above_normal",
+        "prio_high",
+        "prio_realtime",
+    ] {
+        combo_add(s.h_adv_combo_prio, tr(lang, key));
+    }
+    combo_set_sel(s.h_adv_combo_prio, prio_sel as i32);
+    // The advanced button carries the expand/collapse arrow on top of its base
+    // label.
+    s.set_advanced_button_text();
+    // If the panel is open, re-load the selected row so the editor renders in
+    // the new language (and the arrow text above is redrawn).
+    if s.advanced_expanded {
+        s.load_selected_row_into_editor();
+    }
     // Refresh the status line in the new language.
     s.update_status(hwnd);
 }
@@ -278,6 +338,7 @@ unsafe fn apply_language(hwnd: HWND, lang: Lang) {
 const IDC_STATUS: isize = 100;
 const IDC_BTN_START: isize = 101;
 const IDC_BTN_STOP: isize = 102;
+const IDC_BTN_LANG: isize = 103;
 
 // Games + background-apps lists and their labels.
 const IDC_LIST_GAME: isize = 110;
@@ -301,6 +362,21 @@ const IDC_OPT_MEM: isize = 135;
 const IDC_STATUS_RESULT: isize = 140;
 const IDC_BTN_SAVE: isize = 141;
 const IDC_BTN_ADVANCED: isize = 142;
+
+// Advanced panel (per-row editor).
+const IDC_ADV_TITLE: isize = 150;
+const IDC_ADV_LBL_NAME: isize = 151;
+const IDC_ADV_NAME: isize = 152;
+const IDC_ADV_LBL_PRIO: isize = 153;
+const IDC_ADV_COMBO_PRIO: isize = 154;
+const IDC_ADV_LBL_AFFINITY: isize = 155;
+const IDC_ADV_AFFINITY: isize = 156;
+const IDC_ADV_LBL_QOS: isize = 157;
+const IDC_ADV_QOS: isize = 158;
+const IDC_ADV_SUSPEND: isize = 159;
+const IDC_ADV_TRIM: isize = 160;
+const IDC_ADV_RELOAD: isize = 161;
+const IDC_ADV_APPLY: isize = 162;
 
 // Modal popup controls (child ids are per-window, so they don't clash with the
 // main window's ids).
@@ -465,9 +541,14 @@ struct UiState {
     /// CPU-limit combo selection (0 = low/30, 1 = medium/50, 2 = high/70).
     /// Survives the `apply_language` rebuild of the combo items.
     cpu_level: usize,
-    /// Task 4: per-row background overrides keyed by process name. Presently
-    /// never populated — the save mapping reads them if present (a row with an
-    /// override uses it wholesale instead of the global toggles).
+    /// True while the advanced per-row editor is expanded (default: collapsed).
+    /// Drives the `[高级设置 ▸/▾]` arrow and which child controls are visible.
+    advanced_expanded: bool,
+    /// Task 4: per-row background overrides keyed by process name. The
+    /// advanced editor writes into this map (keyed by the row's name); the save
+    /// mapping reads it — a row with an override uses it wholesale instead of
+    /// the global toggles. Cleared on a config re-fetch (`Reload 配置` /
+    /// startup), pruned of dropped rows after a Save.
     bg_overrides: HashMap<String, BackgroundRule>,
     h_status: HWND,
     h_btn_start: HWND,
@@ -489,6 +570,23 @@ struct UiState {
     h_opt_mem: HWND,
     h_btn_save: HWND,
     h_btn_advanced: HWND,
+    /// Language toggle button (top-right; cycles `Zh ↔ En`).
+    h_btn_lang: HWND,
+    // Advanced panel (per-row editor; hidden while collapsed). All created in
+    // `create_state`, shown/hidden by `show_advanced`.
+    h_adv_title: HWND,
+    h_adv_lbl_name: HWND,
+    h_adv_name: HWND,
+    h_adv_lbl_prio: HWND,
+    h_adv_combo_prio: HWND,
+    h_adv_lbl_affinity: HWND,
+    h_adv_affinity: HWND,
+    h_adv_lbl_qos: HWND,
+    h_adv_qos: HWND,
+    h_adv_suspend: HWND,
+    h_adv_trim: HWND,
+    h_adv_reload: HWND,
+    h_adv_apply: HWND,
     /// Tray status icons (owned, freed on `WM_DESTROY` via `DestroyIcon`):
     /// green when the service answers `GetState`, gray when it does not.
     h_icon_green: HICON,
@@ -1215,6 +1313,90 @@ fn pct_to_cpu_level(pct: u32) -> usize {
     }
 }
 
+/// [`PriorityClass`] → advanced-priority-combo index (the combo order is the
+/// enum order: idle … realtime).
+fn priority_to_idx(p: PriorityClass) -> usize {
+    match p {
+        PriorityClass::Idle => 0,
+        PriorityClass::BelowNormal => 1,
+        PriorityClass::Normal => 2,
+        PriorityClass::AboveNormal => 3,
+        PriorityClass::High => 4,
+        PriorityClass::Realtime => 5,
+    }
+}
+
+/// Advanced-priority-combo index → [`PriorityClass`]. `None` for an out-of-range
+/// index (the combo only ever holds the six enum labels, so this is defensive).
+fn idx_to_priority(i: usize) -> Option<PriorityClass> {
+    match i {
+        0 => Some(PriorityClass::Idle),
+        1 => Some(PriorityClass::BelowNormal),
+        2 => Some(PriorityClass::Normal),
+        3 => Some(PriorityClass::AboveNormal),
+        4 => Some(PriorityClass::High),
+        5 => Some(PriorityClass::Realtime),
+        _ => None,
+    }
+}
+
+/// Parse the advanced editor's affinity text ("0,1,2") into an [`AffinitySpec`].
+/// Empty/whitespace text → `Ok(None)` (no affinity). A non-numeric token, an
+/// empty token ("0,,1"), or a core index ≥ 64 → `Err` (the service rejects
+/// those, so the editor rejects them too rather than letting Save fail).
+fn parse_affinity(text: &str) -> Result<Option<AffinitySpec>, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let mut cores = Vec::new();
+    for part in t.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!("empty core in '{t}'"));
+        }
+        let c: u8 = part.parse().map_err(|_| format!("bad core '{part}'"))?;
+        if c >= 64 {
+            return Err(format!("core {c} >= 64"));
+        }
+        cores.push(c);
+    }
+    if cores.is_empty() {
+        return Err(format!("no cores in '{t}'"));
+    }
+    Ok(Some(AffinitySpec { cores }))
+}
+
+/// Parse the advanced editor's QoS text into `qos_cpu_quota`. Empty text →
+/// `Ok(None)`; a non-numeric value or a quota outside 1..=100 → `Err`.
+fn parse_qos(text: &str) -> Result<Option<u32>, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let q: u32 = t.parse().map_err(|_| format!("bad number '{t}'"))?;
+    if q == 0 || q > 100 {
+        return Err(format!("must be 1..=100, got {q}"));
+    }
+    Ok(Some(q))
+}
+
+/// Index of the selected row in a listview, or `None` when nothing is selected.
+unsafe fn list_selected_row(hwnd: HWND) -> Option<i32> {
+    let idx = SendMessageW(
+        hwnd,
+        LVM_GETNEXTITEM,
+        Some(WPARAM(usize::MAX)),
+        Some(LPARAM(LVNI_SELECTED as isize)),
+    )
+    .0 as i32;
+    if idx >= 0 {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UiState behaviour
 // ---------------------------------------------------------------------------
@@ -1513,10 +1695,20 @@ impl UiState {
                 // and re-sync the global toggles under the busy guard (the
                 // unchecked rows visibly disappear, keeping rows ↔ `cfg` 1:1).
                 self.cfg = cfg.clone();
+                // Drop overrides for rows that were unchecked (and therefore no
+                // longer in the saved config) — an override keyed by a dropped
+                // name is stale. Surviving rows keep their overrides: Save's
+                // rebuild re-adds every `cfg.background` row checked, so the
+                // checked state of survivors is preserved.
+                let surviving: Vec<String> = cfg.background.iter().map(|b| b.name.clone()).collect();
+                self.bg_overrides.retain(|name, _| surviving.contains(name));
                 let _busy = BusyGuard::acquire(&mut *self);
                 self.rebuild_list(hwnd, ListKind::Game);
                 self.rebuild_list(hwnd, ListKind::Background);
                 self.sync_toggles_from_cfg();
+                if self.advanced_expanded {
+                    self.load_selected_row_into_editor();
+                }
                 self.save_in_flight = true;
                 self.spawn(hwnd, IpcCall::Save, Request::SaveConfig(cfg));
             }
@@ -1603,7 +1795,19 @@ impl UiState {
     /// representative snapshot, not a merge.
     unsafe fn sync_toggles_from_cfg(&mut self) {
         let default = BackgroundRule::default();
-        let b = self.cfg.background.first().unwrap_or(&default);
+        // Derive the toggles from the first background rule that does NOT have a
+        // per-row override. A row with an override carries its own values (which
+        // can be far from the globals — e.g. qos outside {30,50,70}), so
+        // deriving from it would silently drag the global toggles after a Save;
+        // the override-backed row keeps its values via `build_config_from_ui`
+        // regardless of what the toggles say. When every row is overridden (or
+        // there are none), fall back to the defaults (all off, CPU = medium).
+        let b = self
+            .cfg
+            .background
+            .iter()
+            .find(|b| !self.bg_overrides.contains_key(&b.name))
+            .unwrap_or(&default);
         btn_set(self.h_opt_suspend, b.suspend);
         btn_set(self.h_opt_low_prio, b.priority.is_some());
         let cpu_on = b.qos_cpu_quota.is_some();
@@ -1611,6 +1815,195 @@ impl UiState {
         self.cpu_level = b.qos_cpu_quota.map(pct_to_cpu_level).unwrap_or(1);
         combo_set_sel(self.h_combo_cpu, self.cpu_level as i32);
         btn_set(self.h_opt_mem, b.trim_memory);
+    }
+
+    /// Set the `[高级设置 ▸/▾]` button label: the base `btn_advanced` string
+    /// plus the expand (`▸`) / collapse (`▾`) arrow for the current
+    /// [`Self::advanced_expanded`] state.
+    unsafe fn set_advanced_button_text(&mut self) {
+        let base = tr(self.lang, "btn_advanced");
+        let arrow = if self.advanced_expanded { "▾" } else { "▸" };
+        set_text(self.h_btn_advanced, &format!("{base} {arrow}"));
+    }
+
+    /// Toggle the advanced panel between its hidden (collapsed) and visible
+    /// (expanded) state. Collapsing never touches the local `Config` or
+    /// `bg_overrides`, so nothing typed is lost by switching views.
+    unsafe fn toggle_advanced(&mut self, hwnd: HWND) {
+        self.advanced_expanded = !self.advanced_expanded;
+        self.show_advanced(self.advanced_expanded);
+        self.set_advanced_button_text();
+        if self.advanced_expanded {
+            let loaded = self.load_selected_row_into_editor();
+            if !loaded {
+                self.set_result(hwnd, tr(self.lang, "adv_no_selection"));
+            }
+        }
+    }
+
+    /// Show or hide the advanced-panel controls (and the main-view controls
+    /// they replace: the background list, its buttons, and the global
+    /// optimization group). The games list and the bottom result/save row stay
+    /// visible in both states.
+    unsafe fn show_advanced(&mut self, expanded: bool) {
+        let vis = |hwnd: HWND, on: bool| unsafe {
+            let _ = ShowWindow(hwnd, if on { SW_SHOW } else { SW_HIDE });
+        };
+        for c in [
+            self.h_adv_title,
+            self.h_adv_lbl_name,
+            self.h_adv_name,
+            self.h_adv_lbl_prio,
+            self.h_adv_combo_prio,
+            self.h_adv_lbl_affinity,
+            self.h_adv_affinity,
+            self.h_adv_lbl_qos,
+            self.h_adv_qos,
+            self.h_adv_suspend,
+            self.h_adv_trim,
+            self.h_adv_reload,
+            self.h_adv_apply,
+        ] {
+            vis(c, expanded);
+        }
+        for c in [
+            self.h_label_bg,
+            self.h_list_bg,
+            self.h_btn_pick_bg,
+            self.h_btn_add_bg,
+            self.h_label_opt,
+            self.h_opt_suspend,
+            self.h_opt_low_prio,
+            self.h_opt_cpu,
+            self.h_combo_cpu,
+            self.h_opt_mem,
+        ] {
+            vis(c, !expanded);
+        }
+    }
+
+    /// Load the currently selected background row (or the first row when none
+    /// is selected) into the advanced editor, merging any per-row override
+    /// (`bg_overrides[name]`) over the base rule. Returns `false` when there is
+    /// nothing to load (no background rows).
+    unsafe fn load_selected_row_into_editor(&mut self) -> bool {
+        let n = list_count(self.h_list_bg);
+        if n <= 0 {
+            return false;
+        }
+        let row = list_selected_row(self.h_list_bg).unwrap_or(0);
+        let Some(base) = self.cfg.background.get(row as usize) else {
+            return false;
+        };
+        let rule = self
+            .bg_overrides
+            .get(&base.name)
+            .cloned()
+            .unwrap_or_else(|| base.clone());
+        set_text(self.h_adv_name, &rule.name);
+        let prio_idx = rule.priority.map(priority_to_idx).unwrap_or(2);
+        combo_set_sel(self.h_adv_combo_prio, prio_idx as i32);
+        let aff = rule
+            .affinity
+            .as_ref()
+            .map(|a| {
+                a.cores
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        set_text(self.h_adv_affinity, &aff);
+        let qos = rule.qos_cpu_quota.map(|q| q.to_string()).unwrap_or_default();
+        set_text(self.h_adv_qos, &qos);
+        btn_set(self.h_adv_suspend, rule.suspend);
+        btn_set(self.h_adv_trim, rule.trim_memory);
+        true
+    }
+
+    /// Apply the advanced editor's current values to the selected background
+    /// row, writing a per-row override into `bg_overrides` (keyed by the row's
+    /// name). Renames the row when the name field changed, keeping the list
+    /// row ↔ `cfg.background` mapping 1:1. Field parse failures are rejected
+    /// locally (like the save-side validation) before anything is written.
+    unsafe fn apply_advanced(&mut self, hwnd: HWND) {
+        let n = list_count(self.h_list_bg);
+        let Some(row) = list_selected_row(self.h_list_bg).or(if n > 0 { Some(0) } else { None })
+        else {
+            self.set_result(hwnd, tr(self.lang, "adv_no_selection"));
+            return;
+        };
+        let Some(old_name) = self.cfg.background.get(row as usize).map(|b| b.name.clone()) else {
+            return;
+        };
+        let name = get_text(self.h_adv_name).trim().to_string();
+        if name.is_empty() {
+            self.set_result(hwnd, tr(self.lang, "adv_no_name"));
+            return;
+        }
+        let prio_idx = combo_get_sel(self.h_adv_combo_prio).max(0) as usize;
+        let affinity = match parse_affinity(&get_text(self.h_adv_affinity)) {
+            Ok(a) => a,
+            Err(e) => {
+                self.set_result(
+                    hwnd,
+                    &format!("{}: {e}", tr(self.lang, "adv_invalid_affinity")),
+                );
+                return;
+            }
+        };
+        let qos = match parse_qos(&get_text(self.h_adv_qos)) {
+            Ok(q) => q,
+            Err(e) => {
+                self.set_result(hwnd, &format!("{}: {e}", tr(self.lang, "adv_invalid_qos")));
+                return;
+            }
+        };
+        let rule = BackgroundRule {
+            name: name.clone(),
+            suspend: btn_get(self.h_adv_suspend),
+            priority: idx_to_priority(prio_idx),
+            affinity,
+            qos_cpu_quota: qos,
+            trim_memory: btn_get(self.h_adv_trim),
+        };
+        if name != old_name {
+            self.cfg.background[row as usize].name = name.clone();
+            self.bg_overrides.remove(&old_name);
+        }
+        self.bg_overrides.insert(name.clone(), rule);
+        // Rebuild the list so a rename is reflected; the override persists in
+        // `bg_overrides`, so Save (which gives overrides precedence) keeps it.
+        let _busy = BusyGuard::acquire(&mut *self);
+        self.rebuild_list(hwnd, ListKind::Background);
+        self.set_result(hwnd, tr(self.lang, "adv_applied"));
+    }
+
+    /// "Reload 配置": re-fetch the config from the service (the same
+    /// `GetConfig` path as the startup load). `apply_config`, which runs when
+    /// the result lands, replaces the working copy, clears pending overrides
+    /// (an unsaved override is a local edit — reload discards it) and rebuilds
+    /// the lists + toggles.
+    unsafe fn reload_advanced(&mut self, hwnd: HWND) {
+        self.set_result(hwnd, tr(self.lang, "adv_reloading"));
+        self.spawn(hwnd, IpcCall::GetConfig, Request::GetConfig);
+    }
+
+    /// Cycle the UI language `Zh ↔ En`, persist it to ui.toml, and re-render
+    /// every control (incl. the tray menu, which reads `UiState.lang` per
+    /// click). `apply_language` takes `self` rather than minting its own state
+    /// borrow, so calling it from a `WM_COMMAND` frame that already holds `s`
+    /// cannot create a second `&mut UiState`.
+    unsafe fn toggle_language(&mut self, hwnd: HWND) {
+        let new = match self.lang {
+            Lang::Zh => Lang::En,
+            Lang::En => Lang::Zh,
+        };
+        if let Err(e) = aetheris_core::i18n::save_ui_settings(&UiSettings { lang: new }) {
+            log_err(&format!("save ui settings: {e}"));
+        }
+        apply_language(self, hwnd, new);
     }
 
     /// Set up listview columns and the CPU-limit combo items (called once from
@@ -1623,6 +2016,21 @@ impl UiState {
             combo_add(self.h_combo_cpu, tr(self.lang, key));
         }
         combo_set_sel(self.h_combo_cpu, 1);
+        // Advanced-priority combo: the six PriorityClass labels; selection
+        // defaults to Normal. `apply_language` re-renders these before the
+        // window is shown, so the placeholder language is only visible inside
+        // WM_CREATE.
+        for key in [
+            "prio_idle",
+            "prio_below_normal",
+            "prio_normal",
+            "prio_above_normal",
+            "prio_high",
+            "prio_realtime",
+        ] {
+            combo_add(self.h_adv_combo_prio, tr(self.lang, key));
+        }
+        combo_set_sel(self.h_adv_combo_prio, 2);
     }
 
     /// First paint: rebuild the lists, initialize the toggles from the (stub)
@@ -1656,10 +2064,17 @@ impl UiState {
         self.config_loaded = true;
         self.cfg = c;
         self.init_error = None;
+        // A config re-fetch (startup, WM_SERVICE_UP, or the advanced "Reload
+        // 配置" button) re-reads the on-disk config, so any not-yet-saved
+        // per-row overrides — local editor state only — are discarded.
+        self.bg_overrides.clear();
         let _busy = BusyGuard::acquire(&mut *self);
         self.rebuild_list(hwnd, ListKind::Game);
         self.rebuild_list(hwnd, ListKind::Background);
         self.sync_toggles_from_cfg();
+        if self.advanced_expanded {
+            self.load_selected_row_into_editor();
+        }
         self.set_result(hwnd, msg);
     }
 
@@ -2291,10 +2706,12 @@ unsafe extern "system" fn wndproc(
                     s.start_refresh(hwnd);
                 }
                 IDC_BTN_SAVE if code == 0 => s.do_save(hwnd),
-                // Task 4: `btn_advanced` toggles the collapsible advanced
-                // panel. Stubbed for now — the button exists and is labeled via
-                // `tr`, but does nothing.
-                IDC_BTN_ADVANCED if code == 0 => {}
+                // `btn_advanced` toggles the collapsible advanced panel;
+                // `btn_lang` cycles the UI language (persisted to ui.toml).
+                IDC_BTN_ADVANCED if code == 0 => s.toggle_advanced(hwnd),
+                IDC_BTN_LANG if code == 0 => s.toggle_language(hwnd),
+                IDC_ADV_APPLY if code == 0 => s.apply_advanced(hwnd),
+                IDC_ADV_RELOAD if code == 0 => s.reload_advanced(hwnd),
                 IDC_BTN_PICK_GAME if code == 0 => s.open_picker(hwnd, ListKind::Game),
                 IDC_BTN_ADD_GAME if code == 0 => s.open_prompt(hwnd, ListKind::Game),
                 IDC_BTN_PICK_BG if code == 0 => s.open_picker(hwnd, ListKind::Background),
@@ -2312,12 +2729,24 @@ unsafe extern "system" fn wndproc(
                 // A checkbox toggle / selection change fires this reentrantly
                 // (e.g. `LVM_SETITEMSTATE` during a rebuild). When busy, the
                 // outer frame holds `&mut UiState`, so back out without
-                // touching state. Otherwise the simplified view has no per-row
-                // editor to update — checkbox state is read straight from the
-                // list at Save time. (Task 4 wires row selection into the
-                // advanced panel here.)
+                // touching state.
                 if state_is_busy(hwnd) {
                     return LRESULT(0);
+                }
+                // A selection change on the background list reloads the
+                // advanced editor for the newly selected row (only meaningful
+                // while the panel is expanded). A checkbox toggle, which also
+                // fires LVN_ITEMCHANGED, leaves the editor alone — only the
+                // LVIS_SELECTED bit differing between old/new state counts.
+                if nm.idFrom as isize == IDC_LIST_BG {
+                    let nmlv = &*(lparam.0 as *const NMLISTVIEW);
+                    let sel_changed = ((nmlv.uNewState ^ nmlv.uOldState) & LVIS_SELECTED.0) != 0;
+                    if sel_changed {
+                        let s = state_mut(hwnd);
+                        if s.advanced_expanded {
+                            s.load_selected_row_into_editor();
+                        }
+                    }
                 }
             }
             LRESULT(0)
@@ -2428,6 +2857,21 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         130,
         28,
         IDC_BTN_STOP,
+        hinst,
+    );
+    // Language toggle (top-right): cycles Zh ↔ En; labeled via `tr(lang, "lang")`
+    // by `apply_language`.
+    let h_btn_lang = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Language"),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+        750,
+        8,
+        140,
+        28,
+        IDC_BTN_LANG,
         hinst,
     );
 
@@ -2636,6 +3080,180 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         hinst,
     );
 
+    // --- Advanced panel (per-row editor; collapsed by default) ---
+    // All controls are created WITHOUT `WS_VISIBLE`: `show_advanced` reveals
+    // them on expand and hides them on collapse. Labels are placeholders here —
+    // `apply_language` re-renders everything before the window is shown.
+    let h_adv_title = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("Advanced settings"),
+        WS_CHILD.0,
+        10,
+        250,
+        400,
+        16,
+        IDC_ADV_TITLE,
+        hinst,
+    );
+    let h_adv_lbl_name = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("Name"),
+        WS_CHILD.0,
+        14,
+        272,
+        100,
+        20,
+        IDC_ADV_LBL_NAME,
+        hinst,
+    );
+    let h_adv_name = mk_child(
+        hwnd,
+        WS_EX_CLIENTEDGE,
+        w!("Edit"),
+        PCWSTR::null(),
+        WS_CHILD.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+        120,
+        270,
+        320,
+        22,
+        IDC_ADV_NAME,
+        hinst,
+    );
+    let h_adv_lbl_prio = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("Priority"),
+        WS_CHILD.0,
+        14,
+        298,
+        100,
+        20,
+        IDC_ADV_LBL_PRIO,
+        hinst,
+    );
+    let h_adv_combo_prio = mk_child(
+        hwnd,
+        WS_EX_CLIENTEDGE,
+        w!("ComboBox"),
+        PCWSTR::null(),
+        WS_CHILD.0 | WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0,
+        120,
+        296,
+        180,
+        140,
+        IDC_ADV_COMBO_PRIO,
+        hinst,
+    );
+    let h_adv_lbl_affinity = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("Affinity"),
+        WS_CHILD.0,
+        14,
+        324,
+        100,
+        20,
+        IDC_ADV_LBL_AFFINITY,
+        hinst,
+    );
+    let h_adv_affinity = mk_child(
+        hwnd,
+        WS_EX_CLIENTEDGE,
+        w!("Edit"),
+        PCWSTR::null(),
+        WS_CHILD.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+        120,
+        322,
+        180,
+        22,
+        IDC_ADV_AFFINITY,
+        hinst,
+    );
+    let h_adv_lbl_qos = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Static"),
+        w!("QoS"),
+        WS_CHILD.0,
+        316,
+        324,
+        50,
+        20,
+        IDC_ADV_LBL_QOS,
+        hinst,
+    );
+    let h_adv_qos = mk_child(
+        hwnd,
+        WS_EX_CLIENTEDGE,
+        w!("Edit"),
+        PCWSTR::null(),
+        WS_CHILD.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+        368,
+        322,
+        100,
+        22,
+        IDC_ADV_QOS,
+        hinst,
+    );
+    let h_adv_suspend = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Suspend"),
+        WS_CHILD.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+        14,
+        350,
+        110,
+        20,
+        IDC_ADV_SUSPEND,
+        hinst,
+    );
+    let h_adv_trim = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Trim memory"),
+        WS_CHILD.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+        130,
+        350,
+        130,
+        20,
+        IDC_ADV_TRIM,
+        hinst,
+    );
+    let h_adv_reload = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Reload"),
+        WS_CHILD.0 | WS_TABSTOP.0,
+        14,
+        384,
+        120,
+        30,
+        IDC_ADV_RELOAD,
+        hinst,
+    );
+    let h_adv_apply = mk_child(
+        hwnd,
+        WINDOW_EX_STYLE::default(),
+        w!("Button"),
+        w!("Apply"),
+        WS_CHILD.0 | WS_TABSTOP.0,
+        144,
+        384,
+        120,
+        30,
+        IDC_ADV_APPLY,
+        hinst,
+    );
+
     // Solid status icons for the tray: green (0x00FF00) = service up, gray
     // (0x808080) = service down. Owned here and freed on WM_DESTROY.
     let h_icon_green = make_status_icon(COLORREF(0x0000FF00));
@@ -2653,6 +3271,7 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         busy: false,
         mode: String::new(),
         cpu_level: 1,
+        advanced_expanded: false,
         bg_overrides: HashMap::new(),
         h_status,
         h_btn_start,
@@ -2674,6 +3293,20 @@ unsafe fn create_state(hwnd: HWND, pipe: String) -> UiState {
         h_opt_mem,
         h_btn_save,
         h_btn_advanced,
+        h_btn_lang,
+        h_adv_title,
+        h_adv_lbl_name,
+        h_adv_name,
+        h_adv_lbl_prio,
+        h_adv_combo_prio,
+        h_adv_lbl_affinity,
+        h_adv_affinity,
+        h_adv_lbl_qos,
+        h_adv_qos,
+        h_adv_suspend,
+        h_adv_trim,
+        h_adv_reload,
+        h_adv_apply,
         h_icon_green,
         h_icon_gray,
         status_probe_in_flight: false,
@@ -2812,10 +3445,14 @@ fn run(args: Vec<String>) -> i32 {
 
             // Apply the loaded language (ui.toml, defaulting to the detected
             // system language) BEFORE the window is shown, so every control
-            // (labels, buttons, list headers, CPU combo, status line) paints in
-            // the right language on first paint.
+            // (labels, buttons, list headers, combos, status line) paints in
+            // the right language on first paint. The state borrow is scoped so
+            // the later `state_mut` calls below are a fresh, unaliased borrow.
             let lang = aetheris_core::i18n::load_ui_settings().lang;
-            apply_language(hwnd, lang);
+            {
+                let s = state_mut(hwnd);
+                apply_language(s, hwnd, lang);
+            }
 
             let _ = ShowWindow(hwnd, SW_SHOW);
 
@@ -2886,7 +3523,10 @@ fn needs_elevation(msg: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bg_rule_from_toggles, cpu_level_to_pct, keys, needs_elevation, pct_to_cpu_level, tr};
+    use super::{
+        bg_rule_from_toggles, cpu_level_to_pct, idx_to_priority, keys, needs_elevation,
+        parse_affinity, parse_qos, pct_to_cpu_level, priority_to_idx, tr,
+    };
     use aetheris_core::config::PriorityClass;
     use aetheris_core::i18n::Lang;
 
@@ -2960,5 +3600,49 @@ mod tests {
         assert_eq!(r2.qos_cpu_quota, None);
         assert!(!r2.trim_memory);
         assert!(r2.affinity.is_none());
+    }
+
+    #[test]
+    fn priority_roundtrip_combo_index() {
+        // The advanced priority combo order is the enum order; both directions
+        // agree for every variant.
+        let all = [
+            PriorityClass::Idle,
+            PriorityClass::BelowNormal,
+            PriorityClass::Normal,
+            PriorityClass::AboveNormal,
+            PriorityClass::High,
+            PriorityClass::Realtime,
+        ];
+        for (idx, p) in all.iter().enumerate() {
+            assert_eq!(priority_to_idx(*p), idx, "priority_to_idx({p:?})");
+            assert_eq!(idx_to_priority(idx), Some(*p), "idx_to_priority({idx})");
+        }
+        assert_eq!(idx_to_priority(6), None, "out-of-range index");
+        assert_eq!(idx_to_priority(usize::MAX), None);
+    }
+
+    #[test]
+    fn parse_affinity_text() {
+        assert!(parse_affinity("").unwrap().is_none());
+        assert!(parse_affinity("   ").unwrap().is_none());
+        let a = parse_affinity("0,1,2").unwrap().unwrap();
+        assert_eq!(a.cores, vec![0u8, 1, 2]);
+        let a2 = parse_affinity("0, 4").unwrap().unwrap();
+        assert_eq!(a2.cores, vec![0u8, 4]);
+        assert!(parse_affinity("0,,").is_err(), "empty token rejected");
+        assert!(parse_affinity("abc").is_err(), "non-numeric rejected");
+        assert!(parse_affinity("64").is_err(), "core index >= 64 rejected");
+    }
+
+    #[test]
+    fn parse_qos_text() {
+        assert_eq!(parse_qos("").unwrap(), None);
+        assert_eq!(parse_qos("   ").unwrap(), None);
+        assert_eq!(parse_qos("50").unwrap(), Some(50));
+        assert_eq!(parse_qos("100").unwrap(), Some(100));
+        assert!(parse_qos("0").is_err(), "quota 0 rejected");
+        assert!(parse_qos("101").is_err(), "quota > 100 rejected");
+        assert!(parse_qos("abc").is_err(), "non-numeric rejected");
     }
 }
