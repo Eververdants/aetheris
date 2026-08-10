@@ -21,7 +21,7 @@ use windows::Win32::Foundation::HANDLE;
 
 use crate::actions::OsBackend;
 use crate::config::Config;
-use crate::events::{ForegroundEvent, ProcessEvent};
+use crate::events::{ForegroundEvent, ProcessEvent, ProcessKind};
 use crate::ipc::{
     IpcServer, ProcessInfo, Request, Response, StateSnapshot, DEFAULT_PIPE, DEFAULT_PIPE_DACL,
 };
@@ -292,6 +292,20 @@ impl Service {
     /// Spawn the ETW / foreground / IPC threads, each feeding the shared event
     /// channel, and run the main loop until a [`ServiceMsg::Stop`] arrives.
     pub fn run(mut self) -> Result<(), String> {
+        // Startup snapshot: detect a game that was ALREADY running before the
+        // service started, so "start the service while my game is already open"
+        // triggers GameBoost without waiting for a new Start/foreground event.
+        // One-time scan, not polling. Feeding Start events also applies always-
+        // rules to already-running matches, as if the service had been up.
+        for (pid, name) in crate::actions::snapshot_running_processes() {
+            self.engine.on_process_event(&ProcessEvent {
+                pid,
+                name,
+                parent_pid: 0,
+                kind: ProcessKind::Start,
+            });
+        }
+
         let (tx, rx): (Sender<ServiceMsg>, Receiver<ServiceMsg>) = channel();
 
         // Relay the stop channel into the event channel.

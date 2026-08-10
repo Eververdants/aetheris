@@ -105,6 +105,59 @@ pub fn mask_from_cores(cores: &[u8]) -> u64 {
     cores.iter().fold(0u64, |m, &c| m | (1u64 << c))
 }
 
+/// One-time snapshot of running processes: `(pid, image-file-name)`. Used at
+/// service startup so a game that was ALREADY running before the service
+/// started is detected and boosted immediately — a single scan, not polling.
+/// Lowercased image names for case-insensitive rule matching.
+pub fn snapshot_running_processes() -> Vec<(u32, String)> {
+    use windows::Win32::System::ProcessStatus::EnumProcesses;
+    use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+
+    let mut pids = [0u32; 4096];
+    let mut needed = 0u32;
+    if unsafe {
+        EnumProcesses(pids.as_mut_ptr(), std::mem::size_of_val(&pids) as u32, &mut needed)
+    }
+    .is_err()
+    {
+        return Vec::new();
+    }
+    let count = (needed as usize / std::mem::size_of::<u32>()).min(pids.len());
+    let mut out = Vec::new();
+    for &pid in &pids[..count] {
+        if pid == 0 {
+            continue;
+        }
+        let h = unsafe { OpenProcess(PROCESS_QUERY, false, pid) };
+        let Ok(h) = h else { continue };
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32; // in/out in WCHAR count
+        let r = unsafe {
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut size)
+        };
+        let _ = unsafe { CloseHandle(h) };
+        if r.is_err() {
+            continue;
+        }
+        let full = String::from_utf16_lossy(&buf[..(size as usize).min(buf.len())]);
+        let fname = full.rsplit('\\').next().unwrap_or(&full);
+        if !fname.is_empty() {
+            out.push((pid, fname.to_ascii_lowercase()));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    #[test]
+    fn snapshot_returns_running_processes() {
+        let procs = super::snapshot_running_processes();
+        assert!(!procs.is_empty(), "must see at least this test process");
+        assert!(procs.iter().any(|(_, n)| n.ends_with(".exe")));
+    }
+}
+
 /// Total number of logical processors across every processor group.
 ///
 /// `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)` returns the grand total,
