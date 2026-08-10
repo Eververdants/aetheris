@@ -535,8 +535,9 @@ struct UiState {
     /// checkbox toggle triggered by `LVM_SETITEMSTATE` during a rebuild cannot
     /// touch the `UiState` while the outer frame's `&mut` is live.
     busy: bool,
-    /// Service mode from the last successful `GetState`. Empty means the
-    /// service has not answered — shown as "未运行".
+    /// Service mode from the last successful `GetState`: "GameBoost" while a
+    /// game runs (status shows "正在优化中"), "Normal" when idle, and empty
+    /// when the service has not answered — both shown as "未运行".
     mode: String,
     /// CPU-limit combo selection (0 = low/30, 1 = medium/50, 2 = high/70).
     /// Survives the `apply_language` rebuild of the combo items.
@@ -1439,15 +1440,17 @@ impl UiState {
         }
     }
 
-    /// Render the status static: "正在优化中" once the service has answered a
-    /// `GetState` (mode non-empty), "未运行" otherwise.
+    /// Render the status static: "正在优化中" only while the service reports
+    /// `GameBoost` (a game is running and being optimized); "未运行" for any
+    /// other mode — the service reports "Normal" when idle, so a resident
+    /// service with nothing to optimize shows "未运行", not "正在优化中".
     unsafe fn update_status(&self, hwnd: HWND) {
         let _ = hwnd;
         let lang = self.lang;
-        let text = if self.mode.is_empty() {
-            tr(lang, "status_stopped").to_string()
-        } else {
+        let text = if self.mode == "GameBoost" {
             tr(lang, "status_running").to_string()
+        } else {
+            tr(lang, "status_stopped").to_string()
         };
         set_text(self.h_status, &text);
     }
