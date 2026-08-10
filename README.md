@@ -108,9 +108,12 @@ exits with code 1. That is the intended fail-safe.
 
 On the first run the service auto-creates the machine-wide config at
 `%PROGRAMDATA%\aetheris\aetheris.toml` — a fully commented template, so nothing
-is active until you edit it. The repo's committed `aetheris.toml` is exactly that
-template. The service is elevated, so it can write the admin-owned `ProgramData`
-file; the non-elevated UI and CLI cannot.
+is active until you edit it. The template's comments follow the **detected
+system language** (a Chinese system UI gets a Chinese-commented template,
+anything else gets English); the values are identical either way. The repo's
+committed `aetheris.toml` is exactly that template. The service is elevated, so
+it can write the admin-owned `ProgramData` file; the non-elevated UI and CLI
+cannot.
 
 Saving the config writes to that admin-owned file, so **Save requires an
 elevated UI**. If the UI is not elevated and the service refuses a save for lack
@@ -155,24 +158,44 @@ aetheris                # same as no-argument; against the default pipe \\.\pipe
 aetheris ui --pipe <NAME>  # against a specific pipe (match the service's --pipe)
 ```
 
-The dialog is three parts:
+The dialog is a simplified **bilingual checklist view** (the language follows
+the UI, see below):
 
-- **Status panel** (top): the current mode (`Normal` / `GameBoost`), the boosted
-  process list, and the last-reload result. **Refresh** re-pulls live status via
-  `GetState`; status is also pulled once at startup.
-- **Rule editor** (middle): three lists — game processes (`[game] processes`),
-  `[[background]]` rules, and `[[rule]]` always-rules. Selecting a background or
-  rule row loads its fields into a shared editor row (name, priority combo,
-  affinity as `0,1`, `qos_cpu_quota`, suspend / trim checkboxes). **Add /
-  Delete / Apply** mutate a *local* copy of the config; **Reload cfg** re-fetches
-  the service's config back into the editor.
-- **Save / Reload / Exit** (bottom): **Save** commits the editor and pushes the
-  config to the service; **Reload** asks the service to re-read its config file
-  from disk; **Exit** closes the dialog (minimize-to-tray is the other close
-  path — use the tray **Exit** to quit the UI). **Save requires elevation**: the
-  service only accepts config writes from an elevated client, so a non-elevated
-  UI is prompted once to relaunch `aetheris ui` as administrator (UAC) when a
-  save is refused.
+- **Status area** (top): a status line showing the current mode
+  (`正在优化中` / `Optimizing` while a game runs, `未运行` / `Not running`
+  otherwise) plus **[Start service]** / **[Stop service]** buttons — the same
+  lifecycle actions the tray menu exposes, now in-window. Status is pulled once
+  at startup and refreshed after a save; the tray icon probes it every 5 s.
+- **Checklists** (middle): two single-column checkbox lists. **游戏 / Games**
+  (`[game] processes`) — a checked row enters GameBoost when that process
+  launches. **后台应用 / Background apps** (`[[background]]` rules) — a checked
+  row is throttled while a game runs. Both lists have an **[Add]** button that
+  prompts for a process name (`*` wildcard supported) and a
+  **从运行中的进程选择 / Pick from running** button that opens a modal picker
+  listing running processes (`EnumProcesses`): check the ones to add and click OK.
+- **优化方式 / Optimization** group: four global toggles applied to every
+  checked background row on Save — **挂起 / Suspend**, **降优先级 / Lower
+  priority** (`below_normal`), **限制CPU / Limit CPU** with a **低/中/高 /
+  Low/Medium/High** combo (`qos_cpu_quota` 30/50/70), and **清理内存 / Trim
+  memory**. A row you edit in the Advanced panel keeps its own per-row values
+  instead of the global defaults.
+- **保存 / Save** (bottom): builds a `Config` from the checklists + toggles +
+  per-row overrides and pushes it to the service via `SaveConfig`. Unchecked
+  rows are removed on save — the lists are rewritten from the checkboxes, so a
+  row you uncheck is dropped. **Save requires elevation**: the service only
+  accepts config writes from an elevated client, so a non-elevated UI is
+  prompted once to relaunch `aetheris ui` as administrator (UAC).
+- **[高级设置 ▸] / [Advanced ▸]** (bottom, collapsed by default): expands the
+  advanced per-row editor — name / priority / affinity / QoS / suspend / trim
+  for the selected background row, plus **Reload 配置 / Reload**. Overrides set
+  here are keyed by row name and survive a Save, so a row can diverge from the
+  global toggles without the next Save flattening it.
+- **语言 / Language** (top-right): cycles **中文 ↔ English** and instantly
+  re-renders every control — window title, buttons, list headers, combos, the
+  tray menu, and the pickers — then persists the choice. The UI starts in the
+  **detected system language** (a Chinese system UI → 中文, anything else →
+  English); your choice is stored in `%PROGRAMDATA%\aetheris\ui.toml`, so it
+  survives restarts.
 
 Save runs the same validate-then-persist path the service uses internally: the
 UI validates its working copy before anything leaves the process, then
@@ -181,8 +204,8 @@ the same directory, atomically rename it over the real file, and reload the new
 config into the live engine — an invalid config can never reach the file, and
 the service keeps running its current config until a save succeeds. (If the
 service was unreachable at startup so the config never loaded, Save is refused
-until a successful "Reload cfg" — so an empty editor can't overwrite the real
-config on disk.)
+until a successful reload — so an empty editor can't overwrite the real config
+on disk.)
 
 ## Overlay
 
@@ -364,4 +387,10 @@ Previously documented as v1 gaps, **closed in v1.1**:
   `%PROGRAMDATA%\aetheris\aetheris.toml`, save-as-admin relaunch, multi-game
   re-entry after config reload/save, and the network-QoS crash-reconciliation
   hardening (marker kept on partial revert).
+- **v2.2.1 (shipped):** simplified bilingual (中文/English) checklist UI —
+  games + background-apps checklists with global optimization toggles
+  (suspend / lower priority / limit CPU / trim memory), an add-by-name +
+  running-process picker, a big status area with in-window start/stop, a
+  collapsible advanced editor, and a language toggle (default = detected system
+  language, persisted to `%PROGRAMDATA%\aetheris\ui.toml`).
 - **v2.3 (planned):** kernel driver (monitor-only).
