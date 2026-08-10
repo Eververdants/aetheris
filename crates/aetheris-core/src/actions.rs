@@ -105,6 +105,24 @@ pub fn mask_from_cores(cores: &[u8]) -> u64 {
     cores.iter().fold(0u64, |m, &c| m | (1u64 << c))
 }
 
+/// True when `pid` owns the current foreground window — i.e. the user is
+/// actively interacting with it. Used as a safety guard so the service never
+/// suspends a process the user is currently using (freezing a foreground app
+/// reads as "unresponsive / crashed"). Background visible windows are fine to
+/// suspend; only the foreground one is protected.
+pub fn is_foreground_process(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let mut fg_pid: u32 = 0;
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, Some(&mut fg_pid)) };
+    fg_pid == pid
+}
+
 /// One-time snapshot of running processes: `(pid, image-file-name)`. Used at
 /// service startup so a game that was ALREADY running before the service
 /// started is detected and boosted immediately — a single scan, not polling.
@@ -155,6 +173,14 @@ mod snapshot_tests {
         let procs = super::snapshot_running_processes();
         assert!(!procs.is_empty(), "must see at least this test process");
         assert!(procs.iter().any(|(_, n)| n.ends_with(".exe")));
+    }
+
+    #[test]
+    fn foreground_guard_rejects_pid_zero_and_never_panics() {
+        assert!(!super::is_foreground_process(0));
+        // The test process is never the foreground window owner in a harness;
+        // the call must just not panic and return a bool.
+        let _ = super::is_foreground_process(std::process::id());
     }
 }
 
@@ -669,6 +695,16 @@ impl ProcessBackend for OsBackend {
                     })
                 },
                 TargetAction::Suspend => {
+                    // Safety guard: never suspend the process the user is actively
+                    // using (it owns the foreground window) — freezing a foreground
+                    // app reads as "unresponsive / crashed". Background apps are
+                    // still suspended; only the foreground one is protected.
+                    if is_foreground_process(pid) {
+                        crate::log::warn(format!(
+                            "suspend skipped: pid {pid} owns the foreground window"
+                        ));
+                        return Ok(());
+                    }
                     // NOTE (deviation from brief): ntapi's NtSuspendProcess returns an
                     // NTSTATUS (i32), not a Result, and its HANDLE is a `*mut c_void`
                     // from winapi — distinct from windows::Win32's HANDLE. We cast the
