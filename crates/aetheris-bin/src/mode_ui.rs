@@ -167,7 +167,9 @@ define_strings! {
     "list_games" => "游戏(启动时进入优化模式)", "Games (enter optimization on launch)",
     "list_background" => "后台应用(游戏运行时优化)", "Background apps (optimized while a game runs)",
     "list_process_name" => "进程名", "Process name",
-    // Global optimization options.
+    // Global optimization options. This label is the user-facing status note
+    // documenting the global model: a Save applies these toggles to every
+    // checked background row (Task-4 per-row `bg_overrides` keep their values).
     "opt_group" => "优化方式(应用于全部勾选的后台应用)",
         "Optimization (applies to all checked background apps)",
     "opt_suspend" => "挂起", "Suspend",
@@ -1168,8 +1170,14 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 // ---------------------------------------------------------------------------
 
 /// Build the per-row `BackgroundRule` from the global optimization toggles.
-/// Task 4 merges per-row advanced overrides on top of these defaults (see
-/// `build_config_from_ui`).
+///
+/// This is the global model: **Save applies these fields to every checked
+/// background row** (documented to the user by the [`tr`] `opt_group` status
+/// note). A row that has a Task-4 [`UiState::bg_overrides`] entry (keyed by
+/// name) is *not* built from these defaults — the save mapping in
+/// [`UiState::build_config_from_ui`] uses the override wholesale instead, so a
+/// pre-existing divergent config survives via its per-row override rather than
+/// being flattened here.
 fn bg_rule_from_toggles(
     name: String,
     suspend: bool,
@@ -1394,25 +1402,35 @@ impl UiState {
     }
 
     /// Open the modal running-process picker for `kind`.
+    ///
+    /// `lang` is handed in as a `Copy` so the picker never re-reads the
+    /// parent's [`UiState`] via `state_mut(parent)` while the `WM_COMMAND`
+    /// frame's `&mut UiState` is live on the stack — the same aliasing hazard
+    /// [`state_is_busy`] exists to avoid.
     unsafe fn open_picker(&mut self, hwnd: HWND, kind: ListKind) {
         let hinst: HINSTANCE = GetModuleHandleW(None)
             .expect("module handle")
             .into();
-        show_process_picker(hwnd, kind.to_usize() as isize, hinst);
+        show_process_picker(hwnd, kind.to_usize() as isize, hinst, self.lang);
     }
 
     /// Open the modal add-by-name prompt for `kind`.
+    ///
+    /// Same as [`UiState::open_picker`]: `lang` is passed by value so the
+    /// prompt never touches the parent's [`UiState`] under the live `&mut`.
     unsafe fn open_prompt(&mut self, hwnd: HWND, kind: ListKind) {
         let hinst: HINSTANCE = GetModuleHandleW(None)
             .expect("module handle")
             .into();
-        show_name_prompt(hwnd, kind.to_usize() as isize, hinst);
+        show_name_prompt(hwnd, kind.to_usize() as isize, hinst, self.lang);
     }
 
     /// Build a fresh `Config` from the current UI state: games = checked game
     /// rows; background = checked background rows with the global toggles
-    /// applied (merged with any Task-4 per-row override); `rule` /
-    /// `protected_extra` / `network` / `overlay` carried over unchanged.
+    /// applied, except rows that have a Task-4 per-row override in
+    /// `bg_overrides` (keyed by name), which use the override's values
+    /// wholesale instead; `rule` / `protected_extra` / `network` / `overlay`
+    /// carried over unchanged.
     unsafe fn build_config_from_ui(&mut self) -> Config {
         let mut cfg = self.cfg.clone();
 
@@ -1428,8 +1446,13 @@ impl UiState {
         cfg.game.processes = processes;
 
         // Background apps: checked rows become rules built from the global
-        // toggles. A row with a Task-4 advanced override (presently none) uses
-        // the override wholesale instead of the global defaults.
+        // toggles — the global model, documented to the user by the `opt_group`
+        // label ("applies to all checked background apps"). A row with a Task-4
+        // `bg_overrides` entry (keyed by name) uses the override's per-row
+        // values wholesale instead of the global defaults, so divergent rows
+        // survive a Save via their override. If no checked row has an override,
+        // the toggles legitimately rewrite them all — that is the intended
+        // model (see `sync_toggles_from_cfg`).
         let suspend = btn_get(self.h_opt_suspend);
         let low_prio = btn_get(self.h_opt_low_prio);
         let cpu = btn_get(self.h_opt_cpu);
@@ -1481,7 +1504,19 @@ impl UiState {
             Ok(_) => {
                 // Keep the working copy in sync with what is about to be saved
                 // so the lists/toggles stay consistent after the round-trip.
+                //
+                // `cfg` is the checkbox-filtered build (unchecked rows were
+                // dropped), so the lists must be rebuilt from it too: otherwise
+                // a second Save reads names by row index against the now-trimmed
+                // config while the lists still show the old full row set, and
+                // silently drops or wrong-maps checked rows. Rebuild both lists
+                // and re-sync the global toggles under the busy guard (the
+                // unchecked rows visibly disappear, keeping rows ↔ `cfg` 1:1).
                 self.cfg = cfg.clone();
+                let _busy = BusyGuard::acquire(&mut *self);
+                self.rebuild_list(hwnd, ListKind::Game);
+                self.rebuild_list(hwnd, ListKind::Background);
+                self.sync_toggles_from_cfg();
                 self.save_in_flight = true;
                 self.spawn(hwnd, IpcCall::Save, Request::SaveConfig(cfg));
             }
@@ -1557,6 +1592,15 @@ impl UiState {
     /// first background rule as the representative; falls back to defaults (all
     /// off, CPU = medium) when there are no rules. Task 4's advanced editor is
     /// where per-row precision lives.
+    ///
+    /// These toggles are the global model: **Save applies them to every checked
+    /// background row** (the `opt_group` status note says so). A pre-existing
+    /// heterogeneous config is therefore flattened by a Save unless the
+    /// divergent rows have Task-4 `bg_overrides` entries, which
+    /// `build_config_from_ui` uses wholesale (per-row values, including a qos
+    /// outside {30,50,70}) instead of these globals — that is how per-row
+    /// divergence survives. Deriving from the first rule only is a
+    /// representative snapshot, not a merge.
     unsafe fn sync_toggles_from_cfg(&mut self) {
         let default = BackgroundRule::default();
         let b = self.cfg.background.first().unwrap_or(&default);
@@ -1910,9 +1954,12 @@ unsafe fn run_modal(popup: HWND, parent: HWND, done: *const bool) {
 
 /// Create the running-process picker modal popup and run it. On OK it posts
 /// `WM_PICK_RESULT` to `parent` with the checked process names.
-unsafe fn show_process_picker(parent: HWND, target: isize, hinst: HINSTANCE) {
+///
+/// `lang` is the parent's active language, passed by value (it is `Copy`) so
+/// this modal never re-enters the parent's [`UiState`] while the calling
+/// `WM_COMMAND` frame's `&mut UiState` is live on the stack.
+unsafe fn show_process_picker(parent: HWND, target: isize, hinst: HINSTANCE, lang: Lang) {
     register_popup_class(w!("aetheris_pick"), Some(pick_wndproc), hinst);
-    let lang = state_mut(parent).lang;
     let names = enumerate_processes();
     let title = to_wide(tr(lang, "pick_title"));
     let mut rc = RECT {
@@ -2003,9 +2050,12 @@ unsafe fn show_process_picker(parent: HWND, target: isize, hinst: HINSTANCE) {
 
 /// Create the add-by-name prompt modal popup and run it. On OK it posts
 /// `WM_PROMPT_RESULT` to `parent` with the typed name.
-unsafe fn show_name_prompt(parent: HWND, target: isize, hinst: HINSTANCE) {
+///
+/// `lang` is the parent's active language, passed by value (it is `Copy`) so
+/// this modal never re-enters the parent's [`UiState`] while the calling
+/// `WM_COMMAND` frame's `&mut UiState` is live on the stack.
+unsafe fn show_name_prompt(parent: HWND, target: isize, hinst: HINSTANCE, lang: Lang) {
     register_popup_class(w!("aetheris_prompt"), Some(prompt_wndproc), hinst);
-    let lang = state_mut(parent).lang;
     let title = to_wide(tr(lang, "add_prompt_title"));
     let mut rc = RECT {
         left: 0,
